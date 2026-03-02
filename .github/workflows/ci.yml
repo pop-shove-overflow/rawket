@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y musl-tools zlib1g-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+          components: clippy
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Clippy
+        run: >
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+          cargo clippy --target x86_64-unknown-linux-musl -- --deny warnings
+
+      - name: Build release
+        run: make
+
+      - name: Build debug
+        run: make debug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rawket-release-${{ github.sha }}
+          retention-days: 90
+          path: |
+            target/x86_64-unknown-linux-musl/release/echo_server
+            target/x86_64-unknown-linux-musl/release/debian_http
+            target/x86_64-unknown-linux-musl/release/librawket.a
+            include/rawket.h
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rawket-debug-${{ github.sha }}
+          retention-days: 90
+          path: |
+            target/x86_64-unknown-linux-musl/debug/debian_http_dbg
+            target/x86_64-unknown-linux-musl/debug/librawket.a
+            include/rawket.h
