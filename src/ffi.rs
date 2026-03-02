@@ -8,8 +8,10 @@
 // documented in the C header, the per-function `# Safety` doc section is
 // suppressed below.
 #![allow(clippy::missing_safety_doc)]
+use core::net::{Ipv4Addr, SocketAddrV4};
 use crate::{
     arp_cache,
+    eth::MacAddr,
     interface::Interface,
     ip::Ipv4Cidr,
     network::{Network, NetworkConfig},
@@ -117,8 +119,12 @@ fn set_errno(e: Error) {
     unsafe { *libc::__errno_location() = raw };
 }
 
-fn ip_from_c(ip: c_uint) -> [u8; 4] {
-    ip.to_ne_bytes()
+fn set_errno_raw(n: libc::c_int) {
+    unsafe { *libc::__errno_location() = n };
+}
+
+fn ip_from_c(ip: c_uint) -> Ipv4Addr {
+    Ipv4Addr::from(ip.to_ne_bytes())
 }
 
 unsafe fn cstr_bytes<'a>(p: *const libc::c_char) -> Option<&'a [u8]> {
@@ -197,16 +203,16 @@ pub unsafe extern "C" fn rawket_network_add_intf(
     mac:    *const u8,
 ) -> c_int {
     if net.is_null() || mac.is_null() {
-        unsafe { *libc::__errno_location() = libc::EINVAL };
+        set_errno_raw(libc::EINVAL);
         return -1;
     }
     let name_bytes = match unsafe { cstr_bytes(ifname) } {
         Some(b) => b,
-        None    => { unsafe { *libc::__errno_location() = libc::EINVAL }; return -1; }
+        None    => { set_errno_raw(libc::EINVAL); return -1; }
     };
-    let mac_arr: [u8; 6] = match unsafe { slice::from_raw_parts(mac, 6) }.try_into() {
-        Ok(m)  => m,
-        Err(_) => { unsafe { *libc::__errno_location() = libc::EINVAL }; return -1; }
+    let mac_arr = match <[u8; 6]>::try_from(unsafe { slice::from_raw_parts(mac, 6) }) {
+        Ok(m)  => MacAddr::from(m),
+        Err(_) => { set_errno_raw(libc::EINVAL); return -1; }
     };
 
     let ifindex = match PacketSocket::ifindex(name_bytes) {
@@ -253,15 +259,15 @@ pub unsafe extern "C" fn rawket_intf_get_mac(
     mac_out:  *mut u8,
 ) -> c_int {
     if mac_out.is_null() {
-        unsafe { *libc::__errno_location() = libc::EINVAL };
+        set_errno_raw(libc::EINVAL);
         return -1;
     }
     match unsafe { intf_first(net, intf_idx) } {
         Some(iface) => {
-            unsafe { ptr::copy_nonoverlapping(iface.mac().as_ptr(), mac_out, 6) };
+            unsafe { ptr::copy_nonoverlapping(iface.mac().as_bytes().as_ptr(), mac_out, 6) };
             0
         }
-        None => { unsafe { *libc::__errno_location() = libc::ENOENT }; -1 }
+        None => { set_errno_raw(libc::ENOENT); -1 }
     }
 }
 
@@ -273,17 +279,17 @@ pub unsafe extern "C" fn rawket_intf_set_mac(
     mac:      *const u8,
 ) -> c_int {
     if net.is_null() || mac.is_null() || intf_idx < 0 {
-        unsafe { *libc::__errno_location() = libc::EINVAL };
+        set_errno_raw(libc::EINVAL);
         return -1;
     }
-    let mac_arr: [u8; 6] = match unsafe { slice::from_raw_parts(mac, 6) }.try_into() {
-        Ok(m)  => m,
-        Err(_) => { unsafe { *libc::__errno_location() = libc::EINVAL }; return -1; }
+    let mac_arr = match <[u8; 6]>::try_from(unsafe { slice::from_raw_parts(mac, 6) }) {
+        Ok(m)  => MacAddr::from(m),
+        Err(_) => { set_errno_raw(libc::EINVAL); return -1; }
     };
     let net_inner = unsafe { &mut (*net).0 };
     let idx = intf_idx as usize;
     if idx >= net_inner.uplinks().len() {
-        unsafe { *libc::__errno_location() = libc::ENOENT };
+        set_errno_raw(libc::ENOENT);
         return -1;
     }
     match net_inner.uplinks_mut()[idx].set_iface_mac(mac_arr) {
@@ -305,7 +311,7 @@ pub unsafe extern "C" fn rawket_intf_assign_ip(
     prefix_len: u8,
 ) -> c_int {
     if net.is_null() || intf_idx < 0 {
-        unsafe { *libc::__errno_location() = libc::EINVAL };
+        set_errno_raw(libc::EINVAL);
         return -1;
     }
     let cidr = match Ipv4Cidr::new(ip_from_c(ip), prefix_len) {
@@ -315,12 +321,12 @@ pub unsafe extern "C" fn rawket_intf_assign_ip(
     let net_inner = unsafe { &mut (*net).0 };
     let idx = intf_idx as usize;
     if idx >= net_inner.uplinks().len() {
-        unsafe { *libc::__errno_location() = libc::ENOENT };
+        set_errno_raw(libc::ENOENT);
         return -1;
     }
     match net_inner.uplinks_mut()[idx].interfaces_mut().first_mut() {
         Some(iface) => iface.assign_ip(cidr),
-        None => { unsafe { *libc::__errno_location() = libc::ENOENT }; return -1; }
+        None => { set_errno_raw(libc::ENOENT); return -1; }
     }
     // Auto-insert a connected (on-link) route for the assigned subnet.
     let connected = Ipv4Cidr::new(cidr.network(), cidr.prefix_len()).unwrap();
@@ -360,17 +366,17 @@ pub unsafe extern "C" fn rawket_open_eth_cb(
     userdata: *mut libc::c_void,
 ) -> *mut RawketEthSocket {
     let Some(callback) = cb else {
-        unsafe { *libc::__errno_location() = libc::EINVAL };
+        set_errno_raw(libc::EINVAL);
         return ptr::null_mut();
     };
     if net.is_null() || intf_idx < 0 {
-        unsafe { *libc::__errno_location() = libc::EINVAL };
+        set_errno_raw(libc::EINVAL);
         return ptr::null_mut();
     }
     let net_inner = unsafe { &mut (*net).0 };
     let idx = intf_idx as usize;
     if idx >= net_inner.uplinks().len() {
-        unsafe { *libc::__errno_location() = libc::ENOENT };
+        set_errno_raw(libc::ENOENT);
         return ptr::null_mut();
     }
     let ud = userdata;
@@ -403,13 +409,13 @@ pub unsafe extern "C" fn rawket_eth_send(
     len: libc::size_t,
 ) -> c_int {
     if eth.is_null() || buf.is_null() {
-        unsafe { *libc::__errno_location() = libc::EINVAL };
+        set_errno_raw(libc::EINVAL);
         return -1;
     }
     let e = unsafe { &mut *eth };
     let net_inner = unsafe { &mut (*e.net).0 };
     if e.intf_idx >= net_inner.uplinks().len() {
-        unsafe { *libc::__errno_location() = libc::ENOENT };
+        set_errno_raw(libc::ENOENT);
         return -1;
     }
     let frame = unsafe { slice::from_raw_parts(buf, len) };
@@ -464,14 +470,14 @@ fn c_udp_dispatch(pkt: UdpPacket<'_>) {
             return;
         }
         for entry in &*C_UDP_TABLE_PTR {
-            if entry.src_port == pkt.dst_port {
+            if entry.src_port == pkt.dst.port() {
                 let raw_pkt = RawketUdpPacket {
-                    eth_src:  pkt.eth_src,
-                    eth_dst:  pkt.eth_dst,
-                    ip_src:   u32::from_ne_bytes(pkt.ip_src),
-                    ip_dst:   u32::from_ne_bytes(pkt.ip_dst),
-                    src_port: pkt.src_port,
-                    dst_port: pkt.dst_port,
+                    eth_src:  pkt.eth_src.octets(),
+                    eth_dst:  pkt.eth_dst.octets(),
+                    ip_src:   u32::from_ne_bytes(pkt.src.ip().octets()),
+                    ip_dst:   u32::from_ne_bytes(pkt.dst.ip().octets()),
+                    src_port: pkt.src.port(),
+                    dst_port: pkt.dst.port(),
                     pdu:      pkt.pdu.as_ptr(),
                     pdu_len:  pkt.pdu.len(),
                 };
@@ -520,7 +526,7 @@ pub unsafe extern "C" fn rawket_udp_open(
     recv_ud:    *mut libc::c_void,
 ) -> *mut RawketUdpSocket {
     if net.is_null() || uplink_idx < 0 {
-        unsafe { *libc::__errno_location() = libc::EINVAL };
+        set_errno_raw(libc::EINVAL);
         return ptr::null_mut();
     }
     let ip = ip_from_c(src_ip);
@@ -529,19 +535,19 @@ pub unsafe extern "C" fn rawket_udp_open(
     let (sock, fd) = {
         let net_ref = unsafe { &(*net).0 };
         if idx >= net_ref.uplinks().len() {
-            unsafe { *libc::__errno_location() = libc::ENOENT };
+            set_errno_raw(libc::ENOENT);
             return ptr::null_mut();
         }
         let iface = match net_ref.find_iface_for_src_ip(ip) {
             Some((_, i, _)) => i,
-            None => { unsafe { *libc::__errno_location() = libc::ENOENT }; return ptr::null_mut(); }
+            None => { set_errno_raw(libc::ENOENT); return ptr::null_mut(); }
         };
         let recv_fn: for<'a> fn(UdpPacket<'a>) = if on_recv.is_some() {
             c_udp_dispatch
         } else {
             udp_noop
         };
-        match UdpSocket::new(iface, ip, src_port, recv_fn) {
+        match UdpSocket::new(iface, SocketAddrV4::new(ip, src_port), recv_fn) {
             Ok(s) => {
                 let fd = s.fd();
                 (s, fd)
@@ -605,7 +611,7 @@ pub unsafe extern "C" fn rawket_udp_open_cb(
     recv_ud:  *mut libc::c_void,
 ) -> *mut RawketUdpSocket {
     if net.is_null() {
-        unsafe { *libc::__errno_location() = libc::EINVAL };
+        set_errno_raw(libc::EINVAL);
         return ptr::null_mut();
     }
     let ip = ip_from_c(src_ip);
@@ -618,9 +624,9 @@ pub unsafe extern "C" fn rawket_udp_open_cb(
         let net_ref = unsafe { &(*net).0 };
         let iface = match net_ref.find_iface_for_src_ip(ip) {
             Some((_, i, _)) => i,
-            None => { unsafe { *libc::__errno_location() = libc::ENOENT }; return ptr::null_mut(); }
+            None => { set_errno_raw(libc::ENOENT); return ptr::null_mut(); }
         };
-        match UdpSocket::new(iface, ip, src_port, recv_fn) {
+        match UdpSocket::new(iface, SocketAddrV4::new(ip, src_port), recv_fn) {
             Ok(s)  => s,
             Err(e) => { set_errno(e); return ptr::null_mut(); }
         }
@@ -651,18 +657,18 @@ pub unsafe extern "C" fn rawket_network_add_udp_socket(
     sock:     *mut RawketUdpSocket,
 ) -> c_int {
     if net.is_null() || sock.is_null() || intf_idx < 0 {
-        unsafe { *libc::__errno_location() = libc::EINVAL };
+        set_errno_raw(libc::EINVAL);
         return -1;
     }
     let mut s = unsafe { Box::from_raw(sock) };
     let udp = match s.owned_sock.take() {
         Some(u) => u,
-        None => { unsafe { *libc::__errno_location() = libc::EINVAL }; return -1; }
+        None => { set_errno_raw(libc::EINVAL); return -1; }
     };
     let net_inner = unsafe { &mut (*net).0 };
     let idx = intf_idx as usize;
     if idx >= net_inner.uplinks().len() {
-        unsafe { *libc::__errno_location() = libc::ENOENT };
+        set_errno_raw(libc::ENOENT);
         return -1;
     }
     net_inner.uplinks_mut()[idx].add_udp_socket(udp);
@@ -685,7 +691,7 @@ pub unsafe extern "C" fn rawket_udp_send(
     len:      usize,
 ) -> c_int {
     if sock.is_null() || buf.is_null() {
-        unsafe { *libc::__errno_location() = libc::EINVAL };
+        set_errno_raw(libc::EINVAL);
         return -1;
     }
     let s = unsafe { &mut *sock };
@@ -697,20 +703,21 @@ pub unsafe extern "C" fn rawket_udp_send(
         let net_ref = unsafe { &(*s.net).0 };
         match net_ref.route_get(dst) {
             Some(rr) => rr.nexthop_ip,
-            None => { unsafe { *libc::__errno_location() = libc::EHOSTUNREACH }; return -1; }
+            None => { set_errno_raw(libc::EHOSTUNREACH); return -1; }
         }
     };
 
     let net_ref = unsafe { &mut (*s.net).0 };
+    let dst_addr = SocketAddrV4::new(dst, dst_port);
     for udp in net_ref.uplinks_mut()[s.uplink_idx].udp_sockets_mut() {
-        if udp.src_port == s.src_port {
-            return match udp.send_to_now(data, dst, dst_port, nexthop_ip) {
+        if udp.src_port() == s.src_port {
+            return match udp.send_to_now(data, dst_addr, nexthop_ip) {
                 Ok(()) => 0,
                 Err(e) => { set_errno(e); -1 }
             };
         }
     }
-    unsafe { *libc::__errno_location() = libc::ENOENT };
+    set_errno_raw(libc::ENOENT);
     -1
 }
 
@@ -732,8 +739,8 @@ pub type RawketTcpRecvFn =
 
 /// C error callback type for TCP sockets.
 ///
-/// `error` is `RAWKET_TCP_ERR_RESET` (1) or `RAWKET_TCP_ERR_TIMEOUT` (2).
-pub type RawketTcpErrorFn = unsafe extern "C" fn(error: c_int, userdata: *mut libc::c_void);
+/// `error` is `TcpError::Reset` (1) or `TcpError::Timeout` (2).
+pub type RawketTcpErrorFn = unsafe extern "C" fn(error: TcpError, userdata: *mut libc::c_void);
 
 struct TcpCbEntry {
     src_port:   u16,
@@ -763,7 +770,7 @@ fn c_tcp_recv_dispatch(pkt: TcpPacket<'_>) {
     unsafe {
         if C_TCP_TABLE_PTR.is_null() { return; }
         for entry in &*C_TCP_TABLE_PTR {
-            if entry.src_port == pkt.dst_port {
+            if entry.src_port == pkt.dst.port() {
                 if let Some(cb) = entry.on_recv_c {
                     cb(pkt.pdu.as_ptr(), pkt.pdu.len(), entry.recv_ud);
                 }
@@ -781,15 +788,11 @@ fn fire_tcp_errors(net: &mut Network) {
         for uplink in net.uplinks_mut() {
             for tcp in uplink.standalone_tcp_mut() {
                 if let Some(err) = tcp.last_error.take() {
-                    let src_port = tcp.src_port;
+                    let src_port = tcp.src_port();
                     for entry in &*C_TCP_TABLE_PTR {
                         if entry.src_port == src_port {
                             if let Some(cb) = entry.on_error_c {
-                                let code = match err {
-                                    TcpError::Reset   => 1,
-                                    TcpError::Timeout => 2,
-                                };
-                                cb(code, entry.error_ud);
+                                cb(err, entry.error_ud);
                             }
                             break;
                         }
@@ -813,17 +816,6 @@ pub struct RawketTcpSocket {
 // rawket functions from multiple threads concurrently.
 unsafe impl Send for RawketTcpSocket {}
 
-pub const RAWKET_TCP_CLOSED:       c_int = 0;
-pub const RAWKET_TCP_LISTEN:       c_int = 1;
-pub const RAWKET_TCP_SYN_SENT:     c_int = 2;
-pub const RAWKET_TCP_SYN_RECEIVED: c_int = 3;
-pub const RAWKET_TCP_ESTABLISHED:  c_int = 4;
-pub const RAWKET_TCP_FIN_WAIT1:    c_int = 5;
-pub const RAWKET_TCP_FIN_WAIT2:    c_int = 6;
-pub const RAWKET_TCP_CLOSE_WAIT:   c_int = 7;
-pub const RAWKET_TCP_CLOSING:      c_int = 8;
-pub const RAWKET_TCP_LAST_ACK:     c_int = 9;
-pub const RAWKET_TCP_TIME_WAIT:    c_int = 10;
 
 /// Initiate an active TCP connection (sends SYN).
 ///
@@ -845,7 +837,7 @@ pub unsafe extern "C" fn rawket_tcp_connect(
     error_userdata: *mut libc::c_void,
 ) -> *mut RawketTcpSocket {
     if net.is_null() {
-        unsafe { *libc::__errno_location() = libc::EINVAL };
+        set_errno_raw(libc::EINVAL);
         return ptr::null_mut();
     }
     let dst = ip_from_c(dst_ip);
@@ -858,15 +850,17 @@ pub unsafe extern "C" fn rawket_tcp_connect(
         let net_ref = unsafe { &(*net).0 };
         let rr = match net_ref.route_get(dst) {
             Some(r) => r,
-            None => { unsafe { *libc::__errno_location() = libc::EHOSTUNREACH }; return ptr::null_mut(); }
+            None => { set_errno_raw(libc::EHOSTUNREACH); return ptr::null_mut(); }
         };
         let cfg = net_ref.tcp_config();
         let iface = match net_ref.uplinks()[rr.intf_idx].interfaces().first() {
             Some(i) => i,
-            None => { unsafe { *libc::__errno_location() = libc::ENOENT }; return ptr::null_mut(); }
+            None => { set_errno_raw(libc::ENOENT); return ptr::null_mut(); }
         };
+        let src_addr = SocketAddrV4::new(rr.src_ip, src_port);
+        let dst_addr = SocketAddrV4::new(dst, dst_port);
         match TcpSocket::connect_now(
-            iface, rr.src_ip, src_port, dst, dst_port, rr.nexthop_ip,
+            iface, src_addr, dst_addr, rr.nexthop_ip,
             recv_fn, tcp_error_noop, cfg,
         ) {
             Ok(s)  => (s, rr.intf_idx),
@@ -901,7 +895,7 @@ pub unsafe extern "C" fn rawket_tcp_listen(
     error_userdata: *mut libc::c_void,
 ) -> *mut RawketTcpSocket {
     if net.is_null() {
-        unsafe { *libc::__errno_location() = libc::EINVAL };
+        set_errno_raw(libc::EINVAL);
         return ptr::null_mut();
     }
     let ip = ip_from_c(src_ip);
@@ -914,9 +908,9 @@ pub unsafe extern "C" fn rawket_tcp_listen(
         let net_ref = unsafe { &(*net).0 };
         let (uplink_idx, iface, cfg) = match net_ref.find_iface_for_src_ip(ip) {
             Some(t) => t,
-            None => { unsafe { *libc::__errno_location() = libc::ENOENT }; return ptr::null_mut(); }
+            None => { set_errno_raw(libc::ENOENT); return ptr::null_mut(); }
         };
-        match TcpSocket::accept(iface, ip, src_port, recv_fn, tcp_error_noop, cfg) {
+        match TcpSocket::accept(iface, SocketAddrV4::new(ip, src_port), recv_fn, tcp_error_noop, cfg) {
             Ok(s)  => (s, uplink_idx),
             Err(e) => { set_errno(e); return ptr::null_mut(); }
         }
@@ -959,28 +953,18 @@ pub unsafe extern "C" fn rawket_tcp_close(sock: *mut RawketTcpSocket) {
 
 #[no_mangle]
 pub unsafe extern "C" fn rawket_tcp_state(sock: *const RawketTcpSocket) -> c_int {
-    if sock.is_null() { return RAWKET_TCP_CLOSED; }
-    let s = unsafe { &*sock };
-    if s.net.is_null() { return RAWKET_TCP_CLOSED; }
-    let net = unsafe { &(*s.net).0 };
-    if s.intf_idx >= net.uplinks().len() { return RAWKET_TCP_CLOSED; }
-    let standalone = net.uplinks()[s.intf_idx].standalone_tcp();
-    match standalone.iter().find(|t| t.src_port == s.src_port) {
-        None => RAWKET_TCP_CLOSED,
-        Some(t) => match t.state {
-            State::Closed       => RAWKET_TCP_CLOSED,
-            State::Listen       => RAWKET_TCP_LISTEN,
-            State::SynSent      => RAWKET_TCP_SYN_SENT,
-            State::SynReceived  => RAWKET_TCP_SYN_RECEIVED,
-            State::Established  => RAWKET_TCP_ESTABLISHED,
-            State::FinWait1     => RAWKET_TCP_FIN_WAIT1,
-            State::FinWait2     => RAWKET_TCP_FIN_WAIT2,
-            State::CloseWait    => RAWKET_TCP_CLOSE_WAIT,
-            State::Closing      => RAWKET_TCP_CLOSING,
-            State::LastAck      => RAWKET_TCP_LAST_ACK,
-            State::TimeWait     => RAWKET_TCP_TIME_WAIT,
-        }
+    unsafe fn resolve(sock: *const RawketTcpSocket) -> State {
+        if sock.is_null() { return State::Closed; }
+        let s = unsafe { &*sock };
+        if s.net.is_null() { return State::Closed; }
+        let net = unsafe { &(*s.net).0 };
+        if s.intf_idx >= net.uplinks().len() { return State::Closed; }
+        let standalone = net.uplinks()[s.intf_idx].standalone_tcp();
+        standalone.iter()
+            .find(|t| t.src_port() == s.src_port)
+            .map_or(State::Closed, |t| t.state)
     }
+    (unsafe { resolve(sock) }) as c_int
 }
 
 #[no_mangle]
@@ -990,17 +974,17 @@ pub unsafe extern "C" fn rawket_tcp_send(
     len: usize,
 ) -> c_int {
     if sock.is_null() || buf.is_null() {
-        unsafe { *libc::__errno_location() = libc::EINVAL };
+        set_errno_raw(libc::EINVAL);
         return -1;
     }
     let s = unsafe { &mut *sock };
     let data = unsafe { slice::from_raw_parts(buf, len) };
-    if s.net.is_null() { unsafe { *libc::__errno_location() = libc::ENOTCONN }; return -1; }
+    if s.net.is_null() { set_errno_raw(libc::ENOTCONN); return -1; }
     let net = unsafe { &mut (*s.net).0 };
-    if s.intf_idx >= net.uplinks().len() { unsafe { *libc::__errno_location() = libc::ENOENT }; return -1; }
+    if s.intf_idx >= net.uplinks().len() { set_errno_raw(libc::ENOENT); return -1; }
     let standalone = net.uplinks_mut()[s.intf_idx].standalone_tcp_mut();
-    match standalone.iter_mut().find(|t| t.src_port == s.src_port) {
-        None => { unsafe { *libc::__errno_location() = libc::ENOTCONN }; -1 }
+    match standalone.iter_mut().find(|t| t.src_port() == s.src_port) {
+        None => { set_errno_raw(libc::ENOTCONN); -1 }
         Some(t) => match t.send(data) {
             Ok(()) => 0,
             Err(e) => { set_errno(e); -1 }
@@ -1016,7 +1000,7 @@ pub unsafe extern "C" fn rawket_tcp_recv(
     len: usize,
 ) -> c_int {
     if sock.is_null() || buf.is_null() {
-        unsafe { *libc::__errno_location() = libc::EINVAL };
+        set_errno_raw(libc::EINVAL);
         return -1;
     }
     let s = unsafe { &mut *sock };
@@ -1025,7 +1009,7 @@ pub unsafe extern "C" fn rawket_tcp_recv(
     let net = unsafe { &mut (*s.net).0 };
     if s.intf_idx >= net.uplinks().len() { return 0; }
     let standalone = net.uplinks_mut()[s.intf_idx].standalone_tcp_mut();
-    match standalone.iter_mut().find(|t| t.src_port == s.src_port) {
+    match standalone.iter_mut().find(|t| t.src_port() == s.src_port) {
         None => 0,
         Some(t) => match t.recv(buf_slice) {
             Some(n) => n as c_int,
@@ -1038,7 +1022,7 @@ pub unsafe extern "C" fn rawket_tcp_recv(
 #[no_mangle]
 pub unsafe extern "C" fn rawket_tcp_shutdown(sock: *mut RawketTcpSocket) -> c_int {
     if sock.is_null() {
-        unsafe { *libc::__errno_location() = libc::EINVAL };
+        set_errno_raw(libc::EINVAL);
         return -1;
     }
     let s = unsafe { &mut *sock };
@@ -1046,7 +1030,7 @@ pub unsafe extern "C" fn rawket_tcp_shutdown(sock: *mut RawketTcpSocket) -> c_in
     let net = unsafe { &mut (*s.net).0 };
     if s.intf_idx >= net.uplinks().len() { return 0; }
     let standalone = net.uplinks_mut()[s.intf_idx].standalone_tcp_mut();
-    match standalone.iter_mut().find(|t| t.src_port == s.src_port) {
+    match standalone.iter_mut().find(|t| t.src_port() == s.src_port) {
         None => 0,
         Some(t) => match t.close() {
             Ok(()) => 0,
@@ -1063,7 +1047,7 @@ pub unsafe extern "C" fn rawket_network_poll_rx(
     max_timeout_ms: c_int,
 ) -> c_int {
     if net.is_null() {
-        unsafe { *libc::__errno_location() = libc::EINVAL };
+        set_errno_raw(libc::EINVAL);
         return -1;
     }
     let net_ref = unsafe { &mut (*net).0 };
@@ -1091,7 +1075,7 @@ pub unsafe extern "C" fn rawket_route_add(
     nexthop:    c_uint,
 ) -> c_int {
     if net.is_null() {
-        unsafe { *libc::__errno_location() = libc::EINVAL };
+        set_errno_raw(libc::EINVAL);
         return -1;
     }
     let cidr = match Ipv4Cidr::new(ip_from_c(dst_net), prefix_len) {
@@ -1113,7 +1097,7 @@ pub unsafe extern "C" fn rawket_route_del(
     prefix_len: u8,
 ) -> c_int {
     if net.is_null() {
-        unsafe { *libc::__errno_location() = libc::EINVAL };
+        set_errno_raw(libc::EINVAL);
         return -1;
     }
     let cidr = match Ipv4Cidr::new(ip_from_c(dst_net), prefix_len) {
@@ -1140,27 +1124,27 @@ pub unsafe extern "C" fn rawket_arp_request(
     target_ip: c_uint,
 ) -> c_int {
     if net.is_null() || intf_idx < 0 {
-        unsafe { *libc::__errno_location() = libc::EINVAL };
+        set_errno_raw(libc::EINVAL);
         return -1;
     }
     let target = ip_from_c(target_ip);
     let net_inner = unsafe { &mut (*net).0 };
     let idx = intf_idx as usize;
     if idx >= net_inner.uplinks().len() {
-        unsafe { *libc::__errno_location() = libc::ENOENT };
+        set_errno_raw(libc::ENOENT);
         return -1;
     }
     let (src_mac, src_ip) = {
         match net_inner.uplinks()[idx].interfaces().first() {
             Some(iface) => {
-                let mac = *iface.mac();
+                let mac = iface.mac();
                 let ip  = match iface.ip() {
                     Some(c) => c.addr(),
-                    None => { unsafe { *libc::__errno_location() = libc::EADDRNOTAVAIL }; return -1; }
+                    None => { set_errno_raw(libc::EADDRNOTAVAIL); return -1; }
                 };
                 (mac, ip)
             }
-            None => { unsafe { *libc::__errno_location() = libc::ENOENT }; return -1; }
+            None => { set_errno_raw(libc::ENOENT); return -1; }
         }
     };
     // Use the uplink's PacketSocket to send the ARP request.

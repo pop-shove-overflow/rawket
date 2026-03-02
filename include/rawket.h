@@ -22,6 +22,14 @@
 extern "C" {
 #endif
 
+/* ── Compiler attributes ─────────────────────────────────────────────────── */
+
+#ifdef __GNUC__
+#  define RAWKET_NODISCARD __attribute__((warn_unused_result))
+#else
+#  define RAWKET_NODISCARD
+#endif
+
 /* ── Network configuration ───────────────────────────────────────────────── */
 
 /**
@@ -173,7 +181,7 @@ typedef struct RawketTcpSocket  RawketTcpSocket;
  * @param config  Configuration, or NULL to use library defaults
  * @return        Opaque handle, or NULL on failure (errno set)
  */
-RawketNetwork *rawket_network_new(const RawketNetworkConfig *config);
+RAWKET_NODISCARD RawketNetwork *rawket_network_new(const RawketNetworkConfig *config);
 
 /** Free a network runtime and all uplinks it owns. */
 void rawket_network_free(RawketNetwork *net);
@@ -187,7 +195,7 @@ void rawket_network_free(RawketNetwork *net);
  *
  * @return 0 on success, -1 on error
  */
-int rawket_network_poll_rx(RawketNetwork *net, int max_timeout_ms);
+RAWKET_NODISCARD int rawket_network_poll_rx(RawketNetwork *net, int max_timeout_ms);
 
 
 /* ── One-step interface creation ─────────────────────────────────────────── */
@@ -207,8 +215,8 @@ int rawket_network_poll_rx(RawketNetwork *net, int max_timeout_ms);
  * @param mac     6-byte virtual MAC address
  * @return        Interface index (>= 0) on success, -1 on error
  */
-int rawket_network_add_intf(RawketNetwork *net, const char *ifname,
-                             const uint8_t mac[6]);
+RAWKET_NODISCARD int rawket_network_add_intf(RawketNetwork *net, const char *ifname,
+                                              const uint8_t mac[6]);
 
 
 /* ── Interface management ────────────────────────────────────────────────── */
@@ -218,16 +226,16 @@ int rawket_network_add_intf(RawketNetwork *net, const char *ifname,
  *
  * @return 0 on success, -1 on error
  */
-int rawket_intf_get_mac(const RawketNetwork *net, int intf_idx,
-                        uint8_t mac_out[6]);
+RAWKET_NODISCARD int rawket_intf_get_mac(const RawketNetwork *net, int intf_idx,
+                                         uint8_t mac_out[6]);
 
 /**
  * Replace the MAC of the interface at `intf_idx`, updating the BPF filter.
  *
  * @return 0 on success, -1 on error
  */
-int rawket_intf_set_mac(RawketNetwork *net, int intf_idx,
-                        const uint8_t mac[6]);
+RAWKET_NODISCARD int rawket_intf_set_mac(RawketNetwork *net, int intf_idx,
+                                         const uint8_t mac[6]);
 
 /**
  * Assign an IPv4 CIDR address to the interface at `intf_idx`.
@@ -240,8 +248,8 @@ int rawket_intf_set_mac(RawketNetwork *net, int intf_idx,
  * @param prefix_len Network prefix length (0–32)
  * @return           0 on success, -1 on error
  */
-int rawket_intf_assign_ip(RawketNetwork *net, int intf_idx,
-                           uint32_t ip, uint8_t prefix_len);
+RAWKET_NODISCARD int rawket_intf_assign_ip(RawketNetwork *net, int intf_idx,
+                                            uint32_t ip, uint8_t prefix_len);
 
 /**
  * Add (or replace) a route in the network routing table.
@@ -253,9 +261,9 @@ int rawket_intf_assign_ip(RawketNetwork *net, int intf_idx,
  *                   on-link (directly connected) route
  * @return           0 on success, -1 on error
  */
-int rawket_route_add(RawketNetwork *net,
-                     uint32_t dst_net, uint8_t prefix_len,
-                     uint32_t nexthop);
+RAWKET_NODISCARD int rawket_route_add(RawketNetwork *net,
+                                      uint32_t dst_net, uint8_t prefix_len,
+                                      uint32_t nexthop);
 
 /**
  * Remove the route matching dst_net/prefix_len from the routing table.
@@ -264,8 +272,8 @@ int rawket_route_add(RawketNetwork *net,
  *
  * @return 0 on success, -1 on error
  */
-int rawket_route_del(RawketNetwork *net,
-                     uint32_t dst_net, uint8_t prefix_len);
+RAWKET_NODISCARD int rawket_route_del(RawketNetwork *net,
+                                      uint32_t dst_net, uint8_t prefix_len);
 
 
 /* ── ARP helper ──────────────────────────────────────────────────────────── */
@@ -283,7 +291,7 @@ int rawket_route_del(RawketNetwork *net,
  * @param target_ip  Target IPv4 address to resolve (network byte order)
  * @return           0 on success, -1 on error
  */
-int rawket_arp_request(RawketNetwork *net, int intf_idx, uint32_t target_ip);
+RAWKET_NODISCARD int rawket_arp_request(RawketNetwork *net, int intf_idx, uint32_t target_ip);
 
 
 /* ── Ethernet tap ────────────────────────────────────────────────────────── */
@@ -310,8 +318,8 @@ typedef void (*rawket_eth_recv_fn)(const uint8_t *frame, size_t len,
  * @param userdata  Passed unchanged to each cb invocation
  * @return          Opaque handle, or NULL on failure (errno set)
  */
-RawketEthSocket *rawket_open_eth_cb(RawketNetwork *net, int intf_idx,
-                                    rawket_eth_recv_fn cb, void *userdata);
+RAWKET_NODISCARD RawketEthSocket *rawket_open_eth_cb(RawketNetwork *net, int intf_idx,
+                                                     rawket_eth_recv_fn cb, void *userdata);
 
 /** Deregister the tap and free its handle. */
 void rawket_eth_close(RawketEthSocket *eth);
@@ -323,7 +331,7 @@ void rawket_eth_close(RawketEthSocket *eth);
  *
  * @return 0 on success, -1 on error
  */
-int rawket_eth_send(RawketEthSocket *eth, const uint8_t *buf, size_t len);
+RAWKET_NODISCARD int rawket_eth_send(RawketEthSocket *eth, const uint8_t *buf, size_t len);
 
 
 /* ── UDP ─────────────────────────────────────────────────────────────────── */
@@ -366,7 +374,7 @@ typedef void (*rawket_udp_recv_fn)(const RawketUdpPacket *pkt, void *userdata);
  * @param recv_ud    Passed unchanged to each on_recv invocation
  * @return           Opaque handle, or NULL on failure (errno set)
  */
-RawketUdpSocket *rawket_udp_open(
+RAWKET_NODISCARD RawketUdpSocket *rawket_udp_open(
     RawketNetwork     *net,
     int                uplink_idx,
     uint32_t           src_ip,
@@ -396,7 +404,7 @@ void rawket_udp_close(RawketUdpSocket *sock);
  * @param recv_ud  Passed unchanged to each on_recv invocation
  * @return         Opaque handle, or NULL on failure (errno set)
  */
-RawketUdpSocket *rawket_udp_open_cb(
+RAWKET_NODISCARD RawketUdpSocket *rawket_udp_open_cb(
     RawketNetwork     *net,
     uint32_t           src_ip,
     uint16_t           src_port,
@@ -415,9 +423,9 @@ RawketUdpSocket *rawket_udp_open_cb(
  * @param sock     Handle from rawket_udp_open_cb()
  * @return         0 on success, -1 on error
  */
-int rawket_network_add_udp_socket(RawketNetwork   *net,
-                                   int              intf_idx,
-                                   RawketUdpSocket *sock);
+RAWKET_NODISCARD int rawket_network_add_udp_socket(RawketNetwork   *net,
+                                                    int              intf_idx,
+                                                    RawketUdpSocket *sock);
 
 /**
  * Send a UDP datagram.
@@ -434,7 +442,7 @@ int rawket_network_add_udp_socket(RawketNetwork   *net,
  * @param len       Payload length
  * @return          0 on success, -1 on error
  */
-int rawket_udp_send(
+RAWKET_NODISCARD int rawket_udp_send(
     RawketUdpSocket *sock,
     uint32_t         dst_ip,
     uint16_t         dst_port,
@@ -448,22 +456,26 @@ int rawket_udp_fd(const RawketUdpSocket *sock);
 
 /* ── TCP ─────────────────────────────────────────────────────────────────── */
 
-/** TCP state values returned by rawket_tcp_state(). */
-#define RAWKET_TCP_CLOSED        0
-#define RAWKET_TCP_LISTEN        1
-#define RAWKET_TCP_SYN_SENT      2
-#define RAWKET_TCP_SYN_RECEIVED  3
-#define RAWKET_TCP_ESTABLISHED   4
-#define RAWKET_TCP_FIN_WAIT1     5
-#define RAWKET_TCP_FIN_WAIT2     6
-#define RAWKET_TCP_CLOSE_WAIT    7
-#define RAWKET_TCP_CLOSING       8
-#define RAWKET_TCP_LAST_ACK      9
-#define RAWKET_TCP_TIME_WAIT     10
+/** TCP connection states returned by rawket_tcp_state(). */
+typedef enum {
+    RAWKET_TCP_CLOSED       = 0,
+    RAWKET_TCP_LISTEN       = 1,
+    RAWKET_TCP_SYN_SENT     = 2,
+    RAWKET_TCP_SYN_RECEIVED = 3,
+    RAWKET_TCP_ESTABLISHED  = 4,
+    RAWKET_TCP_FIN_WAIT1    = 5,
+    RAWKET_TCP_FIN_WAIT2    = 6,
+    RAWKET_TCP_CLOSE_WAIT   = 7,
+    RAWKET_TCP_CLOSING      = 8,
+    RAWKET_TCP_LAST_ACK     = 9,
+    RAWKET_TCP_TIME_WAIT    = 10,
+} RawketTcpState;
 
 /** Error codes delivered to the rawket_tcp_error_fn callback. */
-#define RAWKET_TCP_ERR_RESET     1
-#define RAWKET_TCP_ERR_TIMEOUT   2
+typedef enum {
+    RAWKET_TCP_ERR_RESET   = 1,
+    RAWKET_TCP_ERR_TIMEOUT = 2,
+} RawketTcpError;
 
 /**
  * TCP receive callback type.
@@ -490,7 +502,7 @@ typedef void (*rawket_tcp_recv_fn)(const uint8_t *data, size_t len,
  * @param error     RAWKET_TCP_ERR_RESET or RAWKET_TCP_ERR_TIMEOUT
  * @param userdata  Value supplied at socket creation
  */
-typedef void (*rawket_tcp_error_fn)(int error, void *userdata);
+typedef void (*rawket_tcp_error_fn)(RawketTcpError error, void *userdata);
 
 /**
  * Initiate an active TCP connection (sends SYN).
@@ -512,7 +524,7 @@ typedef void (*rawket_tcp_error_fn)(int error, void *userdata);
  * @param error_userdata Passed unchanged to each on_error invocation
  * @return               Opaque handle, or NULL on failure (errno set)
  */
-RawketTcpSocket *rawket_tcp_connect(
+RAWKET_NODISCARD RawketTcpSocket *rawket_tcp_connect(
     RawketNetwork      *net,
     uint16_t            src_port,
     uint32_t            dst_ip,
@@ -540,12 +552,12 @@ RawketTcpSocket *rawket_tcp_connect(
  * @param error_userdata Passed unchanged to each on_error invocation
  * @return               Opaque handle, or NULL on failure (errno set)
  */
-RawketTcpSocket *rawket_tcp_listen(
+RAWKET_NODISCARD RawketTcpSocket *rawket_tcp_listen(
     RawketNetwork      *net,
     uint32_t            src_ip,
     uint16_t            src_port,
     rawket_tcp_recv_fn  on_recv,
-    void               *recv_ud,
+    void               *recv_userdata,
     rawket_tcp_error_fn on_error,
     void               *error_userdata
 );
@@ -553,29 +565,29 @@ RawketTcpSocket *rawket_tcp_listen(
 /** Free a TCP socket handle (does NOT send FIN; call rawket_tcp_shutdown first). */
 void rawket_tcp_close(RawketTcpSocket *sock);
 
-/** Query the current connection state (one of RAWKET_TCP_* constants). */
-int rawket_tcp_state(const RawketTcpSocket *sock);
+/** Query the current connection state. */
+RAWKET_NODISCARD RawketTcpState rawket_tcp_state(const RawketTcpSocket *sock);
 
 /**
  * Buffer data for sending on an established connection.
  *
  * @return 0 on success, -1 on error (errno=ENOTCONN if not Established)
  */
-int rawket_tcp_send(RawketTcpSocket *sock, const uint8_t *buf, size_t len);
+RAWKET_NODISCARD int rawket_tcp_send(RawketTcpSocket *sock, const uint8_t *buf, size_t len);
 
 /**
  * Receive data (non-blocking).
  *
  * @return Bytes received (0 = nothing ready), or -1 on error
  */
-int rawket_tcp_recv(RawketTcpSocket *sock, uint8_t *buf, size_t len);
+RAWKET_NODISCARD int rawket_tcp_recv(RawketTcpSocket *sock, uint8_t *buf, size_t len);
 
 /**
  * Initiate graceful close (sends FIN).
  *
  * @return 0 on success, -1 on error
  */
-int rawket_tcp_shutdown(RawketTcpSocket *sock);
+RAWKET_NODISCARD int rawket_tcp_shutdown(RawketTcpSocket *sock);
 
 
 #ifdef __cplusplus

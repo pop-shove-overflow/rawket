@@ -1,12 +1,21 @@
 /// IPv4 header encode / decode + one's-complement checksum helpers.
 use core::fmt;
+use core::net::Ipv4Addr;
 use crate::{Error, Result};
 
 pub const MIN_HDR_LEN: usize = 20;
 
-pub const PROTO_ICMP: u8 = 1;
-pub const PROTO_TCP:  u8 = 6;
-pub const PROTO_UDP:  u8 = 17;
+/// IPv4 protocol number.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct IpProto(u8);
+
+impl IpProto {
+    pub const ICMP: Self = Self(1);
+    pub const TCP:  Self = Self(6);
+    pub const UDP:  Self = Self(17);
+    pub fn value(self) -> u8 { self.0 }
+}
 
 /// More-Fragments flag (bit 13 of `flags_frag`).
 pub const FLAG_MF: u16 = 0x2000;
@@ -23,9 +32,9 @@ pub struct Ipv4Hdr {
     pub id: u16,
     pub flags_frag: u16,
     pub ttl: u8,
-    pub proto: u8,
-    pub src: [u8; 4],
-    pub dst: [u8; 4],
+    pub proto: IpProto,
+    pub src: Ipv4Addr,
+    pub dst: Ipv4Addr,
 }
 
 impl Ipv4Hdr {
@@ -64,9 +73,9 @@ impl Ipv4Hdr {
             id: u16::from_be_bytes([buf[4], buf[5]]),
             flags_frag: u16::from_be_bytes([buf[6], buf[7]]),
             ttl: buf[8],
-            proto: buf[9],
-            src: buf[12..16].try_into().unwrap(),
-            dst: buf[16..20].try_into().unwrap(),
+            proto: IpProto(buf[9]),
+            src: Ipv4Addr::from(<[u8; 4]>::try_from(&buf[12..16]).unwrap()),
+            dst: Ipv4Addr::from(<[u8; 4]>::try_from(&buf[16..20]).unwrap()),
         })
     }
 
@@ -81,10 +90,10 @@ impl Ipv4Hdr {
         buf[4..6].copy_from_slice(&self.id.to_be_bytes());
         buf[6..8].copy_from_slice(&self.flags_frag.to_be_bytes());
         buf[8] = self.ttl;
-        buf[9] = self.proto;
+        buf[9] = self.proto.0;
         buf[10..12].copy_from_slice(&[0, 0]);
-        buf[12..16].copy_from_slice(&self.src);
-        buf[16..20].copy_from_slice(&self.dst);
+        buf[12..16].copy_from_slice(&self.src.octets());
+        buf[16..20].copy_from_slice(&self.dst.octets());
         let csum = checksum(&buf[..MIN_HDR_LEN]);
         buf[10..12].copy_from_slice(&csum.to_be_bytes());
         Ok(())
@@ -119,7 +128,7 @@ impl Ipv4Hdr {
 /// on demand from `prefix_len`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ipv4Cidr {
-    addr:       [u8; 4],
+    addr:       Ipv4Addr,
     prefix_len: u8,
 }
 
@@ -127,14 +136,14 @@ impl Ipv4Cidr {
     /// Construct from a host address and a prefix length (0–32).
     ///
     /// Returns `Err(InvalidInput)` if `prefix_len > 32`.
-    pub fn new(addr: [u8; 4], prefix_len: u8) -> Result<Self> {
+    pub fn new(addr: Ipv4Addr, prefix_len: u8) -> Result<Self> {
         if prefix_len > 32 {
             return Err(Error::InvalidInput);
         }
         Ok(Ipv4Cidr { addr, prefix_len })
     }
 
-    pub fn addr(&self) -> [u8; 4] {
+    pub fn addr(&self) -> Ipv4Addr {
         self.addr
     }
 
@@ -143,40 +152,34 @@ impl Ipv4Cidr {
     }
 
     /// Subnet mask derived from the prefix length.
-    pub fn mask(&self) -> [u8; 4] {
+    pub fn mask(&self) -> Ipv4Addr {
         if self.prefix_len == 0 {
-            [0; 4]
+            Ipv4Addr::from([0u8; 4])
         } else {
-            (!0u32 << (32 - self.prefix_len)).to_be_bytes()
+            Ipv4Addr::from_bits(!0u32 << (32 - self.prefix_len))
         }
     }
 
     /// Network address (`addr & mask`).
-    pub fn network(&self) -> [u8; 4] {
-        let a = u32::from_be_bytes(self.addr);
-        let m = u32::from_be_bytes(self.mask());
-        (a & m).to_be_bytes()
+    pub fn network(&self) -> Ipv4Addr {
+        Ipv4Addr::from_bits(self.addr.to_bits() & self.mask().to_bits())
     }
 
     /// Directed broadcast address (`addr | ~mask`).
-    pub fn broadcast(&self) -> [u8; 4] {
-        let a = u32::from_be_bytes(self.addr);
-        let m = u32::from_be_bytes(self.mask());
-        (a | !m).to_be_bytes()
+    pub fn broadcast(&self) -> Ipv4Addr {
+        Ipv4Addr::from_bits(self.addr.to_bits() | !self.mask().to_bits())
     }
 
     /// Return `true` if `ip` falls within this network (i.e. shares the same
     /// network address after masking).
-    pub fn contains(&self, ip: [u8; 4]) -> bool {
-        let m = u32::from_be_bytes(self.mask());
-        u32::from_be_bytes(ip) & m == u32::from_be_bytes(self.network())
+    pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        ip.to_bits() & self.mask().to_bits() == self.network().to_bits()
     }
 }
 
 impl fmt::Display for Ipv4Cidr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let [a, b, c, d] = self.addr();
-        write!(f, "{a}.{b}.{c}.{d}/{}", self.prefix_len())
+        write!(f, "{}/{}", self.addr, self.prefix_len())
     }
 }
 
@@ -213,9 +216,9 @@ pub fn checksum(data: &[u8]) -> u16 {
 }
 
 /// Seed a checksum accumulator with the TCP/UDP pseudo-header.
-pub fn pseudo_header_acc(src: &[u8; 4], dst: &[u8; 4], proto: u8, length: u16) -> u32 {
-    let acc = checksum_add(0, src);
-    let acc = checksum_add(acc, dst);
-    let acc = checksum_add(acc, &[0, proto]);
+pub fn pseudo_header_acc(src: &Ipv4Addr, dst: &Ipv4Addr, proto: IpProto, length: u16) -> u32 {
+    let acc = checksum_add(0, &src.octets());
+    let acc = checksum_add(acc, &dst.octets());
+    let acc = checksum_add(acc, &[0, proto.0]);
     checksum_add(acc, &length.to_be_bytes())
 }

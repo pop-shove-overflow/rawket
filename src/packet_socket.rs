@@ -308,7 +308,7 @@ impl PacketSocket {
         }
 
         let mut mr_address = [0u8; 8];
-        mr_address[..6].copy_from_slice(mac);
+        mr_address[..6].copy_from_slice(mac.as_bytes());
 
         let mreq = PacketMreq {
             mr_ifindex: self.ifindex,
@@ -354,9 +354,10 @@ impl PacketSocket {
         let mut prog: Vec<SockFilter> = Vec::with_capacity(6 * (n + 1) + 2);
 
         for (i, mac) in self.macs.iter().enumerate() {
-            let mac01 = (mac[0] as u32) << 8 | mac[1] as u32;
-            let mac23 = (mac[2] as u32) << 8 | mac[3] as u32;
-            let mac45 = (mac[4] as u32) << 8 | mac[5] as u32;
+            let b = mac.as_bytes();
+            let mac01 = (b[0] as u32) << 8 | b[1] as u32;
+            let mac23 = (b[2] as u32) << 8 | b[3] as u32;
+            let mac45 = (b[4] as u32) << 8 | b[5] as u32;
             // On a full match at instruction 6i+5, jump forward to accept.
             // Accept is at index 6*(n+1), so the skip count from 6i+6 is:
             //   6*(n+1) - (6i+6) = 6*(n-i)

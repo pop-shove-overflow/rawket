@@ -8,9 +8,10 @@
 /// that purges stale cache entries.
 use alloc::{rc::Rc, vec::Vec};
 use core::cell::{Cell, RefCell};
+use core::net::Ipv4Addr;
 use crate::{
-    arp::{ArpHdr, HDR_LEN as ARP_HDR_LEN, OPER_REQUEST},
-    eth::{EthHdr, MacAddr, HDR_LEN as ETH_HDR_LEN, ETHERTYPE_ARP},
+    arp::{ArpHdr, ArpOp, HDR_LEN as ARP_HDR_LEN},
+    eth::{EthHdr, EtherType, MacAddr, HDR_LEN as ETH_HDR_LEN},
     packet_socket::PacketSocket,
     timers::{now_ms, Timers},
     Result,
@@ -19,7 +20,7 @@ use crate::{
 // ── Entry ─────────────────────────────────────────────────────────────────────
 
 pub struct ArpEntry {
-    pub ip:  [u8; 4],
+    pub ip:  Ipv4Addr,
     pub mac: MacAddr,
     /// Absolute monotonic timestamp (ms) after which this entry is stale.
     expires_at: u64,
@@ -47,7 +48,7 @@ impl ArpCache {
     /// If an entry for `ip` already exists it is updated in place; otherwise
     /// a new entry is appended.  When the cache is full, the oldest entry
     /// (FIFO) is evicted to make room.  The expiry is set to `now + max_age_ms`.
-    pub fn insert(&mut self, ip: [u8; 4], mac: MacAddr) {
+    pub fn insert(&mut self, ip: Ipv4Addr, mac: MacAddr) {
         let expires_at = now_ms() + self.max_age_ms;
         if let Some(e) = self.entries.iter_mut().find(|e| e.ip == ip) {
             e.mac = mac;
@@ -63,7 +64,7 @@ impl ArpCache {
 
     /// Return the cached MAC address for `ip`, or `None` if not present or
     /// expired.
-    pub fn lookup(&self, ip: [u8; 4]) -> Option<MacAddr> {
+    pub fn lookup(&self, ip: Ipv4Addr) -> Option<MacAddr> {
         let now = now_ms();
         self.entries
             .iter()
@@ -74,7 +75,7 @@ impl ArpCache {
     /// Like [`lookup`](Self::lookup), but also extends the entry's expiry to
     /// `now + max_age_ms` on a hit, preventing frequently-used entries from
     /// aging out while traffic is flowing.
-    pub fn lookup_and_refresh(&mut self, ip: [u8; 4]) -> Option<MacAddr> {
+    pub fn lookup_and_refresh(&mut self, ip: Ipv4Addr) -> Option<MacAddr> {
         let now = now_ms();
         if let Some(e) = self.entries.iter_mut().find(|e| e.ip == ip && e.expires_at > now) {
             e.expires_at = now + self.max_age_ms;
@@ -99,7 +100,7 @@ impl ArpCache {
 /// Bytes `[0..6]` are zeroed as a placeholder; [`ArpQueue::drain_for`] fills
 /// them in once ARP resolves.
 pub(crate) struct ArpQueueEntry {
-    pub dst_ip: [u8; 4],
+    pub dst_ip: Ipv4Addr,
     pub frame:  Vec<u8>,
 }
 
@@ -185,7 +186,7 @@ impl ArpQueue {
     }
 
     /// Insert or refresh a cache entry (called on ARP receipt).
-    pub fn insert(&self, ip: [u8; 4], mac: MacAddr) {
+    pub fn insert(&self, ip: Ipv4Addr, mac: MacAddr) {
         self.cache.borrow_mut().insert(ip, mac);
     }
 
@@ -195,12 +196,12 @@ impl ArpQueue {
     }
 
     /// Look up `ip` without extending its TTL.
-    pub fn lookup(&self, ip: [u8; 4]) -> Option<MacAddr> {
+    pub fn lookup(&self, ip: Ipv4Addr) -> Option<MacAddr> {
         self.cache.borrow().lookup(ip)
     }
 
     /// Look up `ip` and extend its TTL on a hit.
-    pub fn lookup_and_refresh(&self, ip: [u8; 4]) -> Option<MacAddr> {
+    pub fn lookup_and_refresh(&self, ip: Ipv4Addr) -> Option<MacAddr> {
         self.cache.borrow_mut().lookup_and_refresh(ip)
     }
 
@@ -211,9 +212,9 @@ impl ArpQueue {
     /// - **Already queued, at limit** → drops frame, returns [`PushResult::Queued`].
     /// - **First for IP** → appends and returns [`PushResult::FirstForIp`];
     ///   the caller must send an ARP Request and add a drop timer.
-    pub fn push_frame(&self, dst_ip: [u8; 4], mut frame: Vec<u8>) -> PushResult {
+    pub fn push_frame(&self, dst_ip: Ipv4Addr, mut frame: Vec<u8>) -> PushResult {
         if let Some(mac) = self.cache.borrow_mut().lookup_and_refresh(dst_ip) {
-            frame[0..6].copy_from_slice(&mac);
+            frame[0..6].copy_from_slice(mac.as_bytes());
             return PushResult::Sent(frame);
         }
         let mut pending = self.pending.borrow_mut();
@@ -232,14 +233,14 @@ impl ArpQueue {
 
     /// Remove all queued frames for `dst_ip`, fill in `mac`, and return them
     /// ready to transmit.  Called by [`Interface::receive`] on ARP resolution.
-    pub fn drain_for(&self, dst_ip: [u8; 4], mac: MacAddr) -> Vec<Vec<u8>> {
+    pub fn drain_for(&self, dst_ip: Ipv4Addr, mac: MacAddr) -> Vec<Vec<u8>> {
         let mut pending = self.pending.borrow_mut();
         let mut out = Vec::new();
         let mut i = 0;
         while i < pending.entries.len() {
             if pending.entries[i].dst_ip == dst_ip {
                 let mut e = pending.entries.remove(i);
-                e.frame[0..6].copy_from_slice(&mac);
+                e.frame[0..6].copy_from_slice(mac.as_bytes());
                 out.push(e.frame);
             } else {
                 i += 1;
@@ -249,7 +250,7 @@ impl ArpQueue {
     }
 
     /// Drop all queued frames for `dst_ip`.  Called by the ARP timeout timer.
-    pub fn drop_pending(&self, dst_ip: [u8; 4]) {
+    pub fn drop_pending(&self, dst_ip: Ipv4Addr) {
         self.pending.borrow_mut().entries.retain(|e| e.dst_ip != dst_ip);
     }
 }
@@ -263,20 +264,20 @@ impl ArpQueue {
 /// [`Interface::receive`](crate::interface::Interface::receive).
 pub fn send_request(
     src_mac: MacAddr,
-    src_ip:  [u8; 4],
-    dst_ip:  [u8; 4],
+    src_ip:  Ipv4Addr,
+    dst_ip:  Ipv4Addr,
     sock:    &mut PacketSocket,
 ) -> Result<()> {
     let frame_len = ETH_HDR_LEN + ARP_HDR_LEN;
     let mut buf = [0u8; 64];
     let frame = &mut buf[..frame_len];
 
-    EthHdr { dst: [0xff; 6], src: src_mac, ethertype: ETHERTYPE_ARP }.emit(frame)?;
+    EthHdr { dst: MacAddr::BROADCAST, src: src_mac, ethertype: EtherType::ARP }.emit(frame)?;
     ArpHdr {
-        oper: OPER_REQUEST,
+        oper: ArpOp::REQUEST,
         sha:  src_mac,
         spa:  src_ip,
-        tha:  [0u8; 6],
+        tha:  MacAddr::ZERO,
         tpa:  dst_ip,
     }
     .emit(&mut frame[ETH_HDR_LEN..])?;

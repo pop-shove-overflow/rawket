@@ -1,11 +1,12 @@
 /// UDP datagram encode / decode + checksum.
 use alloc::vec::Vec;
+use core::net::{Ipv4Addr, SocketAddrV4};
 use crate::{
     arp_cache::{self, ArpQueue, PushResult},
-    eth::{EthHdr, MacAddr, ETHERTYPE_IPV4},
+    eth::{EthHdr, EtherType, MacAddr},
     interface::Interface,
     ip::{
-        checksum_add, checksum_finish, pseudo_header_acc, Ipv4Hdr, PROTO_UDP,
+        checksum_add, checksum_finish, pseudo_header_acc, IpProto, Ipv4Hdr,
         MIN_HDR_LEN as IP_HDR_LEN,
     },
     packet_socket::{PacketSocket, FRAME_SIZE},
@@ -50,8 +51,8 @@ impl UdpHdr {
     pub fn emit(
         &self,
         buf: &mut [u8],
-        src_ip:  &[u8; 4],
-        dst_ip:  &[u8; 4],
+        src_ip:  &Ipv4Addr,
+        dst_ip:  &Ipv4Addr,
         payload: &[u8],
     ) -> Result<()> {
         if buf.len() < HDR_LEN {
@@ -63,7 +64,7 @@ impl UdpHdr {
         buf[4..6].copy_from_slice(&length.to_be_bytes());
         buf[6..8].copy_from_slice(&[0, 0]);
 
-        let acc = pseudo_header_acc(src_ip, dst_ip, PROTO_UDP, length);
+        let acc = pseudo_header_acc(src_ip, dst_ip, IpProto::UDP, length);
         let acc = checksum_add(acc, &buf[..HDR_LEN]);
         let acc = checksum_add(acc, payload);
         let csum = checksum_finish(acc);
@@ -84,12 +85,10 @@ impl UdpHdr {
 ///
 /// Valid only for the duration of the callback invocation.
 pub struct UdpPacket<'a> {
-    pub eth_src:  MacAddr,
-    pub eth_dst:  MacAddr,
-    pub ip_src:   [u8; 4],
-    pub ip_dst:   [u8; 4],
-    pub src_port: u16,
-    pub dst_port: u16,
+    pub eth_src: MacAddr,
+    pub eth_dst: MacAddr,
+    pub src:     SocketAddrV4,
+    pub dst:     SocketAddrV4,
     /// Layer-4 payload (the bytes after the UDP header).
     pub pdu: &'a [u8],
 }
@@ -97,12 +96,11 @@ pub struct UdpPacket<'a> {
 // ── Higher-level socket-like API ──────────────────────────────────────────────
 
 pub struct UdpSocket {
-    sock:      PacketSocket,
-    src_mac:   MacAddr,
-    src_ip:    [u8; 4],
-    pub src_port: u16,
-    tx_id:     u16,
-    on_recv:   for<'a> fn(UdpPacket<'a>),
+    sock:     PacketSocket,
+    src_mac:  MacAddr,
+    src:      SocketAddrV4,
+    tx_id:    u16,
+    on_recv:  for<'a> fn(UdpPacket<'a>),
     /// Combined ARP cache + frame queue, shared with the owning interface.
     /// All MAC lookups and frame queuing go through this single handle.
     arp_queue: ArpQueue,
@@ -115,22 +113,22 @@ impl UdpSocket {
     /// `on_recv` is called by [`dispatch`] whenever a datagram addressed to
     /// `src_port` arrives.  Pass `|_| {}` for a no-op.
     pub(crate) fn new(
-        iface:    &Interface,
-        src_ip:   [u8; 4],
-        src_port: u16,
-        on_recv:  for<'a> fn(UdpPacket<'a>),
+        iface:   &Interface,
+        src:     SocketAddrV4,
+        on_recv: for<'a> fn(UdpPacket<'a>),
     ) -> Result<Self> {
         let sock = iface.open_socket()?;
         Ok(UdpSocket {
             sock,
-            src_mac: *iface.mac(),
-            src_ip,
-            src_port,
+            src_mac: iface.mac(),
+            src,
             tx_id: 0,
             on_recv,
             arp_queue: iface.arp_queue().clone(),
         })
     }
+
+    pub fn src_port(&self) -> u16 { self.src.port() }
 
     /// Send `payload` to `dst_ip:dst_port`.
     ///
@@ -148,20 +146,19 @@ impl UdpSocket {
     pub fn send_to(
         &mut self,
         payload:    &[u8],
-        dst_ip:     [u8; 4],
-        dst_port:   u16,
-        nexthop_ip: [u8; 4],
+        dst:        SocketAddrV4,
+        nexthop_ip: Ipv4Addr,
         timers:     &mut Timers,
     ) -> Result<()> {
         if payload.len() > MAX_UDP_PAYLOAD {
             return Err(Error::InvalidInput);
         }
-        let frame = self.build_frame_vec(payload, dst_ip, dst_port);
+        let frame = self.build_frame_vec(payload, *dst.ip(), dst.port());
         match self.arp_queue.push_frame(nexthop_ip, frame) {
             PushResult::Sent(f) => self.sock.tx_send(&f),
             PushResult::Queued  => Ok(()),
             PushResult::FirstForIp => {
-                arp_cache::send_request(self.src_mac, self.src_ip, nexthop_ip, &mut self.sock)?;
+                arp_cache::send_request(self.src_mac, *self.src.ip(), nexthop_ip, &mut self.sock)?;
                 let q = self.arp_queue.clone();
                 timers.add(ARP_TIMEOUT_MS, move |_| q.drop_pending(nexthop_ip));
                 Ok(())
@@ -177,15 +174,14 @@ impl UdpSocket {
     pub(crate) fn send_to_now(
         &mut self,
         payload:    &[u8],
-        dst_ip:     [u8; 4],
-        dst_port:   u16,
-        nexthop_ip: [u8; 4],
+        dst:        SocketAddrV4,
+        nexthop_ip: Ipv4Addr,
     ) -> Result<()> {
         if payload.len() > MAX_UDP_PAYLOAD {
             return Err(Error::InvalidInput);
         }
         match self.arp_queue.lookup_and_refresh(nexthop_ip) {
-            Some(dst_mac) => self.send_frame(payload, dst_ip, dst_port, dst_mac),
+            Some(dst_mac) => self.send_frame(payload, *dst.ip(), dst.port(), dst_mac),
             None          => Err(Error::WouldBlock),
         }
     }
@@ -202,23 +198,23 @@ impl UdpSocket {
     fn fill_frame(
         &mut self,
         frame:    &mut [u8],
-        dst_ip:   [u8; 4],
+        dst_ip:   Ipv4Addr,
         dst_port: u16,
         dst_mac:  MacAddr,
         payload:  &[u8],
     ) -> Result<()> {
         let total_ip_len = (IP_HDR_LEN + HDR_LEN + payload.len()) as u16;
-        EthHdr { dst: dst_mac, src: self.src_mac, ethertype: ETHERTYPE_IPV4 }.emit(frame)?;
+        EthHdr { dst: dst_mac, src: self.src_mac, ethertype: EtherType::IPV4 }.emit(frame)?;
         self.tx_id = self.tx_id.wrapping_add(1);
         Ipv4Hdr {
             ihl: 5, dscp_ecn: 0, total_len: total_ip_len,
             id: self.tx_id, flags_frag: 0x4000, ttl: 64,
-            proto: PROTO_UDP, src: self.src_ip, dst: dst_ip,
+            proto: IpProto::UDP, src: *self.src.ip(), dst: dst_ip,
         }.emit(&mut frame[crate::eth::HDR_LEN..])?;
         let udp_off = crate::eth::HDR_LEN + IP_HDR_LEN;
-        UdpHdr { src_port: self.src_port, dst_port,
+        UdpHdr { src_port: self.src.port(), dst_port,
                  length: (HDR_LEN + payload.len()) as u16, checksum: 0 }
-            .emit(&mut frame[udp_off..], &self.src_ip, &dst_ip, payload)?;
+            .emit(&mut frame[udp_off..], self.src.ip(), &dst_ip, payload)?;
         frame[udp_off + HDR_LEN..].copy_from_slice(payload);
         Ok(())
     }
@@ -226,12 +222,12 @@ impl UdpSocket {
     fn build_frame_vec(
         &mut self,
         payload:  &[u8],
-        dst_ip:   [u8; 4],
+        dst_ip:   Ipv4Addr,
         dst_port: u16,
     ) -> Vec<u8> {
         let frame_len = crate::eth::HDR_LEN + IP_HDR_LEN + HDR_LEN + payload.len();
         let mut frame = alloc::vec![0u8; frame_len];
-        self.fill_frame(&mut frame, dst_ip, dst_port, [0u8; 6], payload)
+        self.fill_frame(&mut frame, dst_ip, dst_port, MacAddr::ZERO, payload)
             .expect("buffer sized for frame");
         frame
     }
@@ -239,7 +235,7 @@ impl UdpSocket {
     fn send_frame(
         &mut self,
         payload:  &[u8],
-        dst_ip:   [u8; 4],
+        dst_ip:   Ipv4Addr,
         dst_port: u16,
         dst_mac:  MacAddr,
     ) -> Result<()> {
@@ -277,15 +273,13 @@ pub fn dispatch(
     // first segment's checksum.
 
     for s in sockets.iter_mut() {
-        if s.src_port == udp.dst_port {
+        if s.src_port() == udp.dst_port {
             let pdu = udp.payload(udp_buf);
             (s.on_recv)(UdpPacket {
-                eth_src:  eth.src,
-                eth_dst:  eth.dst,
-                ip_src:   ip.src,
-                ip_dst:   ip.dst,
-                src_port: udp.src_port,
-                dst_port: udp.dst_port,
+                eth_src: eth.src,
+                eth_dst: eth.dst,
+                src:     SocketAddrV4::new(ip.src, udp.src_port),
+                dst:     SocketAddrV4::new(ip.dst, udp.dst_port),
                 pdu,
             });
             return Ok(());

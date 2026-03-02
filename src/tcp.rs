@@ -1,11 +1,12 @@
 /// Full TCP state machine: RFC 793 + SACK (RFC 2018) + RACK-TLP (RFC 8985) + BBRv3.
 use alloc::{vec, vec::Vec};
 use core::fmt;
+use core::net::{Ipv4Addr, SocketAddrV4};
 use crate::{
-    eth::{EthHdr, MacAddr, ETHERTYPE_IPV4},
+    eth::{EthHdr, EtherType, MacAddr},
     interface::Interface,
     ip::{
-        checksum_add, checksum_finish, pseudo_header_acc, Ipv4Hdr, PROTO_TCP,
+        checksum_add, checksum_finish, pseudo_header_acc, IpProto, Ipv4Hdr,
         MIN_HDR_LEN as IP_HDR_LEN,
     },
     packet_socket::PacketSocket,
@@ -16,15 +17,86 @@ use crate::{
 
 pub const HDR_LEN: usize = 20;
 
-pub const FLAG_FIN: u8 = 0x01;
-pub const FLAG_SYN: u8 = 0x02;
-pub const FLAG_RST: u8 = 0x04;
-pub const FLAG_PSH: u8 = 0x08;
-pub const FLAG_ACK: u8 = 0x10;
-/// ECN-Echo: receiver signals Congestion Experienced to the sender.
-pub const FLAG_ECE: u8 = 0x40;
-/// Congestion Window Reduced: sender acknowledges the ECE signal.
-pub const FLAG_CWR: u8 = 0x80;
+/// TCP control flags bitmask.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct TcpFlags(u8);
+
+impl TcpFlags {
+    pub const NONE: Self = Self(0x00);
+    pub const FIN:  Self = Self(0x01);
+    pub const SYN:  Self = Self(0x02);
+    pub const RST:  Self = Self(0x04);
+    pub const PSH:  Self = Self(0x08);
+    pub const ACK:  Self = Self(0x10);
+    /// ECN-Echo: receiver signals Congestion Experienced to the sender.
+    pub const ECE:  Self = Self(0x40);
+    /// Congestion Window Reduced: sender acknowledges the ECE signal.
+    pub const CWR:  Self = Self(0x80);
+
+    #[inline] pub fn has(self, f: Self) -> bool { self.0 & f.0 != 0 }
+    #[inline] pub fn is_empty(self) -> bool      { self.0 == 0 }
+    #[inline] pub fn bits(self) -> u8            { self.0 }
+}
+
+impl core::ops::BitOr for TcpFlags {
+    type Output = Self;
+    fn bitor(self, r: Self) -> Self { Self(self.0 | r.0) }
+}
+impl core::ops::BitOrAssign for TcpFlags {
+    fn bitor_assign(&mut self, r: Self) { self.0 |= r.0; }
+}
+impl core::ops::BitAnd for TcpFlags {
+    type Output = Self;
+    fn bitand(self, r: Self) -> Self { Self(self.0 & r.0) }
+}
+
+/// A fixed-point multiplier stored as × 100.
+///
+/// `ScaledFloat::new(125)` represents 1.25.
+/// Use [`apply`] to multiply a `u64` by this factor.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ScaledFloat(u32);
+
+impl ScaledFloat {
+    pub const fn new(x100: u32) -> Self { Self(x100) }
+    /// Returns `v × self / 100`.
+    #[inline]
+    pub fn apply(self, v: u64) -> u64 { v * self.0 as u64 / 100 }
+}
+
+/// A TCP sequence or acknowledgment number with RFC 793 wrapping arithmetic.
+///
+/// All addition and subtraction wraps modulo 2³².
+/// `SeqNum - SeqNum` returns the wrapping distance as `u32`.
+/// Ordering must use the `seq_lt` / `seq_le` / `seq_gt` / `seq_ge` helpers —
+/// do **not** compare with `<` / `>` directly.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct SeqNum(u32);
+
+impl SeqNum {
+    pub const fn new(n: u32) -> Self { Self(n) }
+    pub fn as_u32(self) -> u32 { self.0 }
+}
+
+impl core::ops::Add<u32> for SeqNum {
+    type Output = SeqNum;
+    fn add(self, n: u32) -> SeqNum { SeqNum(self.0.wrapping_add(n)) }
+}
+impl core::ops::AddAssign<u32> for SeqNum {
+    fn add_assign(&mut self, n: u32) { self.0 = self.0.wrapping_add(n); }
+}
+impl core::ops::Sub<u32> for SeqNum {
+    type Output = SeqNum;
+    fn sub(self, n: u32) -> SeqNum { SeqNum(self.0.wrapping_sub(n)) }
+}
+/// Wrapping distance: `a - b` = how many bytes ahead `a` is of `b`.
+impl core::ops::Sub<SeqNum> for SeqNum {
+    type Output = u32;
+    fn sub(self, rhs: SeqNum) -> u32 { self.0.wrapping_sub(rhs.0) }
+}
 
 /// Maximum receive buffer we are willing to hold.  The receive-window
 /// advertisement (scaled by `LOCAL_WS_SHIFT`) is derived from remaining
@@ -43,10 +115,11 @@ const TIME_WAIT_MS: u64 = 120_000;
 
 // ── TcpError ──────────────────────────────────────────────────────────────────
 
+#[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpError {
-    Reset,
-    Timeout,
+    Reset   = 1,
+    Timeout = 2,
 }
 
 impl fmt::Display for TcpError {
@@ -105,19 +178,20 @@ impl Default for TcpConfig {
 
 // ── State machine ─────────────────────────────────────────────────────────────
 
+#[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    Closed,
-    Listen,
-    SynSent,
-    SynReceived,
-    Established,
-    FinWait1,
-    FinWait2,
-    CloseWait,
-    Closing,
-    LastAck,
-    TimeWait,
+    Closed      = 0,
+    Listen      = 1,
+    SynSent     = 2,
+    SynReceived = 3,
+    Established = 4,
+    FinWait1    = 5,
+    FinWait2    = 6,
+    CloseWait   = 7,
+    Closing     = 8,
+    LastAck     = 9,
+    TimeWait    = 10,
 }
 
 impl fmt::Display for State {
@@ -144,10 +218,10 @@ impl fmt::Display for State {
 pub struct TcpHdr {
     pub src_port:    u16,
     pub dst_port:    u16,
-    pub seq:         u32,
-    pub ack:         u32,
+    pub seq:         SeqNum,
+    pub ack:         SeqNum,
     pub data_offset: u8,
-    pub flags:       u8,
+    pub flags:       TcpFlags,
     pub window:      u16,
     pub checksum:    u16,
     pub urgent:      u16,
@@ -161,10 +235,10 @@ impl TcpHdr {
         Ok(TcpHdr {
             src_port:    u16::from_be_bytes([buf[0], buf[1]]),
             dst_port:    u16::from_be_bytes([buf[2], buf[3]]),
-            seq:         u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]),
-            ack:         u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            seq:         SeqNum(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]])),
+            ack:         SeqNum(u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]])),
             data_offset: buf[12] >> 4,
-            flags:       buf[13],
+            flags:       TcpFlags(buf[13]),
             window:      u16::from_be_bytes([buf[14], buf[15]]),
             checksum:    u16::from_be_bytes([buf[16], buf[17]]),
             urgent:      u16::from_be_bytes([buf[18], buf[19]]),
@@ -174,8 +248,8 @@ impl TcpHdr {
     pub fn emit(
         &self,
         buf: &mut [u8],
-        src_ip: &[u8; 4],
-        dst_ip: &[u8; 4],
+        src_ip: &Ipv4Addr,
+        dst_ip: &Ipv4Addr,
         payload: &[u8],
     ) -> Result<()> {
         if buf.len() < HDR_LEN {
@@ -183,16 +257,16 @@ impl TcpHdr {
         }
         buf[0..2].copy_from_slice(&self.src_port.to_be_bytes());
         buf[2..4].copy_from_slice(&self.dst_port.to_be_bytes());
-        buf[4..8].copy_from_slice(&self.seq.to_be_bytes());
-        buf[8..12].copy_from_slice(&self.ack.to_be_bytes());
+        buf[4..8].copy_from_slice(&self.seq.as_u32().to_be_bytes());
+        buf[8..12].copy_from_slice(&self.ack.as_u32().to_be_bytes());
         buf[12] = self.data_offset << 4;
-        buf[13] = self.flags;
+        buf[13] = self.flags.0;
         buf[14..16].copy_from_slice(&self.window.to_be_bytes());
         buf[16..18].copy_from_slice(&[0, 0]);
         buf[18..20].copy_from_slice(&self.urgent.to_be_bytes());
 
         let seg_len = (HDR_LEN + payload.len()) as u16;
-        let acc = pseudo_header_acc(src_ip, dst_ip, PROTO_TCP, seg_len);
+        let acc = pseudo_header_acc(src_ip, dst_ip, IpProto::TCP, seg_len);
         let acc = checksum_add(acc, &buf[..HDR_LEN]);
         let acc = checksum_add(acc, payload);
         let csum = checksum_finish(acc);
@@ -204,8 +278,8 @@ impl TcpHdr {
         self.data_offset as usize * 4
     }
 
-    pub fn has_flag(&self, f: u8) -> bool {
-        self.flags & f != 0
+    pub fn has_flag(&self, f: TcpFlags) -> bool {
+        self.flags.has(f)
     }
 }
 
@@ -216,12 +290,10 @@ impl TcpHdr {
 /// Valid only for the duration of the callback invocation.  An empty `pdu`
 /// signals a FIN (EOF) from the peer.
 pub struct TcpPacket<'a> {
-    pub eth_src:  MacAddr,
-    pub eth_dst:  MacAddr,
-    pub ip_src:   [u8; 4],
-    pub ip_dst:   [u8; 4],
-    pub src_port: u16,
-    pub dst_port: u16,
+    pub eth_src: MacAddr,
+    pub eth_dst: MacAddr,
+    pub src:     SocketAddrV4,
+    pub dst:     SocketAddrV4,
     /// Layer-4 payload.  Empty on FIN.
     pub pdu: &'a [u8],
 }
@@ -229,9 +301,9 @@ pub struct TcpPacket<'a> {
 // ── Retransmit buffer ─────────────────────────────────────────────────────────
 
 struct TxSegment {
-    seq:              u32,
-    end_seq:          u32,   // seq + len (SYN/FIN count +1)
-    flags:            u8,
+    seq:              SeqNum,
+    end_seq:          SeqNum,   // seq + len (SYN/FIN count +1)
+    flags:            TcpFlags,
     data:             Vec<u8>,
     first_sent_ms:    u64,
     last_sent_ms:     u64,
@@ -243,7 +315,7 @@ struct TxSegment {
 // ── Out-of-order receive buffer ───────────────────────────────────────────────
 
 struct RxOooSegment {
-    seq:  u32,
+    seq:  SeqNum,
     data: Vec<u8>,
 }
 
@@ -431,23 +503,23 @@ fn parse_opts(tcp_buf: &[u8], data_offset: u8) -> ParsedOpts {
 /// space (RFC 793 §3.3).  Uses signed wrapping subtraction: correct across the
 /// 2³²-wrap boundary.
 #[inline]
-fn seq_lt(a: u32, b: u32) -> bool { (a.wrapping_sub(b) as i32) < 0 }
+fn seq_lt(a: SeqNum, b: SeqNum) -> bool { ((a - b) as i32) < 0 }
 
 /// Returns `true` if `a` is before or equal to `b` in TCP's circular sequence-number
 /// space (RFC 793 §3.3).  Uses signed wrapping subtraction: correct across the
 /// 2³²-wrap boundary.
 #[inline]
-fn seq_le(a: u32, b: u32) -> bool { (a.wrapping_sub(b) as i32) <= 0 }
+fn seq_le(a: SeqNum, b: SeqNum) -> bool { ((a - b) as i32) <= 0 }
 
 /// Returns `true` if `a` is strictly after `b` in TCP's circular sequence-number
 /// space (RFC 793 §3.3).  Implemented as `seq_lt(b, a)`.
 #[inline]
-fn seq_gt(a: u32, b: u32) -> bool { seq_lt(b, a) }
+fn seq_gt(a: SeqNum, b: SeqNum) -> bool { seq_lt(b, a) }
 
 /// Returns `true` if `a` is after or equal to `b` in TCP's circular sequence-number
 /// space (RFC 793 §3.3).  Implemented as `seq_le(b, a)`.
 #[inline]
-fn seq_ge(a: u32, b: u32) -> bool { seq_le(b, a) }
+fn seq_ge(a: SeqNum, b: SeqNum) -> bool { seq_le(b, a) }
 
 // ── ISN helper ────────────────────────────────────────────────────────────────
 
@@ -484,15 +556,13 @@ pub struct TcpSocket {
     tx:          TxSocket,
     src_mac:     MacAddr,
     dst_mac:     MacAddr,
-    src_ip:      [u8; 4],
-    dst_ip:      [u8; 4],
-    nexthop_ip:  [u8; 4],
-    pub src_port: u16,
-    dst_port:    u16,
+    src:         SocketAddrV4,
+    dst:         SocketAddrV4,
+    nexthop_ip:  Ipv4Addr,
     pub state:   State,
-    snd_nxt:     u32,
-    snd_una:     u32,
-    rcv_nxt:     u32,
+    snd_nxt:     SeqNum,
+    snd_una:     SeqNum,
+    rcv_nxt:     SeqNum,
     tx_id:       u16,
     on_recv:     for<'a> fn(TcpPacket<'a>),
     on_error:    fn(TcpError),
@@ -522,7 +592,7 @@ pub struct TcpSocket {
     rto_ms:      u64,
 
     // RACK
-    rack_end_seq:    u32,
+    rack_end_seq:    SeqNum,
     rack_xmit_ms:    u64,
     /// Extra reorder tolerance added to the RACK timer deadline (ms).
     /// Increased on D-SACK detection; decays toward 0 over time.
@@ -573,28 +643,25 @@ impl TcpSocket {
     fn new_raw(
         tx:        TxSocket,
         src_mac:   MacAddr,
-        src_ip:    [u8; 4],
-        src_port:  u16,
+        src:       SocketAddrV4,
         on_recv:   for<'a> fn(TcpPacket<'a>),
         on_error:  fn(TcpError),
         cfg:       TcpConfig,
     ) -> Self {
-        let isn   = random_u32();
+        let isn   = SeqNum::new(random_u32());
         let rto   = cfg.rto_min_ms;
         let bbr   = BbrState::new(&cfg);
         TcpSocket {
             tx,
             src_mac,
-            dst_mac:         [0u8; 6],
-            src_ip,
-            dst_ip:          [0; 4],
-            nexthop_ip:      [0; 4],
-            src_port,
-            dst_port:        0,
+            dst_mac:         MacAddr::ZERO,
+            src,
+            dst:             SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+            nexthop_ip:      Ipv4Addr::UNSPECIFIED,
             state:           State::Closed,
             snd_nxt:         isn,
             snd_una:         isn,
-            rcv_nxt:         0,
+            rcv_nxt:         SeqNum::new(0),
             tx_id:           0,
             on_recv,
             on_error,
@@ -671,10 +738,10 @@ impl TcpSocket {
         buf[3] = opt_len as u8;
         for (i, ooo) in self.rx_ooo.iter().take(4).enumerate() {
             let left  = ooo.seq;
-            let right = ooo.seq.wrapping_add(ooo.data.len() as u32);
+            let right = ooo.seq + ooo.data.len() as u32;
             let off   = 4 + i * 8;
-            buf[off..off + 4].copy_from_slice(&left.to_be_bytes());
-            buf[off + 4..off + 8].copy_from_slice(&right.to_be_bytes());
+            buf[off..off + 4].copy_from_slice(&left.as_u32().to_be_bytes());
+            buf[off + 4..off + 8].copy_from_slice(&right.as_u32().to_be_bytes());
         }
         total
     }
@@ -683,19 +750,19 @@ impl TcpSocket {
 
     /// Send a TCP segment with explicit sequence number, flags, payload and options.
     /// `opts` must be pre-padded to a multiple of 4 bytes.
-    fn send_segment(&mut self, seq: u32, mut flags: u8, payload: &[u8], opts: &[u8]) -> Result<()> {
+    fn send_segment(&mut self, seq: SeqNum, mut flags: TcpFlags, payload: &[u8], opts: &[u8]) -> Result<()> {
         debug_assert!(opts.len().is_multiple_of(4));
 
         // ECN flag injection (RFC 3168):
         // • ECE on ACK-only segments when we received a CE-marked IP datagram.
         // • CWR on the next data segment after we received an ECE-bearing ACK.
         if self.ecn_enabled {
-            if flags & FLAG_ACK != 0 && flags & FLAG_SYN == 0 && self.ecn_ce_pending {
-                flags |= FLAG_ECE;
+            if flags.has(TcpFlags::ACK) && !flags.has(TcpFlags::SYN) && self.ecn_ce_pending {
+                flags |= TcpFlags::ECE;
                 self.ecn_ce_pending = false;
             }
             if !payload.is_empty() && self.ecn_cwr_needed {
-                flags |= FLAG_CWR;
+                flags |= TcpFlags::CWR;
                 self.ecn_cwr_needed = false;
             }
         }
@@ -707,7 +774,7 @@ impl TcpSocket {
         let mut buf   = alloc::vec![0u8; frame_len];
         let frame     = &mut buf[..];
 
-        EthHdr { dst: self.dst_mac, src: self.src_mac, ethertype: ETHERTYPE_IPV4 }.emit(frame)?;
+        EthHdr { dst: self.dst_mac, src: self.src_mac, ethertype: EtherType::IPV4 }.emit(frame)?;
 
         // ECT(0) = 0x02 marks outgoing data segments as ECN-capable transport.
         let dscp_ecn = if self.ecn_enabled && !payload.is_empty() { 0x02u8 } else { 0u8 };
@@ -716,18 +783,18 @@ impl TcpSocket {
         Ipv4Hdr {
             ihl: 5, dscp_ecn, total_len: ip_total,
             id: self.tx_id, flags_frag: 0x4000, ttl: 64,
-            proto: PROTO_TCP, src: self.src_ip, dst: self.dst_ip,
+            proto: IpProto::TCP, src: *self.src.ip(), dst: *self.dst.ip(),
         }.emit(&mut frame[crate::eth::HDR_LEN..])?;
 
         let tcp_off = crate::eth::HDR_LEN + IP_HDR_LEN;
         let data_offset = (tcp_hdr_len / 4) as u8;
 
-        frame[tcp_off..tcp_off + 2].copy_from_slice(&self.src_port.to_be_bytes());
-        frame[tcp_off + 2..tcp_off + 4].copy_from_slice(&self.dst_port.to_be_bytes());
-        frame[tcp_off + 4..tcp_off + 8].copy_from_slice(&seq.to_be_bytes());
-        frame[tcp_off + 8..tcp_off + 12].copy_from_slice(&self.rcv_nxt.to_be_bytes());
+        frame[tcp_off..tcp_off + 2].copy_from_slice(&self.src.port().to_be_bytes());
+        frame[tcp_off + 2..tcp_off + 4].copy_from_slice(&self.dst.port().to_be_bytes());
+        frame[tcp_off + 4..tcp_off + 8].copy_from_slice(&seq.as_u32().to_be_bytes());
+        frame[tcp_off + 8..tcp_off + 12].copy_from_slice(&self.rcv_nxt.as_u32().to_be_bytes());
         frame[tcp_off + 12] = data_offset << 4;
-        frame[tcp_off + 13] = flags;
+        frame[tcp_off + 13] = flags.0;
         // Advertise how much receive buffer space we have, scaled by rcv_scale.
         // Cap at u16::MAX; if rcv_scale is 0 (not negotiated) this is bytes-exact.
         let recv_headroom = RECV_BUF_MAX.saturating_sub(self.recv_buf.len() as u32);
@@ -745,7 +812,7 @@ impl TcpSocket {
 
         // Compute TCP checksum over header (including options) + payload.
         let seg_total = (tcp_hdr_len + payload.len()) as u16;
-        let acc = pseudo_header_acc(&self.src_ip, &self.dst_ip, PROTO_TCP, seg_total);
+        let acc = pseudo_header_acc(self.src.ip(), self.dst.ip(), IpProto::TCP, seg_total);
         let acc = checksum_add(acc, &frame[tcp_off..tcp_off + tcp_hdr_len + payload.len()]);
         let csum = checksum_finish(acc);
         frame[tcp_off + 16..tcp_off + 18].copy_from_slice(&csum.to_be_bytes());
@@ -755,7 +822,7 @@ impl TcpSocket {
 
     /// Convenience: control segment using current snd_nxt/rcv_nxt.
     /// Includes TCP Timestamps option when negotiated.
-    fn send_ctrl(&mut self, flags: u8) -> Result<()> {
+    fn send_ctrl(&mut self, flags: TcpFlags) -> Result<()> {
         if self.ts_enabled {
             let ts = self.ts_opt();
             self.send_ctrl_opts(flags, &ts)
@@ -765,7 +832,7 @@ impl TcpSocket {
     }
 
     /// Convenience: control segment with options (e.g. SYN with MSS).
-    fn send_ctrl_opts(&mut self, flags: u8, opts: &[u8]) -> Result<()> {
+    fn send_ctrl_opts(&mut self, flags: TcpFlags, opts: &[u8]) -> Result<()> {
         let seq = self.snd_nxt;
         self.send_segment(seq, flags, &[], opts)
     }
@@ -773,14 +840,18 @@ impl TcpSocket {
     // ── BBR helpers ──────────────────────────────────────────────────────────
 
     /// Returns (pacing_gain_x100, cwnd_gain_x100).
-    fn bbr_gains(&self) -> (u32, u32) {
+    fn bbr_gains(&self) -> (ScaledFloat, ScaledFloat) {
         match self.bbr.phase {
-            BbrPhase::Startup => (288, 200),
-            BbrPhase::Drain   => (35,  200),
-            BbrPhase::ProbeBw => {
-                if self.bbr.probe_bw_in_up { (125, 225) } else { (75, 200) }
+            BbrPhase::Startup  => (ScaledFloat::new(288), ScaledFloat::new(200)),
+            BbrPhase::Drain    => (ScaledFloat::new(35),  ScaledFloat::new(200)),
+            BbrPhase::ProbeBw  => {
+                if self.bbr.probe_bw_in_up {
+                    (ScaledFloat::new(125), ScaledFloat::new(225))
+                } else {
+                    (ScaledFloat::new(75),  ScaledFloat::new(200))
+                }
             }
-            BbrPhase::ProbeRtt => (100, 100),
+            BbrPhase::ProbeRtt => (ScaledFloat::new(100), ScaledFloat::new(100)),
         }
     }
 
@@ -793,7 +864,7 @@ impl TcpSocket {
         };
         if effective_bw == 0 { return 0; }
         let (pacing_gain, _) = self.bbr_gains();
-        effective_bw * pacing_gain as u64 / 100
+        pacing_gain.apply(effective_bw)
     }
 
     /// Milliseconds between MSS-sized sends at current pacing rate.
@@ -814,7 +885,7 @@ impl TcpSocket {
         // Round counting: advance round when we've ACKed past next_round_delivered.
         if self.bbr.delivered >= self.bbr.next_round_delivered {
             self.bbr.round_count          += 1;
-            let bytes_in_flight           = self.snd_nxt.wrapping_sub(self.snd_una) as u64;
+            let bytes_in_flight           = (self.snd_nxt - self.snd_una) as u64;
             self.bbr.next_round_delivered = self.bbr.delivered + bytes_in_flight.max(1);
             // Reset per-round loss tracking at new round
             self.bbr.loss_bytes_round  = 0;
@@ -857,7 +928,7 @@ impl TcpSocket {
             self.cfg.mss as u64 * self.cfg.initial_cwnd_pkts as u64
         };
         let four_mss      = 4 * self.cfg.mss as u32;
-        let cwnd_target   = (bdp * cwnd_gain as u64 / 100) as u32 + four_mss;
+        let cwnd_target   = cwnd_gain.apply(bdp) as u32 + four_mss;
         let new_cwnd      = self.bbr.cwnd.saturating_add(acked_bytes as u32);
         self.bbr.cwnd     = new_cwnd.min(cwnd_target).max(four_mss);
 
@@ -871,7 +942,7 @@ impl TcpSocket {
                 // Exit STARTUP if pipe filled (BW not growing for 3 rounds)
                 if !self.bbr.filled_pipe {
                     let max = self.bbr.max_bw;
-                    if max > 0 && max >= self.bbr.full_bw_at_round * 125 / 100 {
+                    if max > 0 && max >= ScaledFloat::new(125).apply(self.bbr.full_bw_at_round) {
                         self.bbr.full_bw_at_round = max;
                         self.bbr.full_bw_cnt      = 0;
                     } else {
@@ -893,7 +964,7 @@ impl TcpSocket {
                 }
             }
             BbrPhase::Drain => {
-                let bytes_in_flight = self.snd_nxt.wrapping_sub(self.snd_una) as u64;
+                let bytes_in_flight = (self.snd_nxt - self.snd_una) as u64;
                 let bdp = if self.bbr.min_rtt_ms < u64::MAX && self.bbr.max_bw > 0 {
                     self.bbr.max_bw * self.bbr.min_rtt_ms / 1_000
                 } else { 0 };
@@ -931,7 +1002,7 @@ impl TcpSocket {
                     }
                 } else {
                     // Drain until in-flight ≤ BDP, then cruise
-                    let bytes_in_flight = self.snd_nxt.wrapping_sub(self.snd_una) as u64;
+                    let bytes_in_flight = (self.snd_nxt - self.snd_una) as u64;
                     let bdp = if self.bbr.min_rtt_ms < u64::MAX && self.bbr.max_bw > 0 {
                         self.bbr.max_bw * self.bbr.min_rtt_ms / 1_000
                     } else { 0 };
@@ -980,7 +1051,7 @@ impl TcpSocket {
 
     // ── Core ACK processing ──────────────────────────────────────────────────
 
-    fn on_ack(&mut self, new_ack: u32, opts: &ParsedOpts) {
+    fn on_ack(&mut self, new_ack: SeqNum, opts: &ParsedOpts) {
         let now          = timers::now_ms();
         let mut acked    = 0u64;
         let mut rtt_sample: Option<u64> = None;
@@ -997,7 +1068,7 @@ impl TcpSocket {
             let seg = &self.unacked[i];
             if seq_le(seg.end_seq, new_ack) {
                 let bytes = seg.data.len() as u64
-                    + if seg.flags & (FLAG_SYN | FLAG_FIN) != 0 { 1 } else { 0 };
+                    + if !(seg.flags & (TcpFlags::SYN | TcpFlags::FIN)).is_empty() { 1 } else { 0 };
                 acked += bytes;
                 // Karn's: RTT only from non-retransmitted segments
                 if seg.retransmits == 0 && rtt_sample.is_none() {
@@ -1022,6 +1093,7 @@ impl TcpSocket {
         // 2. Mark SACK-covered segments
         for k in 0..opts.sack_count as usize {
             if let Some((left, right)) = opts.sack_blocks[k] {
+                let (left, right) = (SeqNum::new(left), SeqNum::new(right));
                 for seg in &mut self.unacked {
                     if !seg.sacked && seq_ge(seg.seq, left) && seq_le(seg.end_seq, right) {
                         seg.sacked = true;
@@ -1084,7 +1156,7 @@ impl TcpSocket {
         // retransmit due to reordering → widen the adaptive reorder window.
         if opts.sack_count > 0 {
             if let Some((left, _)) = opts.sack_blocks[0] {
-                if seq_lt(left, self.snd_una) {
+                if seq_lt(SeqNum::new(left), self.snd_una) {
                     let inc = (self.srtt_ms / 4).max(1);
                     self.rack_reo_wnd_ms =
                         (self.rack_reo_wnd_ms + inc).min(self.srtt_ms);
@@ -1098,7 +1170,7 @@ impl TcpSocket {
         let rack_rtt       = self.srtt_ms.max(1);
         let reorder_window = (rack_rtt / 4).max(1) + self.rack_reo_wnd_ms;
         // Collect segments to retransmit to avoid borrow conflict
-        let mut retx: Vec<(u32, u8, Vec<u8>)> = Vec::new();
+        let mut retx: Vec<(SeqNum, TcpFlags, Vec<u8>)> = Vec::new();
         for seg in &self.unacked {
             if !seg.sacked
                 && seq_le(seg.end_seq, self.rack_end_seq)
@@ -1115,10 +1187,10 @@ impl TcpSocket {
                     s.last_sent_ms = now;
                 }
             }
-            self.bbr_on_loss(data.len() as u64 + if flags & (FLAG_SYN | FLAG_FIN) != 0 { 1 } else { 0 });
+            self.bbr_on_loss(data.len() as u64 + if !(flags & (TcpFlags::SYN | TcpFlags::FIN)).is_empty() { 1 } else { 0 });
             let opts_arr;
             let ts_arr;
-            let opts_slice: &[u8] = if flags & FLAG_SYN != 0 {
+            let opts_slice: &[u8] = if flags.has(TcpFlags::SYN) {
                 opts_arr = self.syn_opts();
                 &opts_arr
             } else if self.ts_enabled {
@@ -1161,7 +1233,7 @@ impl TcpSocket {
             // snd_wnd_raw is the raw (unscaled) value from the peer's header;
             // left-shift by snd_scale to get the true byte count.
             let peer_wnd = (self.snd_wnd_raw as u32) << self.snd_scale;
-            let wnd_limit = self.snd_una.wrapping_add(peer_wnd);
+            let wnd_limit = self.snd_una + peer_wnd;
             if peer_wnd == 0 || seq_ge(self.snd_nxt, wnd_limit) {
                 // Arm persist timer when blocked by zero window
                 if self.persist_deadline_ms == 0 && !self.send_buf.is_empty() {
@@ -1174,14 +1246,14 @@ impl TcpSocket {
             self.persist_deadline_ms = 0;
 
             // cwnd gate
-            let bytes_in_flight = self.snd_nxt.wrapping_sub(self.snd_una);
+            let bytes_in_flight = self.snd_nxt - self.snd_una;
             let limit = self.bbr.cwnd
                 .min(self.bbr.inflight_lo)
                 .min(self.bbr.inflight_hi);
             if bytes_in_flight >= limit { break; }
 
             // Both gates: cap chunk at the tighter of cwnd room and window room.
-            let wnd_room   = wnd_limit.wrapping_sub(self.snd_nxt) as usize;
+            let wnd_room   = (wnd_limit - self.snd_nxt) as usize;
             let available  = ((limit - bytes_in_flight) as usize).min(wnd_room);
             let chunk_len  = (self.peer_mss as usize)
                 .min(self.send_buf.len())
@@ -1197,7 +1269,7 @@ impl TcpSocket {
             let ts_slice: &[u8] = if self.ts_enabled {
                 ts_arr = self.ts_opt(); &ts_arr
             } else { &[] };
-            if self.send_segment(seg_seq, FLAG_PSH | FLAG_ACK, &chunk, ts_slice).is_err() {
+            if self.send_segment(seg_seq, TcpFlags::PSH | TcpFlags::ACK, &chunk, ts_slice).is_err() {
                 // On TX error, put bytes back and give up.
                 let mut tmp = chunk;
                 tmp.append(&mut self.send_buf);
@@ -1206,11 +1278,11 @@ impl TcpSocket {
             }
 
             // Record in retransmit buffer
-            let seg_end = seg_seq.wrapping_add(chunk.len() as u32);
+            let seg_end = seg_seq + chunk.len() as u32;
             self.unacked.push(TxSegment {
                 seq:              seg_seq,
                 end_seq:          seg_end,
-                flags:            FLAG_PSH | FLAG_ACK,
+                flags:            TcpFlags::PSH | TcpFlags::ACK,
                 data:             chunk,
                 first_sent_ms:    now,
                 last_sent_ms:     now,
@@ -1241,18 +1313,18 @@ impl TcpSocket {
     // ── In-order OOO drain ───────────────────────────────────────────────────
 
     /// Flush any OOO segments that have become in-order and call on_recv.
-    fn drain_ooo(&mut self, eth_src: MacAddr, eth_dst: MacAddr, ip_src: [u8;4], ip_dst: [u8;4]) {
+    fn drain_ooo(&mut self, eth_src: MacAddr, eth_dst: MacAddr, ip_src: Ipv4Addr, ip_dst: Ipv4Addr) {
         loop {
             let pos = self.rx_ooo.iter().position(|s| s.seq == self.rcv_nxt);
             let Some(pos) = pos else { break };
             let seg = self.rx_ooo.remove(pos);
-            self.rcv_nxt = self.rcv_nxt.wrapping_add(seg.data.len() as u32);
+            self.rcv_nxt += seg.data.len() as u32;
             self.recv_buf.extend_from_slice(&seg.data);
             let on_recv = self.on_recv;
             on_recv(TcpPacket {
-                eth_src, eth_dst, ip_src, ip_dst,
-                src_port: self.dst_port,
-                dst_port: self.src_port,
+                eth_src, eth_dst,
+                src: SocketAddrV4::new(ip_src, self.dst.port()),
+                dst: SocketAddrV4::new(ip_dst, self.src.port()),
                 pdu: &seg.data,
             });
         }
@@ -1262,13 +1334,13 @@ impl TcpSocket {
 
     pub(crate) fn process_segment(&mut self, raw: &[u8]) -> Result<()> {
         let eth = EthHdr::parse(raw)?;
-        if eth.ethertype != ETHERTYPE_IPV4 { return Ok(()); }
+        if eth.ethertype != EtherType::IPV4 { return Ok(()); }
         let ip_buf = eth.payload(raw);
         let ip     = Ipv4Hdr::parse(ip_buf)?;
-        if ip.proto != PROTO_TCP || ip.dst != self.src_ip { return Ok(()); }
+        if ip.proto != IpProto::TCP || ip.dst != *self.src.ip() { return Ok(()); }
         let tcp_buf = ip.payload(ip_buf);
         let seg     = TcpHdr::parse(tcp_buf)?;
-        if seg.dst_port != self.src_port { return Ok(()); }
+        if seg.dst_port != self.src.port() { return Ok(()); }
 
         // NOTE: no TCP checksum validation here.  AF_PACKET / TPACKET_V2
         // delivers frames whose checksums have already been verified by the
@@ -1277,7 +1349,7 @@ impl TcpSocket {
         // it would silently discard every GRO super-segment.
 
         // RST handling (all states that have an established peer)
-        if seg.has_flag(FLAG_RST) {
+        if seg.has_flag(TcpFlags::RST) {
             match self.state {
                 State::Listen | State::Closed => return Ok(()),
                 _ => {}
@@ -1285,7 +1357,7 @@ impl TcpSocket {
             // Validate RST is within receive window (use actual advertised window).
             let rcv_wnd   = RECV_BUF_MAX.saturating_sub(self.recv_buf.len() as u32);
             let in_window = seq_ge(seg.seq, self.rcv_nxt)
-                && seq_lt(seg.seq, self.rcv_nxt.wrapping_add(rcv_wnd));
+                && seq_lt(seg.seq, self.rcv_nxt + rcv_wnd);
             if in_window || self.state == State::SynSent {
                 self.state      = State::Closed;
                 self.last_error = Some(TcpError::Reset);
@@ -1310,14 +1382,14 @@ impl TcpSocket {
         // considered older.  This handles the case where the peer's clock
         // wraps the full 32-bit range (~49 days at 1-ms resolution).
         if self.ts_enabled
-            && !seg.has_flag(FLAG_SYN)
+            && !seg.has_flag(TcpFlags::SYN)
             && !matches!(self.state, State::Listen | State::SynSent | State::Closed | State::TimeWait)
         {
             if let Some(tsv) = opts.ts_val {
                 if tsv.wrapping_sub(self.ts_recent) > 0x8000_0000 {
                     // Timestamp is older than ts_recent — PAWS violation.
                     // RFC 7323 §5.2: send a duplicate ACK and discard.
-                    let _ = self.send_ctrl(FLAG_ACK);
+                    let _ = self.send_ctrl(TcpFlags::ACK);
                     return Ok(());
                 }
             }
@@ -1331,11 +1403,10 @@ impl TcpSocket {
         match self.state {
             // ── LISTEN ──────────────────────────────────────────────────────
             State::Listen => {
-                if seg.has_flag(FLAG_SYN) && !seg.has_flag(FLAG_ACK) {
-                    self.dst_ip   = ip.src;
-                    self.dst_port = seg.src_port;
-                    self.dst_mac  = eth.src;
-                    self.rcv_nxt  = seg.seq.wrapping_add(1);
+                if seg.has_flag(TcpFlags::SYN) && !seg.has_flag(TcpFlags::ACK) {
+                    self.dst     = SocketAddrV4::new(ip.src, seg.src_port);
+                    self.dst_mac = eth.src;
+                    self.rcv_nxt  = seg.seq + 1;
                     // Learn peer MSS
                     if let Some(m) = opts.mss { self.peer_mss = m; }
                     self.sack_ok = opts.sack_permitted;
@@ -1351,20 +1422,20 @@ impl TcpSocket {
                     }
                     // ECN: if SYN carries both ECE+CWR the peer is ECN-capable.
                     // Respond with SYN-ACK+ECE only (per RFC 3168 §6.1.1).
-                    let ecn_synack = if seg.has_flag(FLAG_ECE) && seg.has_flag(FLAG_CWR) {
+                    let ecn_synack = if seg.has_flag(TcpFlags::ECE) && seg.has_flag(TcpFlags::CWR) {
                         self.ecn_enabled = true;
-                        FLAG_ECE
-                    } else { 0 };
+                        TcpFlags::ECE
+                    } else { TcpFlags::NONE };
                     let syn_opts = self.syn_opts();
                     let isn = self.snd_nxt;
-                    self.send_ctrl_opts(FLAG_SYN | FLAG_ACK | ecn_synack, &syn_opts)?;
-                    self.snd_nxt = self.snd_nxt.wrapping_add(1);
+                    self.send_ctrl_opts(TcpFlags::SYN | TcpFlags::ACK | ecn_synack, &syn_opts)?;
+                    self.snd_nxt += 1;
                     // Record SYN-ACK in unacked
                     let now = timers::now_ms();
                     if self.bbr.delivered_ms == 0 { self.bbr.delivered_ms = now; }
                     self.unacked.push(TxSegment {
-                        seq: isn, end_seq: isn.wrapping_add(1),
-                        flags: FLAG_SYN | FLAG_ACK, data: vec![],
+                        seq: isn, end_seq: isn + 1,
+                        flags: TcpFlags::SYN | TcpFlags::ACK, data: vec![],
                         first_sent_ms: now, last_sent_ms: now,
                         retransmits: 0, sacked: false,
                         dtime_at_send: self.bbr.delivered_ms,
@@ -1378,7 +1449,7 @@ impl TcpSocket {
 
             // ── SYN_RECEIVED ────────────────────────────────────────────────
             State::SynReceived => {
-                if seg.has_flag(FLAG_ACK) && seq_gt(seg.ack, self.snd_una) && seq_le(seg.ack, self.snd_nxt) {
+                if seg.has_flag(TcpFlags::ACK) && seq_gt(seg.ack, self.snd_una) && seq_le(seg.ack, self.snd_nxt) {
                     self.on_ack(seg.ack, &opts);
                     self.state = State::Established;
                     self.flush_send_buf();
@@ -1387,7 +1458,7 @@ impl TcpSocket {
 
             // ── SYN_SENT ────────────────────────────────────────────────────
             State::SynSent => {
-                if seg.has_flag(FLAG_SYN) && seg.has_flag(FLAG_ACK) {
+                if seg.has_flag(TcpFlags::SYN) && seg.has_flag(TcpFlags::ACK) {
                     if let Some(m) = opts.mss { self.peer_mss = m; }
                     self.sack_ok = opts.sack_permitted;
                     // Window scaling negotiated iff SYN-ACK includes WS option.
@@ -1399,15 +1470,15 @@ impl TcpSocket {
                         self.ts_recent  = tsv;
                     }
                     // ECN: SYN-ACK with ECE (without CWR) means peer agrees.
-                    if seg.has_flag(FLAG_ECE) && !seg.has_flag(FLAG_CWR) {
+                    if seg.has_flag(TcpFlags::ECE) && !seg.has_flag(TcpFlags::CWR) {
                         self.ecn_enabled = true;
                     }
-                    self.rcv_nxt = seg.seq.wrapping_add(1);
+                    self.rcv_nxt = seg.seq + 1;
                     self.on_ack(seg.ack, &opts);
-                    self.send_ctrl(FLAG_ACK)?;
+                    self.send_ctrl(TcpFlags::ACK)?;
                     self.state = State::Established;
                     self.flush_send_buf();
-                } else if seg.has_flag(FLAG_SYN) {
+                } else if seg.has_flag(TcpFlags::SYN) {
                     // Simultaneous open (RFC 793 §3.4): bare SYN without ACK.
                     // Transition to SYN_RECEIVED and send SYN+ACK.
                     if let Some(m) = opts.mss { self.peer_mss = m; }
@@ -1419,9 +1490,9 @@ impl TcpSocket {
                         self.ts_enabled = true;
                         self.ts_recent  = tsv;
                     }
-                    self.rcv_nxt = seg.seq.wrapping_add(1);
+                    self.rcv_nxt = seg.seq + 1;
                     let syn_ack_opts = self.syn_opts();
-                    self.send_ctrl_opts(FLAG_SYN | FLAG_ACK, &syn_ack_opts)?;
+                    self.send_ctrl_opts(TcpFlags::SYN | TcpFlags::ACK, &syn_ack_opts)?;
                     self.state = State::SynReceived;
                 }
             }
@@ -1431,12 +1502,12 @@ impl TcpSocket {
                 // Window check: use actual advertised receive window.
                 let rcv_wnd   = RECV_BUF_MAX.saturating_sub(self.recv_buf.len() as u32);
                 let in_window = seq_ge(seg.seq, self.rcv_nxt)
-                    && seq_lt(seg.seq, self.rcv_nxt.wrapping_add(rcv_wnd));
-                let is_keepalive = seg.seq == self.rcv_nxt.wrapping_sub(1);
+                    && seq_lt(seg.seq, self.rcv_nxt + rcv_wnd);
+                let is_keepalive = seg.seq == self.rcv_nxt - 1;
 
                 if !in_window && !is_keepalive {
                     // Duplicate or out-of-window: send ACK and discard
-                    let _ = self.send_ctrl(FLAG_ACK);
+                    let _ = self.send_ctrl(TcpFlags::ACK);
                     return Ok(());
                 }
 
@@ -1445,7 +1516,7 @@ impl TcpSocket {
                 let pdu           = &tcp_buf[payload_start..];
 
                 // Process cumulative ACK; also update the peer's window.
-                if seg.has_flag(FLAG_ACK) {
+                if seg.has_flag(TcpFlags::ACK) {
                     self.snd_wnd_raw = seg.window;
                     if seq_gt(seg.ack, self.snd_una) {
                         self.dupack_count = 0;
@@ -1464,7 +1535,7 @@ impl TcpSocket {
                                     if s.seq == seq { s.retransmits += 1; s.last_sent_ms = now; }
                                 }
                                 let opts_arr;
-                                let opts_slice: &[u8] = if flags & FLAG_SYN != 0 {
+                                let opts_slice: &[u8] = if flags.has(TcpFlags::SYN) {
                                     opts_arr = self.syn_opts(); &opts_arr
                                 } else { &[] };
                                 let _ = self.send_segment(seq, flags, &data, opts_slice);
@@ -1478,39 +1549,39 @@ impl TcpSocket {
                     self.ecn_ce_pending = true;
                 }
                 // ECN: react to ECE on incoming ACKs — reduce cwnd as if loss.
-                if self.ecn_enabled && seg.has_flag(FLAG_ECE) && !seg.has_flag(FLAG_SYN) {
+                if self.ecn_enabled && seg.has_flag(TcpFlags::ECE) && !seg.has_flag(TcpFlags::SYN) {
                     self.bbr_on_loss(self.cfg.mss as u64);
                     self.ecn_cwr_needed = true;
                 }
 
                 // Data / FIN
 
-                if seg.has_flag(FLAG_FIN) {
+                if seg.has_flag(TcpFlags::FIN) {
                     // Deliver any data with FIN
                     if !pdu.is_empty() {
                         let advance = pdu.len();
                         if seg.seq == self.rcv_nxt {
-                            self.rcv_nxt = self.rcv_nxt.wrapping_add(advance as u32);
+                            self.rcv_nxt += advance as u32;
                             self.recv_buf.extend_from_slice(pdu);
                             let on_recv = self.on_recv;
                             let pdu_copy = &tcp_buf[payload_start..]; // borrow raw
                             on_recv(TcpPacket {
                                 eth_src: eth.src, eth_dst: eth.dst,
-                                ip_src: ip.src, ip_dst: ip.dst,
-                                src_port: seg.src_port, dst_port: seg.dst_port,
+                                src: SocketAddrV4::new(ip.src, seg.src_port),
+                                dst: SocketAddrV4::new(ip.dst, seg.dst_port),
                                 pdu: pdu_copy,
                             });
                         }
                     }
                     // FIN consumes one sequence number
-                    self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
-                    let _ = self.send_ctrl(FLAG_ACK);
+                    self.rcv_nxt += 1;
+                    let _ = self.send_ctrl(TcpFlags::ACK);
                     // Notify peer closed with empty pdu
                     let on_recv = self.on_recv;
                     on_recv(TcpPacket {
                         eth_src: eth.src, eth_dst: eth.dst,
-                        ip_src: ip.src, ip_dst: ip.dst,
-                        src_port: seg.src_port, dst_port: seg.dst_port,
+                        src: SocketAddrV4::new(ip.src, seg.src_port),
+                        dst: SocketAddrV4::new(ip.dst, seg.dst_port),
                         pdu: &[],
                     });
                     self.state = State::CloseWait;
@@ -1521,7 +1592,7 @@ impl TcpSocket {
 
                 if seg.seq == self.rcv_nxt {
                     // In-order segment
-                    self.rcv_nxt = self.rcv_nxt.wrapping_add(pdu.len() as u32);
+                    self.rcv_nxt += pdu.len() as u32;
                     self.recv_buf.extend_from_slice(pdu);
                     // Try to drain OOO queue
                     self.drain_ooo(eth.src, eth.dst, ip.src, ip.dst);
@@ -1539,15 +1610,15 @@ impl TcpSocket {
                     let sack_len     = if self.sack_ok { self.build_sack_opts(&mut sack_buf) } else { 0 };
                     let seq = self.snd_nxt;
                     if sack_len > 0 {
-                        self.send_segment(seq, FLAG_ACK, &[], &sack_buf[..sack_len])?;
+                        self.send_segment(seq, TcpFlags::ACK, &[], &sack_buf[..sack_len])?;
                     } else {
-                        self.send_ctrl(FLAG_ACK)?;
+                        self.send_ctrl(TcpFlags::ACK)?;
                     }
                     let on_recv = self.on_recv;
                     on_recv(TcpPacket {
                         eth_src: eth.src, eth_dst: eth.dst,
-                        ip_src: ip.src, ip_dst: ip.dst,
-                        src_port: seg.src_port, dst_port: seg.dst_port,
+                        src: SocketAddrV4::new(ip.src, seg.src_port),
+                        dst: SocketAddrV4::new(ip.dst, seg.dst_port),
                         pdu,
                     });
                 } else if seq_gt(seg.seq, self.rcv_nxt) {
@@ -1570,9 +1641,9 @@ impl TcpSocket {
                     let sack_len     = if self.sack_ok { self.build_sack_opts(&mut sack_buf) } else { 0 };
                     let seq = self.snd_nxt;
                     if sack_len > 0 {
-                        self.send_segment(seq, FLAG_ACK, &[], &sack_buf[..sack_len])?;
+                        self.send_segment(seq, TcpFlags::ACK, &[], &sack_buf[..sack_len])?;
                     } else {
-                        self.send_ctrl(FLAG_ACK)?;
+                        self.send_ctrl(TcpFlags::ACK)?;
                     }
                 }
                 // else: seq < rcv_nxt (retransmit of already-received data) → ACK only
@@ -1584,19 +1655,19 @@ impl TcpSocket {
                 let pdu           = &tcp_buf[payload_start..];
 
                 // Process cumulative ACK (may ACK our FIN or earlier data).
-                if seg.has_flag(FLAG_ACK) && seq_gt(seg.ack, self.snd_una) {
+                if seg.has_flag(TcpFlags::ACK) && seq_gt(seg.ack, self.snd_una) {
                     self.on_ack(seg.ack, &opts);
                 }
 
                 // Deliver in-order payload data (half-close: peer may still send).
                 if !pdu.is_empty() && seg.seq == self.rcv_nxt {
-                    self.rcv_nxt = self.rcv_nxt.wrapping_add(pdu.len() as u32);
+                    self.rcv_nxt += pdu.len() as u32;
                     self.recv_buf.extend_from_slice(pdu);
                     let on_recv = self.on_recv;
                     on_recv(TcpPacket {
                         eth_src: eth.src, eth_dst: eth.dst,
-                        ip_src: ip.src, ip_dst: ip.dst,
-                        src_port: seg.src_port, dst_port: seg.dst_port,
+                        src: SocketAddrV4::new(ip.src, seg.src_port),
+                        dst: SocketAddrV4::new(ip.dst, seg.dst_port),
                         pdu,
                     });
                 }
@@ -1604,9 +1675,9 @@ impl TcpSocket {
                 // State transition based on whether our FIN was ACKed.
                 let fin_acked = seq_ge(self.snd_una, self.snd_nxt);
 
-                if seg.has_flag(FLAG_FIN) {
-                    self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
-                    let _ = self.send_ctrl(FLAG_ACK);
+                if seg.has_flag(TcpFlags::FIN) {
+                    self.rcv_nxt += 1;
+                    let _ = self.send_ctrl(TcpFlags::ACK);
                     if fin_acked {
                         let now = timers::now_ms();
                         self.rto_deadline_ms = now + TIME_WAIT_MS;
@@ -1617,8 +1688,8 @@ impl TcpSocket {
                 } else if fin_acked {
                     self.state = State::FinWait2;
                 }
-                if !pdu.is_empty() || seg.has_flag(FLAG_FIN) {
-                    let _ = self.send_ctrl(FLAG_ACK);
+                if !pdu.is_empty() || seg.has_flag(TcpFlags::FIN) {
+                    let _ = self.send_ctrl(TcpFlags::ACK);
                 }
             }
 
@@ -1628,37 +1699,37 @@ impl TcpSocket {
                 let pdu           = &tcp_buf[payload_start..];
 
                 // Process ACKs for any remaining retransmit state.
-                if seg.has_flag(FLAG_ACK) && seq_gt(seg.ack, self.snd_una) {
+                if seg.has_flag(TcpFlags::ACK) && seq_gt(seg.ack, self.snd_una) {
                     self.on_ack(seg.ack, &opts);
                 }
 
                 // Deliver in-order payload data (peer's send direction is open).
                 if !pdu.is_empty() && seg.seq == self.rcv_nxt {
-                    self.rcv_nxt = self.rcv_nxt.wrapping_add(pdu.len() as u32);
+                    self.rcv_nxt += pdu.len() as u32;
                     self.recv_buf.extend_from_slice(pdu);
                     let on_recv = self.on_recv;
                     on_recv(TcpPacket {
                         eth_src: eth.src, eth_dst: eth.dst,
-                        ip_src: ip.src, ip_dst: ip.dst,
-                        src_port: seg.src_port, dst_port: seg.dst_port,
+                        src: SocketAddrV4::new(ip.src, seg.src_port),
+                        dst: SocketAddrV4::new(ip.dst, seg.dst_port),
                         pdu,
                     });
                 }
 
-                if seg.has_flag(FLAG_FIN) {
-                    self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
-                    let _ = self.send_ctrl(FLAG_ACK);
+                if seg.has_flag(TcpFlags::FIN) {
+                    self.rcv_nxt += 1;
+                    let _ = self.send_ctrl(TcpFlags::ACK);
                     let now = timers::now_ms();
                     self.rto_deadline_ms = now + TIME_WAIT_MS;
                     self.state = State::TimeWait;
                 } else if !pdu.is_empty() {
-                    let _ = self.send_ctrl(FLAG_ACK);
+                    let _ = self.send_ctrl(TcpFlags::ACK);
                 }
             }
 
             // ── CLOSING ─────────────────────────────────────────────────────
             State::Closing => {
-                if seg.has_flag(FLAG_ACK) {
+                if seg.has_flag(TcpFlags::ACK) {
                     let now = timers::now_ms();
                     self.rto_deadline_ms = now + TIME_WAIT_MS;
                     self.state = State::TimeWait;
@@ -1667,7 +1738,7 @@ impl TcpSocket {
 
             // ── LAST_ACK ────────────────────────────────────────────────────
             State::LastAck => {
-                if seg.has_flag(FLAG_ACK) {
+                if seg.has_flag(TcpFlags::ACK) {
                     self.state = State::Closed;
                 }
             }
@@ -1676,7 +1747,7 @@ impl TcpSocket {
             // Peer has sent FIN; local app has not yet called close().
             // Process ACKs; don't expect new data from peer.
             State::CloseWait => {
-                if seg.has_flag(FLAG_ACK) && seq_gt(seg.ack, self.snd_una) {
+                if seg.has_flag(TcpFlags::ACK) && seq_gt(seg.ack, self.snd_una) {
                     self.on_ack(seg.ack, &opts);
                 }
             }
@@ -1697,11 +1768,9 @@ impl TcpSocket {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn connect_now(
         iface:      &Interface,
-        src_ip:     [u8; 4],
-        src_port:   u16,
-        dst_ip:     [u8; 4],
-        dst_port:   u16,
-        nexthop_ip: [u8; 4],
+        src:        SocketAddrV4,
+        dst:        SocketAddrV4,
+        nexthop_ip: Ipv4Addr,
         on_recv:    for<'a> fn(TcpPacket<'a>),
         on_error:   fn(TcpError),
         cfg:        TcpConfig,
@@ -1712,24 +1781,23 @@ impl TcpSocket {
 
         let tx = TxSocket::open(iface.ifindex())?;
         let mut s = Self::new_raw(
-            tx, *iface.mac(), src_ip, src_port, on_recv, on_error,
+            tx, iface.mac(), src, on_recv, on_error,
             cfg,
         );
-        s.dst_ip     = dst_ip;
-        s.dst_port   = dst_port;
+        s.dst        = dst;
         s.nexthop_ip = nexthop_ip;
         s.dst_mac    = dst_mac;
         s.state      = State::SynSent;
         let syn_opts = s.syn_opts();
         let isn = s.snd_nxt;
         // Advertise ECN capability in SYN (RFC 3168 §6.1.1).
-        s.send_ctrl_opts(FLAG_SYN | FLAG_ECE | FLAG_CWR, &syn_opts)?;
-        s.snd_nxt = s.snd_nxt.wrapping_add(1);
+        s.send_ctrl_opts(TcpFlags::SYN | TcpFlags::ECE | TcpFlags::CWR, &syn_opts)?;
+        s.snd_nxt += 1;
         let now = timers::now_ms();
         if s.bbr.delivered_ms == 0 { s.bbr.delivered_ms = now; }
         s.unacked.push(TxSegment {
-            seq: isn, end_seq: isn.wrapping_add(1),
-            flags: FLAG_SYN, data: vec![],
+            seq: isn, end_seq: isn + 1,
+            flags: TcpFlags::SYN, data: vec![],
             first_sent_ms: now, last_sent_ms: now,
             retransmits: 0, sacked: false,
             dtime_at_send: 0,
@@ -1740,16 +1808,15 @@ impl TcpSocket {
 
     /// Passive open: waits for SYN.  Drive with `poll()` until `state == Established`.
     pub(crate) fn accept(
-        iface:    &Interface,
-        src_ip:   [u8; 4],
-        src_port: u16,
-        on_recv:  for<'a> fn(TcpPacket<'a>),
+        iface:   &Interface,
+        src:     SocketAddrV4,
+        on_recv: for<'a> fn(TcpPacket<'a>),
         on_error: fn(TcpError),
-        cfg:      TcpConfig,
+        cfg:     TcpConfig,
     ) -> Result<Self> {
         let tx = TxSocket::open(iface.ifindex())?;
         let mut s = Self::new_raw(
-            tx, *iface.mac(), src_ip, src_port, on_recv, on_error,
+            tx, iface.mac(), src, on_recv, on_error,
             cfg,
         );
         s.state = State::Listen;
@@ -1760,18 +1827,11 @@ impl TcpSocket {
 
     /// Return true if this socket owns the flow identified by the four-tuple.
     /// Used by PMTUD dispatch in `interface.rs` to match an embedded TCP header.
-    pub(crate) fn matches_flow(
-        &self,
-        src_ip:   [u8; 4],
-        dst_ip:   [u8; 4],
-        src_port: u16,
-        dst_port: u16,
-    ) -> bool {
-        self.src_ip   == src_ip
-            && self.dst_ip   == dst_ip
-            && self.src_port == src_port
-            && self.dst_port == dst_port
+    pub(crate) fn matches_flow(&self, src: SocketAddrV4, dst: SocketAddrV4) -> bool {
+        self.src == src && self.dst == dst
     }
+
+    pub fn src_port(&self) -> u16 { self.src.port() }
 
     /// Reduce the effective MSS when a "Fragmentation Needed" ICMP is received
     /// for a segment sent by this socket (RFC 1191 Path MTU Discovery).
@@ -1804,7 +1864,7 @@ impl TcpSocket {
                 let probe_len = (self.cfg.mss as usize).min(self.send_buf.len());
                 let probe: Vec<u8> = self.send_buf[..probe_len].to_vec();
                 let seq = self.snd_nxt;
-                let _ = self.send_segment(seq, FLAG_PSH | FLAG_ACK, &probe, &[]);
+                let _ = self.send_segment(seq, TcpFlags::PSH | TcpFlags::ACK, &probe, &[]);
             }
         }
 
@@ -1825,7 +1885,7 @@ impl TcpSocket {
                 }
                 let opts_arr;
                 let ts_arr;
-                let opts_slice: &[u8] = if flags & FLAG_SYN != 0 {
+                let opts_slice: &[u8] = if flags.has(TcpFlags::SYN) {
                     opts_arr = self.syn_opts();
                     &opts_arr
                 } else if self.ts_enabled {
@@ -1863,8 +1923,8 @@ impl TcpSocket {
                 on_error(TcpError::Timeout);
                 return Ok(());
             }
-            let probe_seq = self.snd_una.wrapping_sub(1);
-            let _ = self.send_segment(probe_seq, FLAG_ACK, &[], &[]);
+            let probe_seq = self.snd_una - 1;
+            let _ = self.send_segment(probe_seq, TcpFlags::ACK, &[], &[]);
             self.keepalive_deadline_ms = now + self.cfg.keepalive_interval_ms;
         }
 
@@ -1881,7 +1941,7 @@ impl TcpSocket {
                 let ts_slice: &[u8] = if self.ts_enabled {
                     ts_arr = self.ts_opt(); &ts_arr
                 } else { &[] };
-                let _ = self.send_segment(seq, FLAG_ACK, &[probe_byte], ts_slice);
+                let _ = self.send_segment(seq, TcpFlags::ACK, &[probe_byte], ts_slice);
             }
             // Exponential backoff, capped at rto_max
             self.persist_backoff_ms = (self.persist_backoff_ms * 2)
@@ -1927,15 +1987,15 @@ impl TcpSocket {
         match self.state {
             State::Established => {
                 let fin_seq = self.snd_nxt;
-                self.send_ctrl(FLAG_FIN | FLAG_ACK)?;
-                self.snd_nxt = self.snd_nxt.wrapping_add(1);
+                self.send_ctrl(TcpFlags::FIN | TcpFlags::ACK)?;
+                self.snd_nxt += 1;
                 self.record_fin(fin_seq);
                 self.state = State::FinWait1;
             }
             State::CloseWait => {
                 let fin_seq = self.snd_nxt;
-                self.send_ctrl(FLAG_FIN | FLAG_ACK)?;
-                self.snd_nxt = self.snd_nxt.wrapping_add(1);
+                self.send_ctrl(TcpFlags::FIN | TcpFlags::ACK)?;
+                self.snd_nxt += 1;
                 self.record_fin(fin_seq);
                 self.state = State::LastAck;
             }
@@ -1946,12 +2006,12 @@ impl TcpSocket {
 
     /// Push a FIN into the retransmit buffer and arm RTO so a lost FIN is
     /// retransmitted.
-    fn record_fin(&mut self, fin_seq: u32) {
+    fn record_fin(&mut self, fin_seq: SeqNum) {
         let now = timers::now_ms();
         self.unacked.push(TxSegment {
             seq:           fin_seq,
-            end_seq:       fin_seq.wrapping_add(1), // FIN occupies 1 sequence byte
-            flags:         FLAG_FIN | FLAG_ACK,
+            end_seq:       fin_seq + 1, // FIN occupies 1 sequence byte
+            flags:         TcpFlags::FIN | TcpFlags::ACK,
             data:          Vec::new(),
             first_sent_ms: now,
             last_sent_ms:  now,
@@ -1986,7 +2046,7 @@ pub fn dispatch(
     let seg     = TcpHdr::parse(tcp_buf)?;
 
     for s in sockets.iter_mut() {
-        if s.src_port == seg.dst_port {
+        if s.src_port() == seg.dst_port {
             s.process_segment(raw)?;
             return Ok(());
         }

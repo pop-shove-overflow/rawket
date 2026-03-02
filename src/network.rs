@@ -8,6 +8,7 @@
 /// [`Network::poll_rx`] is the single entry point for inbound traffic: it
 /// updates the timer system, blocks in `poll(2)` for the appropriate
 /// duration, drains all ready rings, and updates the timer system again.
+use core::net::Ipv4Addr;
 use crate::{
     arp_cache,
     eth::MacAddr,
@@ -165,7 +166,7 @@ impl NetworkConfig {
 pub(crate) struct Route {
     pub dst:     Ipv4Cidr,
     /// `None` = on-link (connected route); `Some(gw)` = forward via gateway.
-    pub nexthop: Option<[u8; 4]>,
+    pub nexthop: Option<Ipv4Addr>,
 }
 
 /// Result of a successful [`Network::route_get`] lookup.
@@ -174,9 +175,9 @@ pub(crate) struct RouteResult {
     /// Index into `Network::uplinks` — the egress uplink.
     pub intf_idx:   usize,
     /// Source address assigned to the egress interface.
-    pub src_ip:     [u8; 4],
+    pub src_ip:     Ipv4Addr,
     /// IP address to resolve via ARP (gateway IP, or `dst_ip` for on-link routes).
-    pub nexthop_ip: [u8; 4],
+    pub nexthop_ip: Ipv4Addr,
 }
 
 // ── Uplink ────────────────────────────────────────────────────────────────────
@@ -215,7 +216,7 @@ impl Uplink {
     ///   ARP cache.
     /// - Installs a recurring ARP cache expiry timer.
     pub fn attach(&mut self, mut iface: Interface, timers: &mut Timers) -> Result<()> {
-        self.sock.attach_mac(iface.mac())?;
+        self.sock.attach_mac(&iface.mac())?;
         // Apply network-wide ARP settings and install the recurring expiry timer.
         iface.arp_queue().set_max_age_ms(self.arp_cache_max_age_ms);
         iface.arp_queue().set_max_entries(self.arp_cache_max_entries);
@@ -241,7 +242,7 @@ impl Uplink {
     /// Marks the interface's ARP queue as dead, which stops the
     /// self-rescheduling expiry timer and drops all queued outbound frames.
     pub fn detach(&mut self, mac: &MacAddr) -> Result<Option<Interface>> {
-        if let Some(idx) = self.interfaces.iter().position(|i| i.mac() == mac) {
+        if let Some(idx) = self.interfaces.iter().position(|i| &i.mac() == mac) {
             let iface = self.interfaces.remove(idx);
             iface.arp_queue().mark_dead();
             self.sock.detach_mac(mac)?;
@@ -300,12 +301,12 @@ impl Uplink {
 
     /// Remove the standalone TCP socket with the given source port.
     pub(crate) fn remove_standalone_tcp(&mut self, src_port: u16) {
-        self.standalone_tcp.retain(|s| s.src_port != src_port);
+        self.standalone_tcp.retain(|s| s.src_port() != src_port);
     }
 
     /// Remove the UDP socket with the given source port.
     pub(crate) fn remove_udp_socket(&mut self, src_port: u16) {
-        self.udp_sockets.retain(|s| s.src_port != src_port);
+        self.udp_sockets.retain(|s| s.src_port() != src_port);
     }
 
     pub fn socket(&self) -> &PacketSocket {
@@ -338,9 +339,9 @@ impl Uplink {
 
     /// Replace the MAC on the first attached interface, updating the BPF
     /// filter accordingly.
-    pub(crate) fn set_iface_mac(&mut self, new_mac: [u8; 6]) -> Result<()> {
+    pub(crate) fn set_iface_mac(&mut self, new_mac: MacAddr) -> Result<()> {
         let iface = self.interfaces.first_mut().ok_or(Error::InvalidInput)?;
-        let old   = *iface.mac();
+        let old   = iface.mac();
         self.sock.detach_mac(&old)?;
         iface.set_mac(new_mac);
         self.sock.attach_mac(&new_mac)?;
@@ -418,7 +419,7 @@ impl Network {
     /// Returns `None` if no attached interface has that IP.
     pub(crate) fn find_iface_for_src_ip(
         &self,
-        src_ip: [u8; 4],
+        src_ip: Ipv4Addr,
     ) -> Option<(usize, &Interface, TcpConfig)> {
         let cfg = self.config.tcp_config();
         for (idx, uplink) in self.uplinks.iter().enumerate() {
@@ -435,7 +436,7 @@ impl Network {
     ///
     /// If a route with the same destination CIDR already exists it is updated
     /// in place; otherwise the new route is appended.
-    pub(crate) fn route_add(&mut self, dst: Ipv4Cidr, nexthop: Option<[u8; 4]>) {
+    pub(crate) fn route_add(&mut self, dst: Ipv4Cidr, nexthop: Option<Ipv4Addr>) {
         if let Some(e) = self.routes.iter_mut().find(|r| r.dst == dst) {
             e.nexthop = nexthop;
         } else {
@@ -452,7 +453,7 @@ impl Network {
     ///
     /// Returns the nexthop IP to ARP for and the egress interface identified
     /// by the interface whose subnet contains that nexthop.
-    pub(crate) fn route_get(&self, dst_ip: [u8; 4]) -> Option<RouteResult> {
+    pub(crate) fn route_get(&self, dst_ip: Ipv4Addr) -> Option<RouteResult> {
         // Longest-prefix-match: highest prefix_len wins (0.0.0.0/0 is last).
         let route = self.routes
             .iter()
@@ -581,13 +582,13 @@ fn drain(uplink: &mut Uplink, timers: &mut Timers) -> Result<()> {
         }
         let raw = &frame_buf[..frame_len];
 
-        let dst_mac: MacAddr = raw[0..6].try_into().unwrap();
+        let dst_mac = MacAddr::from(<[u8; 6]>::try_from(&raw[0..6]).unwrap());
 
         // Deliver to eth tap callbacks for frames addressed to this uplink's
         // interface MAC(s) or Ethernet broadcast.  Frames for other MACs
         // (promiscuous traffic) are not delivered to the tap.
-        let tap_match = dst_mac == [0xff; 6]
-            || uplink.interfaces.iter().any(|i| i.mac() == &dst_mac);
+        let tap_match = dst_mac == MacAddr::BROADCAST
+            || uplink.interfaces.iter().any(|i| i.mac() == dst_mac);
         if tap_match {
             for entry in &uplink.eth_callbacks {
                 (entry.callback)(raw);
@@ -602,13 +603,13 @@ fn drain(uplink: &mut Uplink, timers: &mut Timers) -> Result<()> {
             &mut uplink.standalone_tcp,
         );
 
-        if dst_mac == [0xff; 6] {
+        if dst_mac == MacAddr::BROADCAST {
             for iface in interfaces.iter_mut() {
                 iface.receive(sock, raw, udp_sockets, tcp_sockets, standalone_tcp, timers)?;
             }
         } else {
             for iface in interfaces.iter_mut() {
-                if iface.mac() == &dst_mac {
+                if iface.mac() == dst_mac {
                     iface.receive(sock, raw, udp_sockets, tcp_sockets, standalone_tcp, timers)?;
                     break;
                 }

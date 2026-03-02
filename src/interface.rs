@@ -10,17 +10,18 @@
 /// [`PacketSocket`] filtered to this MAC.
 use alloc::{rc::Rc, vec, vec::Vec};
 use core::cell::{Cell, RefCell};
+use core::net::{Ipv4Addr, SocketAddrV4};
 use crate::{
-    arp::{ArpHdr, HDR_LEN as ARP_HDR_LEN, OPER_REPLY, OPER_REQUEST},
+    arp::{ArpHdr, ArpOp, HDR_LEN as ARP_HDR_LEN},
     arp_cache::ArpQueue,
-    eth::{EthHdr, MacAddr, HDR_LEN as ETH_HDR_LEN, ETHERTYPE_ARP, ETHERTYPE_IPV4},
-    icmp::{IcmpHdr, HDR_LEN as ICMP_HDR_LEN, TYPE_DEST_UNREACH, TYPE_ECHO_REQUEST},
+    eth::{EthHdr, EtherType, MacAddr, HDR_LEN as ETH_HDR_LEN},
+    icmp::{IcmpMessage, HDR_LEN as ICMP_HDR_LEN},
     ip::{
-        Ipv4Cidr, Ipv4Hdr, FLAG_MF, PROTO_ICMP, PROTO_TCP, PROTO_UDP,
+        IpProto, Ipv4Cidr, Ipv4Hdr, FLAG_MF,
         MIN_HDR_LEN as IP_HDR_LEN,
     },
     packet_socket::{PacketSocket, FRAME_SIZE},
-    tcp::{self, TcpHdr, FLAG_ACK, FLAG_FIN, FLAG_RST, FLAG_SYN, HDR_LEN as TCP_HDR_LEN, TcpSocket},
+    tcp::{self, SeqNum, TcpFlags, TcpHdr, HDR_LEN as TCP_HDR_LEN, TcpSocket},
     timers::{now_ms, TimerId, Timers},
     udp::{self, UdpSocket},
     Result,
@@ -46,10 +47,10 @@ const DEFAULT_FRAG_MEM_LIMIT: usize = 65_536;
 /// RFC 791 requires (src, dst, protocol, identification) for uniqueness.
 #[derive(PartialEq)]
 struct ReassemblyKey {
-    src_ip: [u8; 4],
-    dst_ip: [u8; 4],
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
     id:     u16,
-    proto:  u8,
+    proto:  IpProto,
 }
 
 /// One received fragment: its byte offset into the reassembled payload and the
@@ -356,7 +357,7 @@ impl ReassemblyTable {
 pub struct Interface {
     /// NUL-padded, IFNAMSIZ (16) bytes.
     ifname_buf: [u8; 16],
-    mac:        [u8; 6],
+    mac:        MacAddr,
     ifindex:    i32,
     ip:         Option<Ipv4Cidr>,
     tx_id:      u16,
@@ -377,7 +378,7 @@ impl Interface {
     ///
     /// No AF_PACKET socket is opened here.  Attach this interface to a shared
     /// [`PacketSocket`] via [`Uplink::attach`](crate::Uplink::attach).
-    pub fn add(uplink: &[u8], mac: [u8; 6]) -> Result<Self> {
+    pub fn add(uplink: &[u8], mac: MacAddr) -> Result<Self> {
         let ifindex = PacketSocket::ifindex(uplink)?;
         let mut ifname_buf = [0u8; 16];
         let len = uplink.len().min(16);
@@ -402,8 +403,8 @@ impl Interface {
         drop(self);
     }
 
-    pub fn mac(&self) -> &[u8; 6] {
-        &self.mac
+    pub fn mac(&self) -> MacAddr {
+        self.mac
     }
 
     /// NUL-terminated slice into the internal name buffer.
@@ -428,7 +429,7 @@ impl Interface {
         self.ip
     }
 
-    pub(crate) fn set_mac(&mut self, mac: [u8; 6]) {
+    pub(crate) fn set_mac(&mut self, mac: MacAddr) {
         self.mac = mac;
     }
 
@@ -455,7 +456,7 @@ impl Interface {
     /// Look up the MAC address for `ip` in this interface's ARP cache.
     ///
     /// Returns `None` if no non-expired entry exists.
-    pub fn arp_lookup(&self, ip: [u8; 4]) -> Option<MacAddr> {
+    pub fn arp_lookup(&self, ip: Ipv4Addr) -> Option<MacAddr> {
         self.arp.lookup(ip)
     }
 
@@ -518,7 +519,7 @@ impl Interface {
         };
 
         match eth.ethertype {
-            ETHERTYPE_ARP => {
+            EtherType::ARP => {
                 if let Ok(arp) = ArpHdr::parse(eth.payload(raw)) {
                     if arp.tpa == cidr.addr() {
                         // Targeted at us: insert into this interface's cache
@@ -529,7 +530,7 @@ impl Interface {
                             sock.tx_send(&frame)?;
                         }
 
-                        if arp.oper == OPER_REQUEST {
+                        if arp.oper == ArpOp::REQUEST {
                             self.send_arp_reply(sock, &arp)?;
                         }
                     }
@@ -540,7 +541,7 @@ impl Interface {
                     // by broadcasting crafted gratuitous ARP replies.
                 }
             }
-            ETHERTYPE_IPV4 => {
+            EtherType::IPV4 => {
                 let ip_buf = eth.payload(raw);
                 let ip = match Ipv4Hdr::parse(ip_buf) {
                     Ok(h)  => h,
@@ -551,7 +552,7 @@ impl Interface {
                 // directed broadcast, or the limited broadcast 255.255.255.255.
                 // Anything else is silently dropped.
                 let is_broadcast = ip.dst == cidr.broadcast()
-                    || ip.dst == [255u8, 255, 255, 255];
+                    || ip.dst == Ipv4Addr::BROADCAST;
                 if ip.dst != cidr.addr() && !is_broadcast {
                     return Ok(());
                 }
@@ -591,31 +592,30 @@ impl Interface {
         let ip     = Ipv4Hdr::parse(ip_buf)?;
 
         // Drop packets with martian source addresses before any L4 dispatch.
-        let own_ip = self.ip.map(|c| c.addr()).unwrap_or([0u8; 4]);
+        let own_ip = self.ip.map(|c| c.addr()).unwrap_or(Ipv4Addr::UNSPECIFIED);
         if is_martian_src(ip.src, own_ip) {
             return Ok(());
         }
 
         match ip.proto {
-            PROTO_ICMP => {
+            IpProto::ICMP => {
                 let icmp_buf = ip.payload(ip_buf);
-                if let Ok(icmp) = IcmpHdr::parse(icmp_buf) {
-                    if icmp.typ == TYPE_ECHO_REQUEST && icmp.code == 0 {
+                match IcmpMessage::parse(icmp_buf) {
+                    Ok(IcmpMessage::EchoRequest { .. }) => {
                         // RFC 1122 §3.2.2.6: do not reply to echo requests
                         // sent to a broadcast address (Smurf amplification).
-                        let is_bcast = ip.dst == [255u8, 255, 255, 255]
+                        let is_bcast = ip.dst == Ipv4Addr::BROADCAST
                             || self.ip.is_some_and(|c| ip.dst == c.broadcast());
                         if is_bcast { return Ok(()); }
                         self.send_icmp_echo_reply(sock, raw)?;
-                    } else if icmp.typ == TYPE_DEST_UNREACH && icmp.code == 4 {
+                    }
+                    Ok(IcmpMessage::DestUnreach { code: 4, next_hop_mtu }) => {
                         // Fragmentation Needed (RFC 1191 §4): update MSS on the
-                        // matching TCP socket.  The next-hop MTU is in the
-                        // IcmpHdr.seq field (bytes 6-7 of the ICMP header).
-                        let next_hop_mtu = icmp.seq;
-                        let embedded     = icmp.payload(icmp_buf);
+                        // matching TCP socket.
+                        let embedded = &icmp_buf[ICMP_HDR_LEN..];
                         if let Ok(orig_ip) = Ipv4Hdr::parse(embedded) {
                             let orig_tcp_buf = orig_ip.payload(embedded);
-                            if orig_ip.proto == PROTO_TCP && orig_tcp_buf.len() >= 4 {
+                            if orig_ip.proto == IpProto::TCP && orig_tcp_buf.len() >= 4 {
                                 let orig_src_port =
                                     u16::from_be_bytes([orig_tcp_buf[0], orig_tcp_buf[1]]);
                                 let orig_dst_port =
@@ -627,10 +627,8 @@ impl Interface {
                                     .chain(standalone_tcp.iter_mut())
                                 {
                                     if s.matches_flow(
-                                        orig_ip.src,
-                                        orig_ip.dst,
-                                        orig_src_port,
-                                        orig_dst_port,
+                                        SocketAddrV4::new(orig_ip.src, orig_src_port),
+                                        SocketAddrV4::new(orig_ip.dst, orig_dst_port),
                                     ) {
                                         s.update_pmtu(new_mss);
                                     }
@@ -638,15 +636,16 @@ impl Interface {
                             }
                         }
                     }
+                    _ => {}
                 }
             }
-            PROTO_UDP  => { udp::dispatch(self, sock, raw, udp_sockets)?; }
-            PROTO_TCP  => {
+            IpProto::UDP  => { udp::dispatch(self, sock, raw, udp_sockets)?; }
+            IpProto::TCP  => {
                 let tcp_buf = ip.payload(ip_buf);
                 if tcp_buf.len() >= 4 {
                     let dst_port = u16::from_be_bytes([tcp_buf[2], tcp_buf[3]]);
                     for s in standalone_tcp.iter_mut() {
-                        if s.src_port == dst_port {
+                        if s.src_port() == dst_port {
                             let _ = s.process_segment(raw);
                             return Ok(());
                         }
@@ -668,11 +667,11 @@ impl Interface {
         let frame_len = ETH_HDR_LEN + ARP_HDR_LEN;
         let mut frame = [0u8; ETH_HDR_LEN + ARP_HDR_LEN];
 
-        EthHdr { dst: req.sha, src: self.mac, ethertype: ETHERTYPE_ARP }
+        EthHdr { dst: req.sha, src: self.mac, ethertype: EtherType::ARP }
             .emit(&mut frame[..ETH_HDR_LEN])?;
 
         ArpHdr {
-            oper: OPER_REPLY,
+            oper: ArpOp::REPLY,
             sha:  self.mac,
             spa:  req.tpa,   // our IP (the address they were asking about)
             tha:  req.sha,
@@ -694,8 +693,11 @@ impl Interface {
         let ip_buf   = eth.payload(raw);
         let ip       = Ipv4Hdr::parse(ip_buf)?;
         let icmp_buf = ip.payload(ip_buf);
-        let icmp     = IcmpHdr::parse(icmp_buf)?;
-        let payload  = icmp.payload(icmp_buf);
+        let (id, seq) = match IcmpMessage::parse(icmp_buf) {
+            Ok(IcmpMessage::EchoRequest { id, seq }) => (id, seq),
+            _ => return Ok(()),
+        };
+        let payload = &icmp_buf[ICMP_HDR_LEN..];
 
         let frame_len = ETH_HDR_LEN + IP_HDR_LEN + ICMP_HDR_LEN + payload.len();
         if frame_len > FRAME_SIZE {
@@ -705,7 +707,7 @@ impl Interface {
         let mut buf = [0u8; FRAME_SIZE];
         let frame   = &mut buf[..frame_len];
 
-        EthHdr { dst: eth.src, src: self.mac, ethertype: ETHERTYPE_IPV4 }.emit(frame)?;
+        EthHdr { dst: eth.src, src: self.mac, ethertype: EtherType::IPV4 }.emit(frame)?;
 
         self.tx_id = self.tx_id.wrapping_add(1);
         Ipv4Hdr {
@@ -715,16 +717,14 @@ impl Interface {
             id:        self.tx_id,
             flags_frag: 0,
             ttl:       64,
-            proto:     PROTO_ICMP,
+            proto:     IpProto::ICMP,
             src:       cidr.addr(),
             dst:       ip.src,
         }
         .emit(&mut frame[ETH_HDR_LEN..])?;
 
         let icmp_off = ETH_HDR_LEN + IP_HDR_LEN;
-        IcmpHdr { typ: crate::icmp::TYPE_ECHO_REPLY, code: 0, checksum: 0,
-                  id: icmp.id, seq: icmp.seq }
-            .emit(&mut frame[icmp_off..], payload)?;
+        IcmpMessage::EchoReply { id, seq }.emit(&mut frame[icmp_off..], payload)?;
         frame[icmp_off + ICMP_HDR_LEN..].copy_from_slice(payload);
 
         sock.tx_send(frame)
@@ -767,7 +767,7 @@ impl Interface {
         let mut buf   = [0u8; FRAME_SIZE];
         let frame     = &mut buf[..frame_len];
 
-        EthHdr { dst: eth.src, src: self.mac, ethertype: ETHERTYPE_IPV4 }.emit(frame)?;
+        EthHdr { dst: eth.src, src: self.mac, ethertype: EtherType::IPV4 }.emit(frame)?;
 
         self.tx_id = self.tx_id.wrapping_add(1);
         Ipv4Hdr {
@@ -777,14 +777,14 @@ impl Interface {
             id: self.tx_id,
             flags_frag: 0,
             ttl: 64,
-            proto: PROTO_ICMP,
+            proto: IpProto::ICMP,
             src: cidr.addr(),
             dst: ip.src,
         }
         .emit(&mut frame[ETH_HDR_LEN..])?;
 
         let icmp_off = ETH_HDR_LEN + IP_HDR_LEN;
-        IcmpHdr { typ: 3, code, checksum: 0, id: 0, seq: 0 }
+        IcmpMessage::DestUnreach { code, next_hop_mtu: 0 }
             .emit(&mut frame[icmp_off..], icmp_payload)?;
         frame[icmp_off + ICMP_HDR_LEN..icmp_off + ICMP_HDR_LEN + icmp_payload_len]
             .copy_from_slice(icmp_payload);
@@ -810,7 +810,7 @@ impl Interface {
         let mut buf   = [0u8; FRAME_SIZE];
         let frame     = &mut buf[..frame_len];
 
-        EthHdr { dst: eth.src, src: self.mac, ethertype: ETHERTYPE_IPV4 }.emit(frame)?;
+        EthHdr { dst: eth.src, src: self.mac, ethertype: EtherType::IPV4 }.emit(frame)?;
 
         self.tx_id = self.tx_id.wrapping_add(1);
         Ipv4Hdr {
@@ -820,22 +820,22 @@ impl Interface {
             id: self.tx_id,
             flags_frag: 0,
             ttl: 64,
-            proto: PROTO_TCP,
+            proto: IpProto::TCP,
             src: cidr.addr(),
             dst: ip.src,
         }
         .emit(&mut frame[ETH_HDR_LEN..])?;
 
         let tcp_off = ETH_HDR_LEN + IP_HDR_LEN;
-        let (seq, ack_num, flags) = if seg.has_flag(FLAG_ACK) {
-            (seg.ack, 0u32, FLAG_RST)
+        let (seq, ack_num, flags) = if seg.has_flag(TcpFlags::ACK) {
+            (seg.ack, SeqNum::new(0), TcpFlags::RST)
         } else {
             // RFC 793 §3.4: ack = SEG.SEQ + SEG.LEN (payload + SYN/FIN).
             let payload_start = seg.hdr_len().min(tcp_buf.len());
             let payload_len   = tcp_buf.len().saturating_sub(payload_start) as u32;
-            let syn_fin       = (seg.flags & (FLAG_SYN | FLAG_FIN)).count_ones();
+            let syn_fin       = (seg.flags & (TcpFlags::SYN | TcpFlags::FIN)).bits().count_ones();
             let seg_len       = payload_len + syn_fin;
-            (0u32, seg.seq.wrapping_add(seg_len.max(1)), FLAG_RST | FLAG_ACK)
+            (SeqNum::new(0), seg.seq + seg_len.max(1), TcpFlags::RST | TcpFlags::ACK)
         };
         TcpHdr {
             src_port:    seg.dst_port,
@@ -866,12 +866,13 @@ impl Interface {
 /// - `255.255.255.255` — limited broadcast
 /// - `own_ip` — LAND attack (source == our own address)
 #[inline]
-fn is_martian_src(src: [u8; 4], own_ip: [u8; 4]) -> bool {
-    src[0] == 0          // 0.0.0.0/8
-    || src[0] == 127     // loopback
-    || src[0] >= 224     // multicast and reserved (224–255)
-    || src == [255, 255, 255, 255]
-    || src == own_ip     // LAND attack
+fn is_martian_src(src: Ipv4Addr, own_ip: Ipv4Addr) -> bool {
+    src.is_unspecified()   // 0.0.0.0/8
+    || src.is_loopback()   // 127.0.0.0/8
+    || src.is_multicast()  // 224.0.0.0/4
+    || src.octets()[0] >= 240  // reserved / Class E (240.0.0.0/4) and broadcast
+    || src.is_broadcast()
+    || src == own_ip       // LAND attack
 }
 
 // ── Fragment purge timer ──────────────────────────────────────────────────────
