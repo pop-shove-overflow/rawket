@@ -9,7 +9,7 @@ use crate::{
         checksum_add, checksum_finish, pseudo_header_acc, IpProto, Ipv4Hdr,
         MIN_HDR_LEN as IP_HDR_LEN,
     },
-    packet_socket::{PacketSocket, FRAME_SIZE},
+    af_packet::{AfPacketSocket, EtherLink, FRAME_SIZE},
     timers::Timers,
     Error, Result,
 };
@@ -96,7 +96,7 @@ pub struct UdpPacket<'a> {
 // ── Higher-level socket-like API ──────────────────────────────────────────────
 
 pub struct UdpSocket {
-    sock:     PacketSocket,
+    sock:     AfPacketSocket,
     src_mac:  MacAddr,
     src:      SocketAddrV4,
     tx_id:    u16,
@@ -256,7 +256,7 @@ impl UdpSocket {
 /// On no match, sends ICMP Destination Unreachable Type 3 Code 3 via `iface`.
 pub fn dispatch(
     iface:   &mut Interface,
-    sock:    &mut PacketSocket,
+    sock:    &mut impl EtherLink,
     raw:     &[u8],
     sockets: &mut [UdpSocket],
 ) -> Result<()> {

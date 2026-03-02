@@ -1,6 +1,6 @@
 /// Simple AF_PACKET raw Ethernet socket.
 ///
-/// Unlike [`PacketSocket`], this does not use TPACKET_V2 mmap rings; it uses
+/// Unlike [`AfPacketSocket`], this does not use TPACKET_V2 mmap rings; it uses
 /// ordinary `sendto(2)` / `recv(2)` syscalls.  Intended for low-frequency,
 /// short-lived uses such as a DHCP client where the ring setup overhead is
 /// not worthwhile.

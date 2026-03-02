@@ -4,7 +4,7 @@
 /// ownership of each frame is indicated by the `tp_status` field in the
 /// per-frame `tpacket2_hdr`.
 ///
-/// A single `PacketSocket` can serve multiple L3 [`Interface`]s on the same
+/// A single `AfPacketSocket` can serve multiple L3 [`Interface`]s on the same
 /// uplink.  [`attach_mac`] / [`detach_mac`] maintain the BPF filter as a
 /// union of all registered MACs; [`poll`] dispatches inbound frames to the
 /// matching interface's L3 receive handler.
@@ -60,7 +60,45 @@ struct Tpacket2Hdr {
     _padding: [u8; 4],
 }
 
-pub struct PacketSocket {
+// ── EtherLink trait ───────────────────────────────────────────────────────────
+
+/// Abstraction over an Ethernet frame I/O endpoint.
+///
+/// Implemented by [`AfPacketSocket`] (production AF_PACKET ring) and by
+/// `VirtualLink` (in-process wire used by the system-test-validator).
+pub trait EtherLink {
+    /// Poll for one received frame. Returns a borrowed slice into an internal
+    /// buffer. Caller MUST call [`rx_release`] before the next [`rx_recv`].
+    fn rx_recv(&mut self) -> Option<&[u8]>;
+
+    /// Release the buffer returned by [`rx_recv`].
+    fn rx_release(&mut self);
+
+    /// Copy `frame` into the transmit path and dispatch it.
+    fn tx_send(&mut self, frame: &[u8]) -> Result<()>;
+
+    /// Return an OS file descriptor suitable for use with `poll(2)`.
+    ///
+    /// Implementations that are not backed by a real file descriptor should
+    /// return `-1`; `poll(2)` on Linux ignores entries with negative fds,
+    /// so the caller will rely on timer-driven wakeups instead.
+    fn fd(&self) -> libc::c_int { -1 }
+
+    /// Register `mac` in the link-layer receive filter.
+    ///
+    /// The default implementation is a no-op (suitable for virtual links that
+    /// do their own frame routing).
+    fn attach_mac(&mut self, _mac: &MacAddr) -> Result<()> { Ok(()) }
+
+    /// Deregister `mac` from the link-layer receive filter.
+    ///
+    /// The default implementation is a no-op.
+    fn detach_mac(&mut self, _mac: &MacAddr) -> Result<()> { Ok(()) }
+}
+
+// ── AfPacketSocket ────────────────────────────────────────────────────────────
+
+pub struct AfPacketSocket {
     fd: libc::c_int,
     ifindex: i32,
     /// RX ring at `[0, ring_bytes)`, TX ring at `[ring_bytes, 2*ring_bytes)`.
@@ -73,9 +111,9 @@ pub struct PacketSocket {
 }
 
 // SAFETY: The mmap region is exclusively owned by this struct.
-unsafe impl Send for PacketSocket {}
+unsafe impl Send for AfPacketSocket {}
 
-impl PacketSocket {
+impl AfPacketSocket {
     pub fn open(ifindex: i32) -> Result<Self> {
         let fd = unsafe {
             libc::socket(
@@ -161,7 +199,7 @@ impl PacketSocket {
             return Err(Error::last_os());
         }
 
-        Ok(PacketSocket { fd, ifindex, map, ring_bytes, rx_idx: 0, tx_idx: 0, macs: Vec::new() })
+        Ok(AfPacketSocket { fd, ifindex, map, ring_bytes, rx_idx: 0, tx_idx: 0, macs: Vec::new() })
     }
 
     /// Look up the interface index for `ifname` (NUL-terminated C string).
@@ -194,103 +232,12 @@ impl PacketSocket {
         unsafe { (self.map as *mut u8).add(offset) as *mut Tpacket2Hdr }
     }
 
-    /// Return the next available received frame, or `None` if the ring is empty.
-    ///
-    /// The caller **must** call [`rx_release`] after processing the frame.
-    pub fn rx_recv(&mut self) -> Option<&[u8]> {
-        let hdr = self.rx_frame_ptr(self.rx_idx);
-        let status = unsafe { ptr::read_volatile(&(*hdr).tp_status) };
-        if status & TP_STATUS_USER == 0 {
-            return None;
-        }
-        let snaplen = unsafe { (*hdr).tp_snaplen as usize };
-        let mac_off = unsafe { (*hdr).tp_mac as usize };
-        let base = hdr as usize + mac_off;
-        Some(unsafe { slice::from_raw_parts(base as *const u8, snaplen) })
-    }
-
-    /// Return the current RX frame to the kernel and advance the index.
-    pub fn rx_release(&mut self) {
-        let hdr = self.rx_frame_ptr(self.rx_idx);
-        unsafe { ptr::write_volatile(&mut (*hdr).tp_status, TP_STATUS_KERNEL) };
-        self.rx_idx = self.rx_idx.wrapping_add(1) % FRAME_COUNT;
-    }
-
-    // ── TX ───────────────────────────────────────────────────────────────────
-
     fn tx_frame_ptr(&self, idx: usize) -> *mut Tpacket2Hdr {
         let offset = self.ring_bytes + (idx % FRAME_COUNT) * FRAME_SIZE;
         unsafe { (self.map as *mut u8).add(offset) as *mut Tpacket2Hdr }
     }
 
-    /// Copy `frame` into the next TX slot and signal the kernel.
-    ///
-    /// Returns `Err(WouldBlock)` if the ring is full.
-    pub fn tx_send(&mut self, frame: &[u8]) -> Result<()> {
-        if frame.len() > FRAME_SIZE - mem::size_of::<Tpacket2Hdr>() {
-            return Err(Error::InvalidInput);
-        }
-
-        let hdr = self.tx_frame_ptr(self.tx_idx);
-        let status = unsafe { ptr::read_volatile(&(*hdr).tp_status) };
-        if status != TP_STATUS_AVAILABLE {
-            return Err(Error::WouldBlock);
-        }
-
-        let mac_off = mem::size_of::<Tpacket2Hdr>();
-        unsafe {
-            let dst = (hdr as *mut u8).add(mac_off);
-            ptr::copy_nonoverlapping(frame.as_ptr(), dst, frame.len());
-            (*hdr).tp_len = frame.len() as u32;
-            (*hdr).tp_snaplen = frame.len() as u32;
-            (*hdr).tp_mac = mac_off as u16;
-            (*hdr).tp_net = (mac_off + 14) as u16;
-            ptr::write_volatile(&mut (*hdr).tp_status, TP_STATUS_SEND_REQUEST);
-        }
-
-        self.tx_idx = self.tx_idx.wrapping_add(1) % FRAME_COUNT;
-
-        let rc = unsafe { libc::sendto(self.fd, ptr::null(), 0, 0, ptr::null(), 0) };
-        if rc < 0 {
-            let e = Error::last_os();
-            if e.raw_os() == Some(libc::ENOBUFS) {
-                return Err(Error::WouldBlock);
-            }
-            return Err(e);
-        }
-        Ok(())
-    }
-
-    pub fn fd(&self) -> libc::c_int {
-        self.fd
-    }
-
     // ── BPF MAC filter + NIC unicast membership ──────────────────────────────
-
-    /// Add `mac` to the set of addresses accepted by the kernel BPF filter
-    /// and register it with the NIC's hardware receive filter via
-    /// `PACKET_ADD_MEMBERSHIP / PACKET_MR_UNICAST`.
-    ///
-    /// Without the membership call the NIC drops unicast frames for virtual
-    /// MACs before they ever reach the socket; the BPF filter alone is not
-    /// sufficient.  No-op if `mac` is already registered.
-    pub fn attach_mac(&mut self, mac: &MacAddr) -> Result<()> {
-        if !self.macs.contains(mac) {
-            self.macs.push(*mac);
-            self.set_membership(mac, true)?;
-        }
-        self.rebuild_filter()
-    }
-
-    /// Remove `mac` from the filter and deregister it from the NIC's hardware
-    /// receive filter.  No-op if not present.
-    pub fn detach_mac(&mut self, mac: &MacAddr) -> Result<()> {
-        if self.macs.contains(mac) {
-            self.set_membership(mac, false)?;
-            self.macs.retain(|m| m != mac);
-        }
-        self.rebuild_filter()
-    }
 
     /// Call `PACKET_ADD_MEMBERSHIP` or `PACKET_DROP_MEMBERSHIP` with
     /// `mr_type = PACKET_MR_UNICAST` for `mac`.
@@ -392,10 +339,100 @@ impl PacketSocket {
         };
         if rc < 0 { Err(Error::last_os()) } else { Ok(()) }
     }
-
 }
 
-impl Drop for PacketSocket {
+impl EtherLink for AfPacketSocket {
+    /// Return the next available received frame, or `None` if the ring is empty.
+    ///
+    /// The caller **must** call [`rx_release`] after processing the frame.
+    fn rx_recv(&mut self) -> Option<&[u8]> {
+        let hdr = self.rx_frame_ptr(self.rx_idx);
+        let status = unsafe { ptr::read_volatile(&(*hdr).tp_status) };
+        if status & TP_STATUS_USER == 0 {
+            return None;
+        }
+        let snaplen = unsafe { (*hdr).tp_snaplen as usize };
+        let mac_off = unsafe { (*hdr).tp_mac as usize };
+        let base = hdr as usize + mac_off;
+        Some(unsafe { slice::from_raw_parts(base as *const u8, snaplen) })
+    }
+
+    /// Return the current RX frame to the kernel and advance the index.
+    fn rx_release(&mut self) {
+        let hdr = self.rx_frame_ptr(self.rx_idx);
+        unsafe { ptr::write_volatile(&mut (*hdr).tp_status, TP_STATUS_KERNEL) };
+        self.rx_idx = self.rx_idx.wrapping_add(1) % FRAME_COUNT;
+    }
+
+    /// Copy `frame` into the next TX slot and signal the kernel.
+    ///
+    /// Returns `Err(WouldBlock)` if the ring is full.
+    fn tx_send(&mut self, frame: &[u8]) -> Result<()> {
+        if frame.len() > FRAME_SIZE - mem::size_of::<Tpacket2Hdr>() {
+            return Err(Error::InvalidInput);
+        }
+
+        let hdr = self.tx_frame_ptr(self.tx_idx);
+        let status = unsafe { ptr::read_volatile(&(*hdr).tp_status) };
+        if status != TP_STATUS_AVAILABLE {
+            return Err(Error::WouldBlock);
+        }
+
+        let mac_off = mem::size_of::<Tpacket2Hdr>();
+        unsafe {
+            let dst = (hdr as *mut u8).add(mac_off);
+            ptr::copy_nonoverlapping(frame.as_ptr(), dst, frame.len());
+            (*hdr).tp_len = frame.len() as u32;
+            (*hdr).tp_snaplen = frame.len() as u32;
+            (*hdr).tp_mac = mac_off as u16;
+            (*hdr).tp_net = (mac_off + 14) as u16;
+            ptr::write_volatile(&mut (*hdr).tp_status, TP_STATUS_SEND_REQUEST);
+        }
+
+        self.tx_idx = self.tx_idx.wrapping_add(1) % FRAME_COUNT;
+
+        let rc = unsafe { libc::sendto(self.fd, ptr::null(), 0, 0, ptr::null(), 0) };
+        if rc < 0 {
+            let e = Error::last_os();
+            if e.raw_os() == Some(libc::ENOBUFS) {
+                return Err(Error::WouldBlock);
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn fd(&self) -> libc::c_int {
+        self.fd
+    }
+
+    /// Add `mac` to the set of addresses accepted by the kernel BPF filter
+    /// and register it with the NIC's hardware receive filter via
+    /// `PACKET_ADD_MEMBERSHIP / PACKET_MR_UNICAST`.
+    ///
+    /// Without the membership call the NIC drops unicast frames for virtual
+    /// MACs before they ever reach the socket; the BPF filter alone is not
+    /// sufficient.  No-op if `mac` is already registered.
+    fn attach_mac(&mut self, mac: &MacAddr) -> Result<()> {
+        if !self.macs.contains(mac) {
+            self.macs.push(*mac);
+            self.set_membership(mac, true)?;
+        }
+        self.rebuild_filter()
+    }
+
+    /// Remove `mac` from the filter and deregister it from the NIC's hardware
+    /// receive filter.  No-op if not present.
+    fn detach_mac(&mut self, mac: &MacAddr) -> Result<()> {
+        if self.macs.contains(mac) {
+            self.set_membership(mac, false)?;
+            self.macs.retain(|m| m != mac);
+        }
+        self.rebuild_filter()
+    }
+}
+
+impl Drop for AfPacketSocket {
     fn drop(&mut self) {
         unsafe {
             libc::munmap(self.map, self.ring_bytes * 2);

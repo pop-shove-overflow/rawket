@@ -9,7 +9,7 @@ use crate::{
         checksum_add, checksum_finish, pseudo_header_acc, IpProto, Ipv4Hdr,
         MIN_HDR_LEN as IP_HDR_LEN,
     },
-    packet_socket::PacketSocket,
+    af_packet::EtherLink,
     raw_socket::TxSocket,
     timers,
     Error, Result,
@@ -2035,7 +2035,7 @@ impl TcpSocket {
 /// socket matches.
 pub fn dispatch(
     iface:   &mut Interface,
-    sock:    &mut PacketSocket,
+    sock:    &mut impl EtherLink,
     raw:     &[u8],
     sockets: &mut [TcpSocket],
 ) -> Result<()> {

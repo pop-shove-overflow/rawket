@@ -12,7 +12,7 @@ use core::net::Ipv4Addr;
 use crate::{
     arp::{ArpHdr, ArpOp, HDR_LEN as ARP_HDR_LEN},
     eth::{EthHdr, EtherType, MacAddr, HDR_LEN as ETH_HDR_LEN},
-    packet_socket::PacketSocket,
+    af_packet::EtherLink,
     timers::{now_ms, Timers},
     Result,
 };
@@ -266,7 +266,7 @@ pub fn send_request(
     src_mac: MacAddr,
     src_ip:  Ipv4Addr,
     dst_ip:  Ipv4Addr,
-    sock:    &mut PacketSocket,
+    sock:    &mut impl EtherLink,
 ) -> Result<()> {
     let frame_len = ETH_HDR_LEN + ARP_HDR_LEN;
     let mut buf = [0u8; 64];

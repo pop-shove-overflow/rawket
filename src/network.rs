@@ -1,7 +1,7 @@
 /// Top-level network runtime.
 ///
 /// A [`Network`] owns a set of [`Uplink`]s — one per physical interface
-/// (ifindex).  Each [`Uplink`] pairs one shared [`PacketSocket`] with the
+/// (ifindex).  Each [`Uplink`] pairs one shared [`EtherLink`] with the
 /// [`Interface`]s (Layer-3 virtual NICs) that are multiplexed over it, plus
 /// the [`UdpSocket`]s and [`TcpSocket`]s registered on that uplink.
 ///
@@ -14,7 +14,7 @@ use crate::{
     eth::MacAddr,
     interface::Interface,
     ip::Ipv4Cidr,
-    packet_socket::{PacketSocket, FRAME_SIZE},
+    af_packet::{AfPacketSocket, EtherLink, FRAME_SIZE},
     tcp::{TcpConfig, TcpSocket},
     timers::Timers,
     udp::UdpSocket,
@@ -189,10 +189,10 @@ struct EthEntry {
     callback: Box<dyn Fn(&[u8])>,
 }
 
-/// One physical uplink: a shared [`PacketSocket`], the L3 [`Interface`]s
+/// One physical uplink: a shared [`EtherLink`], the L3 [`Interface`]s
 /// multiplexed over it, and the L4 sockets registered on those interfaces.
-pub struct Uplink {
-    sock:                    PacketSocket,
+pub struct Uplink<L: EtherLink> {
+    sock:                    L,
     interfaces:              Vec<Interface>,
     udp_sockets:             Vec<UdpSocket>,
     tcp_sockets:             Vec<TcpSocket>,
@@ -208,7 +208,7 @@ pub struct Uplink {
     next_eth_id:             usize,
 }
 
-impl Uplink {
+impl<L: EtherLink> Uplink<L> {
     /// Attach `iface` to this uplink.
     ///
     /// - Registers the interface's MAC in the socket's BPF filter.
@@ -309,11 +309,11 @@ impl Uplink {
         self.udp_sockets.retain(|s| s.src_port() != src_port);
     }
 
-    pub fn socket(&self) -> &PacketSocket {
+    pub fn socket(&self) -> &L {
         &self.sock
     }
 
-    pub(crate) fn socket_mut(&mut self) -> &mut PacketSocket {
+    pub(crate) fn socket_mut(&mut self) -> &mut L {
         &mut self.sock
     }
 
@@ -352,31 +352,33 @@ impl Uplink {
 // ── Network ───────────────────────────────────────────────────────────────────
 
 /// Top-level network runtime — owns all uplinks and drives inbound traffic.
-pub struct Network {
-    uplinks: Vec<Uplink>,
+pub struct Network<L: EtherLink> {
+    uplinks: Vec<Uplink<L>>,
     config:  NetworkConfig,
     timers:  Timers,
     routes:  Vec<Route>,
 }
 
-impl Default for Network {
+impl Default for Network<AfPacketSocket> {
     fn default() -> Self { Self::new() }
 }
 
-impl Network {
+impl Network<AfPacketSocket> {
     /// Create a network runtime with default configuration.
     pub fn new() -> Self {
         Self::with_config(NetworkConfig::default())
     }
+}
 
+impl<L: EtherLink> Network<L> {
     /// Create a network runtime with the given configuration.
     pub fn with_config(config: NetworkConfig) -> Self {
         Network { uplinks: Vec::new(), config, timers: Timers::new(), routes: Vec::new() }
     }
 
-    /// Register a [`PacketSocket`] as an uplink and return a mutable reference
+    /// Register an [`EtherLink`] as an uplink and return a mutable reference
     /// to the new [`Uplink`] so the caller can immediately attach interfaces.
-    pub fn add_uplink(&mut self, sock: PacketSocket) -> &mut Uplink {
+    pub fn add_uplink(&mut self, sock: L) -> &mut Uplink<L> {
         self.uplinks.push(Uplink {
             sock,
             interfaces:              Vec::new(),
@@ -396,11 +398,11 @@ impl Network {
         self.uplinks.last_mut().unwrap()
     }
 
-    pub fn uplinks(&self) -> &[Uplink] {
+    pub fn uplinks(&self) -> &[Uplink<L>] {
         &self.uplinks
     }
 
-    pub fn uplinks_mut(&mut self) -> &mut [Uplink] {
+    pub fn uplinks_mut(&mut self) -> &mut [Uplink<L>] {
         &mut self.uplinks
     }
 
@@ -409,7 +411,7 @@ impl Network {
     /// Used by [`rawket_network_add_intf`](crate::ffi) to call
     /// [`Uplink::attach`] (which needs `&mut Timers`) without triggering a
     /// double-borrow of `Network`.
-    pub(crate) fn uplinks_and_timers_mut(&mut self) -> (&mut Vec<Uplink>, &mut Timers) {
+    pub(crate) fn uplinks_and_timers_mut(&mut self) -> (&mut Vec<Uplink<L>>, &mut Timers) {
         (&mut self.uplinks, &mut self.timers)
     }
 
@@ -559,7 +561,7 @@ impl Network {
 
 /// Drain all available frames from `uplink` and dispatch each to its
 /// matching [`Interface`] receive handler.
-fn drain(uplink: &mut Uplink, timers: &mut Timers) -> Result<()> {
+fn drain<L: EtherLink>(uplink: &mut Uplink<L>, timers: &mut Timers) -> Result<()> {
     // Allocate once; 65536-byte frame buffer is too large for a per-iteration
     // stack array, and GRO frames fill most of it so zeroing would dominate.
     let mut frame_buf = alloc::vec![0u8; FRAME_SIZE];

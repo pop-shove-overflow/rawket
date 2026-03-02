@@ -15,7 +15,7 @@ use crate::{
     interface::Interface,
     ip::Ipv4Cidr,
     network::{Network, NetworkConfig},
-    packet_socket::PacketSocket,
+    af_packet::AfPacketSocket,
     tcp::{State, TcpError, TcpPacket, TcpSocket},
     udp::{UdpPacket, UdpSocket},
     Error,
@@ -141,7 +141,7 @@ fn tcp_error_noop(_: TcpError) {}
 
 // ── Network ───────────────────────────────────────────────────────────────────
 
-pub struct RawketNetwork(Network);
+pub struct RawketNetwork(Network<AfPacketSocket>);
 
 impl From<RawketNetworkConfig> for NetworkConfig {
     fn from(c: RawketNetworkConfig) -> Self {
@@ -189,7 +189,7 @@ pub unsafe extern "C" fn rawket_network_free(net: *mut RawketNetwork) {
     }
 }
 
-/// One-step interface creation: open a PacketSocket on `ifname`, create an
+/// One-step interface creation: open an AfPacketSocket on `ifname`, create an
 /// Interface with `mac`, attach it, and return the uplink index.
 ///
 /// `rawket_network_add_intf` must be called before any `rawket_tcp_*` or
@@ -215,11 +215,11 @@ pub unsafe extern "C" fn rawket_network_add_intf(
         Err(_) => { set_errno_raw(libc::EINVAL); return -1; }
     };
 
-    let ifindex = match PacketSocket::ifindex(name_bytes) {
+    let ifindex = match AfPacketSocket::ifindex(name_bytes) {
         Ok(i)  => i,
         Err(e) => { set_errno(e); return -1; }
     };
-    let sock = match PacketSocket::open(ifindex) {
+    let sock = match AfPacketSocket::open(ifindex) {
         Ok(s)  => s,
         Err(e) => { set_errno(e); return -1; }
     };
@@ -782,7 +782,7 @@ fn c_tcp_recv_dispatch(pkt: TcpPacket<'_>) {
 
 /// Fire pending error callbacks for all standalone TCP sockets in `net`.
 /// Called from rawket_network_poll_rx after poll_rx_with_timeout returns.
-fn fire_tcp_errors(net: &mut Network) {
+fn fire_tcp_errors(net: &mut Network<AfPacketSocket>) {
     unsafe {
         if C_TCP_TABLE_PTR.is_null() { return; }
         for uplink in net.uplinks_mut() {
@@ -1147,7 +1147,7 @@ pub unsafe extern "C" fn rawket_arp_request(
             None => { set_errno_raw(libc::ENOENT); return -1; }
         }
     };
-    // Use the uplink's PacketSocket to send the ARP request.
+    // Use the uplink's AfPacketSocket to send the ARP request.
     // We need a mutable reference to the uplink's socket, but we already
     // took an immutable reference above. Re-borrow mutably now.
     match arp_cache::send_request(src_mac, src_ip, target, net_inner.uplinks_mut()[idx].socket_mut()) {

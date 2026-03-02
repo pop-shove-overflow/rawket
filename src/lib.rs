@@ -12,14 +12,14 @@ pub mod icmp;
 pub mod interface;
 pub mod ip;
 pub mod network;
-pub mod packet_socket;
+pub mod af_packet;
 pub mod raw_socket;
 pub mod tcp;
 pub mod timers;
 pub mod udp;
 
 pub use network::{Network, NetworkConfig, Uplink};
-pub use packet_socket::PacketSocket;
+pub use af_packet::AfPacketSocket;
 
 // ── Global allocator (libc malloc/free) ──────────────────────────────────────
 
