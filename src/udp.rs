@@ -1,5 +1,5 @@
 /// UDP datagram encode / decode + checksum.
-use alloc::vec::Vec;
+use alloc::{rc::Rc, vec::Vec};
 use core::net::{Ipv4Addr, SocketAddrV4};
 use crate::{
     arp_cache::{self, ArpQueue, PushResult},
@@ -9,7 +9,7 @@ use crate::{
         checksum_add, checksum_finish, pseudo_header_acc, IpProto, Ipv4Hdr,
         MIN_HDR_LEN as IP_HDR_LEN,
     },
-    af_packet::{AfPacketSocket, EtherLink, FRAME_SIZE},
+    af_packet::FRAME_SIZE,
     timers::Timers,
     Error, Result,
 };
@@ -96,7 +96,7 @@ pub struct UdpPacket<'a> {
 // ── Higher-level socket-like API ──────────────────────────────────────────────
 
 pub struct UdpSocket {
-    sock:     AfPacketSocket,
+    tx:       Rc<dyn Fn(&[u8]) -> Result<()>>,
     src_mac:  MacAddr,
     src:      SocketAddrV4,
     tx_id:    u16,
@@ -116,16 +116,15 @@ impl UdpSocket {
         iface:   &Interface,
         src:     SocketAddrV4,
         on_recv: for<'a> fn(UdpPacket<'a>),
-    ) -> Result<Self> {
-        let sock = iface.open_socket()?;
-        Ok(UdpSocket {
-            sock,
+    ) -> Self {
+        UdpSocket {
+            tx: iface.tx(),
             src_mac: iface.mac(),
             src,
             tx_id: 0,
             on_recv,
             arp_queue: iface.arp_queue().clone(),
-        })
+        }
     }
 
     pub fn src_port(&self) -> u16 { self.src.port() }
@@ -155,10 +154,11 @@ impl UdpSocket {
         }
         let frame = self.build_frame_vec(payload, *dst.ip(), dst.port());
         match self.arp_queue.push_frame(nexthop_ip, frame) {
-            PushResult::Sent(f) => self.sock.tx_send(&f),
+            PushResult::Sent(f) => (self.tx)(&f),
             PushResult::Queued  => Ok(()),
             PushResult::FirstForIp => {
-                arp_cache::send_request(self.src_mac, *self.src.ip(), nexthop_ip, &mut self.sock)?;
+                let tx = Rc::clone(&self.tx);
+                arp_cache::send_request(self.src_mac, *self.src.ip(), nexthop_ip, |f| tx(f))?;
                 let q = self.arp_queue.clone();
                 timers.add(ARP_TIMEOUT_MS, move |_| q.drop_pending(nexthop_ip));
                 Ok(())
@@ -184,10 +184,6 @@ impl UdpSocket {
             Some(dst_mac) => self.send_frame(payload, *dst.ip(), dst.port(), dst_mac),
             None          => Err(Error::WouldBlock),
         }
-    }
-
-    pub fn fd(&self) -> libc::c_int {
-        self.sock.fd()
     }
 
     // ── Private frame builders ────────────────────────────────────────────────
@@ -242,7 +238,7 @@ impl UdpSocket {
         let frame_len = crate::eth::HDR_LEN + IP_HDR_LEN + HDR_LEN + payload.len();
         let mut frame = alloc::vec![0u8; frame_len];
         self.fill_frame(&mut frame, dst_ip, dst_port, dst_mac, payload)?;
-        self.sock.tx_send(&frame)
+        (self.tx)(&frame)
     }
 }
 
@@ -256,7 +252,6 @@ impl UdpSocket {
 /// On no match, sends ICMP Destination Unreachable Type 3 Code 3 via `iface`.
 pub fn dispatch(
     iface:   &mut Interface,
-    sock:    &mut impl EtherLink,
     raw:     &[u8],
     sockets: &mut [UdpSocket],
 ) -> Result<()> {
@@ -287,6 +282,6 @@ pub fn dispatch(
     }
 
     // No socket listening on this port — ICMP Port Unreachable.
-    let _ = iface.send_icmp_unreachable(sock, raw, 3);
+    let _ = iface.send_icmp_unreachable(raw, 3);
     Ok(())
 }

@@ -22,6 +22,8 @@ pub use network::{Network, NetworkConfig, Uplink};
 pub use af_packet::AfPacketSocket;
 
 // ── Global allocator (libc malloc/free) ──────────────────────────────────────
+/// Shared TX-path closure type used by interfaces and sockets.
+pub(crate) type TxFn = alloc::rc::Rc<dyn Fn(&[u8]) -> Result<()>>;
 
 use core::alloc::{GlobalAlloc, Layout};
 

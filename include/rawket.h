@@ -450,10 +450,6 @@ RAWKET_NODISCARD int rawket_udp_send(
     size_t           len
 );
 
-/** Return the underlying file descriptor (for poll/epoll/select). */
-int rawket_udp_fd(const RawketUdpSocket *sock);
-
-
 /* ── TCP ─────────────────────────────────────────────────────────────────── */
 
 /** TCP connection states returned by rawket_tcp_state(). */

@@ -15,12 +15,13 @@ use crate::{
     interface::Interface,
     ip::Ipv4Cidr,
     af_packet::{AfPacketSocket, EtherLink, FRAME_SIZE},
+    raw_socket::TxSocket,
     tcp::{TcpConfig, TcpSocket},
     timers::Timers,
     udp::UdpSocket,
     Error, Result,
 };
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, rc::Rc, vec::Vec};
 
 // ── NetworkConfig ─────────────────────────────────────────────────────────────
 
@@ -217,6 +218,9 @@ impl<L: EtherLink> Uplink<L> {
     /// - Installs a recurring ARP cache expiry timer.
     pub fn attach(&mut self, mut iface: Interface, timers: &mut Timers) -> Result<()> {
         self.sock.attach_mac(&iface.mac())?;
+        // Wire up the shared TX path for this interface.
+        let tx_sock = TxSocket::open(iface.ifindex())?;
+        iface.set_tx(Rc::new(move |f: &[u8]| tx_sock.send(f)));
         // Apply network-wide ARP settings and install the recurring expiry timer.
         iface.arp_queue().set_max_age_ms(self.arp_cache_max_age_ms);
         iface.arp_queue().set_max_entries(self.arp_cache_max_entries);
@@ -307,10 +311,6 @@ impl<L: EtherLink> Uplink<L> {
     /// Remove the UDP socket with the given source port.
     pub(crate) fn remove_udp_socket(&mut self, src_port: u16) {
         self.udp_sockets.retain(|s| s.src_port() != src_port);
-    }
-
-    pub fn socket(&self) -> &L {
-        &self.sock
     }
 
     pub(crate) fn socket_mut(&mut self) -> &mut L {
@@ -597,8 +597,7 @@ fn drain<L: EtherLink>(uplink: &mut Uplink<L>, timers: &mut Timers) -> Result<()
             }
         }
 
-        let (sock, interfaces, udp_sockets, tcp_sockets, standalone_tcp) = (
-            &mut uplink.sock,
+        let (interfaces, udp_sockets, tcp_sockets, standalone_tcp) = (
             &mut uplink.interfaces,
             &mut uplink.udp_sockets,
             &mut uplink.tcp_sockets,
@@ -607,12 +606,12 @@ fn drain<L: EtherLink>(uplink: &mut Uplink<L>, timers: &mut Timers) -> Result<()
 
         if dst_mac == MacAddr::BROADCAST {
             for iface in interfaces.iter_mut() {
-                iface.receive(sock, raw, udp_sockets, tcp_sockets, standalone_tcp, timers)?;
+                iface.receive(raw, udp_sockets, tcp_sockets, standalone_tcp, timers)?;
             }
         } else {
             for iface in interfaces.iter_mut() {
                 if iface.mac() == dst_mac {
-                    iface.receive(sock, raw, udp_sockets, tcp_sockets, standalone_tcp, timers)?;
+                    iface.receive(raw, udp_sockets, tcp_sockets, standalone_tcp, timers)?;
                     break;
                 }
             }

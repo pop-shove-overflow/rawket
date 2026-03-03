@@ -5,9 +5,10 @@
 /// which performs Layer-2 dispatch and calls [`Interface::receive`] for each
 /// frame whose Ethernet destination matches this interface's MAC.
 ///
-/// For UDP/TCP sockets that need their own independent ring buffers, call
-/// [`open_socket`](Interface::open_socket) to get a dedicated
-/// [`AfPacketSocket`] filtered to this MAC.
+/// The interface's TX path is an injectable `Rc<dyn Fn>` set by
+/// [`Uplink::attach`](crate::Uplink::attach).  All sockets created from this
+/// interface clone that `Rc` so they share the same TX path.  In tests the
+/// closure is replaced with a `VirtualLink` callback before attaching.
 use alloc::{rc::Rc, vec, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::net::{Ipv4Addr, SocketAddrV4};
@@ -20,7 +21,7 @@ use crate::{
         IpProto, Ipv4Cidr, Ipv4Hdr, FLAG_MF,
         MIN_HDR_LEN as IP_HDR_LEN,
     },
-    af_packet::{AfPacketSocket, EtherLink, FRAME_SIZE},
+    af_packet::{AfPacketSocket, FRAME_SIZE},
     tcp::{self, SeqNum, TcpFlags, TcpHdr, HDR_LEN as TCP_HDR_LEN, TcpSocket},
     timers::{now_ms, TimerId, Timers},
     udp::{self, UdpSocket},
@@ -361,6 +362,10 @@ pub struct Interface {
     ifindex:    i32,
     ip:         Option<Ipv4Cidr>,
     tx_id:      u16,
+    /// Shared TX path — set by [`Uplink::attach`](crate::Uplink::attach).
+    /// All sockets created from this interface clone this `Rc`.
+    /// Defaults to a no-op until `attach` wires it up.
+    tx:         crate::TxFn,
     /// ARP cache + outbound frame queue, shared with all sockets on this
     /// interface.  Both the cache and the queue are per-interface: entries
     /// are learned from frames arriving on this L2 interface only, and
@@ -389,6 +394,7 @@ impl Interface {
             ifindex,
             ip: None,
             tx_id: 0,
+            tx:      Rc::new(|_| Ok(())),
             arp:     ArpQueue::new(DEFAULT_ARP_MAX_AGE_MS),
             reasm:   Rc::new(RefCell::new(ReassemblyTable::new(
                 DEFAULT_FRAG_MEM_LIMIT, DEFAULT_FRAG_TIMEOUT_MS,
@@ -397,8 +403,7 @@ impl Interface {
         })
     }
 
-    /// Consume and drop the interface descriptor.  Sockets already created
-    /// from it retain their own AF_PACKET fds and continue to function.
+    /// Consume and drop the interface descriptor.
     pub fn remove(self) {
         drop(self);
     }
@@ -433,15 +438,17 @@ impl Interface {
         self.mac = mac;
     }
 
-    /// Open a dedicated [`AfPacketSocket`] filtered to this interface's MAC.
+    /// Set the TX closure used by this interface and all sockets cloned from it.
     ///
-    /// Used by [`UdpSocket`](crate::udp::UdpSocket) and
-    /// [`TcpSocket`](crate::tcp::TcpSocket) to get their own independent ring
-    /// buffers, separate from the shared dispatch socket.
-    pub fn open_socket(&self) -> Result<AfPacketSocket> {
-        let mut sock = AfPacketSocket::open(self.ifindex)?;
-        sock.attach_mac(&self.mac)?;
-        Ok(sock)
+    /// Called by [`Uplink::attach`](crate::Uplink::attach) in production and
+    /// by the test harness to inject a `VirtualLink` TX path.
+    pub(crate) fn set_tx(&mut self, tx: crate::TxFn) {
+        self.tx = tx;
+    }
+
+    /// Clone the shared TX closure for use by a socket.
+    pub(crate) fn tx(&self) -> crate::TxFn {
+        Rc::clone(&self.tx)
     }
 
     /// Return a reference to this interface's combined ARP cache + frame queue.
@@ -485,8 +492,8 @@ impl Interface {
     /// Process one inbound Ethernet frame at Layer 3.
     ///
     /// Called by the `drain` loop after L2 destination-MAC dispatch.
-    /// `sock` is the shared [`EtherLink`] and is used for any response
-    /// frames (ICMP unreachables, TCP resets).
+    /// Response frames (ICMP unreachables, TCP resets, ARP replies) are
+    /// sent via the interface's injected TX closure.
     ///
     /// Dispatch rules:
     /// - `ETHERTYPE_ARP` → if `tpa == interface IP`: sender SHA/SPA inserted and pending sends
@@ -501,7 +508,6 @@ impl Interface {
     /// - Any other proto → ICMP Type 3 Code 2.
     pub fn receive(
         &mut self,
-        sock:           &mut impl EtherLink,
         raw:            &[u8],
         udp_sockets:    &mut [UdpSocket],
         tcp_sockets:    &mut [TcpSocket],
@@ -527,11 +533,11 @@ impl Interface {
                         self.arp.insert(arp.spa, arp.sha);
 
                         for frame in self.arp.drain_for(arp.spa, arp.sha) {
-                            sock.tx_send(&frame)?;
+                            (self.tx)(&frame)?;
                         }
 
                         if arp.oper == ArpOp::REQUEST {
-                            self.send_arp_reply(sock, &arp)?;
+                            self.send_arp_reply(&arp)?;
                         }
                     }
                     // Frames not targeted at us are ignored.  We intentionally
@@ -560,12 +566,12 @@ impl Interface {
                 if ip.is_fragment() {
                     let maybe_frame = self.reasm.borrow_mut().insert(eth, ip, ip_buf, timers);
                     if let Some(frame) = maybe_frame {
-                        self.dispatch_ipv4(sock, &frame, udp_sockets, tcp_sockets, standalone_tcp)?;
+                        self.dispatch_ipv4(&frame, udp_sockets, tcp_sockets, standalone_tcp)?;
                     }
                     return Ok(());
                 }
 
-                self.dispatch_ipv4(sock, raw, udp_sockets, tcp_sockets, standalone_tcp)?;
+                self.dispatch_ipv4(raw, udp_sockets, tcp_sockets, standalone_tcp)?;
             }
             _ => {} // unknown EtherType — silently ignore
         }
@@ -581,7 +587,6 @@ impl Interface {
     /// `raw` must be a valid Ethernet+IPv4 frame.
     fn dispatch_ipv4(
         &mut self,
-        sock:           &mut impl EtherLink,
         raw:            &[u8],
         udp_sockets:    &mut [UdpSocket],
         tcp_sockets:    &mut [TcpSocket],
@@ -607,7 +612,7 @@ impl Interface {
                         let is_bcast = ip.dst == Ipv4Addr::BROADCAST
                             || self.ip.is_some_and(|c| ip.dst == c.broadcast());
                         if is_bcast { return Ok(()); }
-                        self.send_icmp_echo_reply(sock, raw)?;
+                        self.send_icmp_echo_reply(raw)?;
                     }
                     Ok(IcmpMessage::DestUnreach { code: 4, next_hop_mtu }) => {
                         // Fragmentation Needed (RFC 1191 §4): update MSS on the
@@ -639,7 +644,7 @@ impl Interface {
                     _ => {}
                 }
             }
-            IpProto::UDP  => { udp::dispatch(self, sock, raw, udp_sockets)?; }
+            IpProto::UDP  => { udp::dispatch(self, raw, udp_sockets)?; }
             IpProto::TCP  => {
                 let tcp_buf = ip.payload(ip_buf);
                 if tcp_buf.len() >= 4 {
@@ -651,10 +656,10 @@ impl Interface {
                         }
                     }
                 }
-                tcp::dispatch(self, sock, raw, tcp_sockets)?;
+                tcp::dispatch(self, raw, tcp_sockets)?;
             }
             _ => {
-                let _ = self.send_icmp_unreachable(sock, raw, 2);
+                let _ = self.send_icmp_unreachable(raw, 2);
             }
         }
         Ok(())
@@ -663,7 +668,7 @@ impl Interface {
     // ── TX helpers (crate-visible for udp::dispatch / tcp::dispatch) ─────────
 
     /// Send an ARP Reply in response to an ARP Request targeting this interface.
-    fn send_arp_reply(&self, sock: &mut impl EtherLink, req: &ArpHdr) -> Result<()> {
+    fn send_arp_reply(&self, req: &ArpHdr) -> Result<()> {
         let frame_len = ETH_HDR_LEN + ARP_HDR_LEN;
         let mut frame = [0u8; ETH_HDR_LEN + ARP_HDR_LEN];
 
@@ -679,14 +684,14 @@ impl Interface {
         }
         .emit(&mut frame[ETH_HDR_LEN..])?;
 
-        sock.tx_send(&frame[..frame_len])
+        (self.tx)(&frame[..frame_len])
     }
 
     /// Send an ICMP Echo Reply in response to an Echo Request.
     ///
     /// The reply preserves the original `id`, `seq`, and payload verbatim.
     /// Requests whose reply would exceed [`FRAME_SIZE`] are silently dropped.
-    fn send_icmp_echo_reply(&mut self, sock: &mut impl EtherLink, raw: &[u8]) -> Result<()> {
+    fn send_icmp_echo_reply(&mut self, raw: &[u8]) -> Result<()> {
         let cidr = self.ip.unwrap(); // guaranteed Some by callers
 
         let eth      = EthHdr::parse(raw)?;
@@ -727,17 +732,16 @@ impl Interface {
         IcmpMessage::EchoReply { id, seq }.emit(&mut frame[icmp_off..], payload)?;
         frame[icmp_off + ICMP_HDR_LEN..].copy_from_slice(payload);
 
-        sock.tx_send(frame)
+        (self.tx)(frame)
     }
 
-    /// Send ICMP Destination Unreachable (Type 3, `code`) via `sock`.
+    /// Send ICMP Destination Unreachable (Type 3, `code`).
     ///
     /// Payload: original IP header + first 8 bytes of its payload (RFC 792).
     /// Subject to the per-interface ICMP rate limit; silently suppressed when
     /// the token bucket is empty.
     pub(crate) fn send_icmp_unreachable(
         &mut self,
-        sock: &mut impl EtherLink,
         raw:  &[u8],
         code: u8,
     ) -> Result<()> {
@@ -789,15 +793,15 @@ impl Interface {
         frame[icmp_off + ICMP_HDR_LEN..icmp_off + ICMP_HDR_LEN + icmp_payload_len]
             .copy_from_slice(icmp_payload);
 
-        sock.tx_send(frame)
+        (self.tx)(frame)
     }
 
-    /// Send a TCP RST in response to an unexpected inbound segment via `sock`.
+    /// Send a TCP RST in response to an unexpected inbound segment.
     ///
     /// - Inbound has ACK set → RST with `seq = seg.ack`.
     /// - Otherwise → RST|ACK with `seq = 0, ack = seg.seq + seg_len`
     ///   (RFC 793 §3.4).
-    pub(crate) fn send_tcp_rst(&mut self, sock: &mut impl EtherLink, raw: &[u8]) -> Result<()> {
+    pub(crate) fn send_tcp_rst(&mut self, raw: &[u8]) -> Result<()> {
         let cidr = self.ip.unwrap();
 
         let eth    = EthHdr::parse(raw)?;
@@ -850,7 +854,7 @@ impl Interface {
         }
         .emit(&mut frame[tcp_off..], &cidr.addr(), &ip.src, &[])?;
 
-        sock.tx_send(frame)
+        (self.tx)(frame)
     }
 }
 

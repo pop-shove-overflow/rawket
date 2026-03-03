@@ -12,7 +12,6 @@ use core::net::Ipv4Addr;
 use crate::{
     arp::{ArpHdr, ArpOp, HDR_LEN as ARP_HDR_LEN},
     eth::{EthHdr, EtherType, MacAddr, HDR_LEN as ETH_HDR_LEN},
-    af_packet::EtherLink,
     timers::{now_ms, Timers},
     Result,
 };
@@ -266,7 +265,7 @@ pub fn send_request(
     src_mac: MacAddr,
     src_ip:  Ipv4Addr,
     dst_ip:  Ipv4Addr,
-    sock:    &mut impl EtherLink,
+    mut tx:  impl FnMut(&[u8]) -> Result<()>,
 ) -> Result<()> {
     let frame_len = ETH_HDR_LEN + ARP_HDR_LEN;
     let mut buf = [0u8; 64];
@@ -282,7 +281,7 @@ pub fn send_request(
     }
     .emit(&mut frame[ETH_HDR_LEN..])?;
 
-    sock.tx_send(frame)
+    tx(frame)
 }
 
 // ── Recurring expiry timer ────────────────────────────────────────────────────

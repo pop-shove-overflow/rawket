@@ -9,8 +9,6 @@ use crate::{
         checksum_add, checksum_finish, pseudo_header_acc, IpProto, Ipv4Hdr,
         MIN_HDR_LEN as IP_HDR_LEN,
     },
-    af_packet::EtherLink,
-    raw_socket::TxSocket,
     timers,
     Error, Result,
 };
@@ -553,7 +551,7 @@ fn random_u32() -> u32 {
 // ── TcpSocket ─────────────────────────────────────────────────────────────────
 
 pub struct TcpSocket {
-    tx:          TxSocket,
+    tx:          crate::TxFn,
     src_mac:     MacAddr,
     dst_mac:     MacAddr,
     src:         SocketAddrV4,
@@ -641,7 +639,7 @@ pub struct TcpSocket {
 impl TcpSocket {
     #[allow(clippy::too_many_arguments)]
     fn new_raw(
-        tx:        TxSocket,
+        tx:        crate::TxFn,
         src_mac:   MacAddr,
         src:       SocketAddrV4,
         on_recv:   for<'a> fn(TcpPacket<'a>),
@@ -817,7 +815,7 @@ impl TcpSocket {
         let csum = checksum_finish(acc);
         frame[tcp_off + 16..tcp_off + 18].copy_from_slice(&csum.to_be_bytes());
 
-        self.tx.send(frame)
+        (self.tx)(frame)
     }
 
     /// Convenience: control segment using current snd_nxt/rcv_nxt.
@@ -1779,9 +1777,8 @@ impl TcpSocket {
             .lookup_and_refresh(nexthop_ip)
             .ok_or(Error::WouldBlock)?;
 
-        let tx = TxSocket::open(iface.ifindex())?;
         let mut s = Self::new_raw(
-            tx, iface.mac(), src, on_recv, on_error,
+            iface.tx(), iface.mac(), src, on_recv, on_error,
             cfg,
         );
         s.dst        = dst;
@@ -1814,9 +1811,8 @@ impl TcpSocket {
         on_error: fn(TcpError),
         cfg:     TcpConfig,
     ) -> Result<Self> {
-        let tx = TxSocket::open(iface.ifindex())?;
         let mut s = Self::new_raw(
-            tx, iface.mac(), src, on_recv, on_error,
+            iface.tx(), iface.mac(), src, on_recv, on_error,
             cfg,
         );
         s.state = State::Listen;
@@ -2035,7 +2031,6 @@ impl TcpSocket {
 /// socket matches.
 pub fn dispatch(
     iface:   &mut Interface,
-    sock:    &mut impl EtherLink,
     raw:     &[u8],
     sockets: &mut [TcpSocket],
 ) -> Result<()> {
@@ -2051,6 +2046,6 @@ pub fn dispatch(
             return Ok(());
         }
     }
-    let _ = iface.send_tcp_rst(sock, raw);
+    let _ = iface.send_tcp_rst(raw);
     Ok(())
 }

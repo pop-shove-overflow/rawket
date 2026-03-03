@@ -15,7 +15,7 @@ use crate::{
     interface::Interface,
     ip::Ipv4Cidr,
     network::{Network, NetworkConfig},
-    af_packet::AfPacketSocket,
+    af_packet::{AfPacketSocket, EtherLink},
     tcp::{State, TcpError, TcpPacket, TcpSocket},
     udp::{UdpPacket, UdpSocket},
     Error,
@@ -498,7 +498,6 @@ fn c_udp_dispatch(pkt: UdpPacket<'_>) {
 /// used (it is freed by `rawket_network_add_udp_socket`).
 pub struct RawketUdpSocket {
     src_port:   u16,
-    fd:         c_int,
     net:        *mut RawketNetwork,
     uplink_idx: usize,
     /// `Some(...)` only between `rawket_udp_open_cb` and
@@ -532,7 +531,7 @@ pub unsafe extern "C" fn rawket_udp_open(
     let ip = ip_from_c(src_ip);
     let idx = uplink_idx as usize;
 
-    let (sock, fd) = {
+    let sock = {
         let net_ref = unsafe { &(*net).0 };
         if idx >= net_ref.uplinks().len() {
             set_errno_raw(libc::ENOENT);
@@ -547,13 +546,7 @@ pub unsafe extern "C" fn rawket_udp_open(
         } else {
             udp_noop
         };
-        match UdpSocket::new(iface, SocketAddrV4::new(ip, src_port), recv_fn) {
-            Ok(s) => {
-                let fd = s.fd();
-                (s, fd)
-            }
-            Err(e) => { set_errno(e); return ptr::null_mut(); }
-        }
+        UdpSocket::new(iface, SocketAddrV4::new(ip, src_port), recv_fn)
     };
 
     // Register callback in the table before moving the socket.
@@ -564,7 +557,7 @@ pub unsafe extern "C" fn rawket_udp_open(
     // Transfer ownership to the uplink.
     unsafe { &mut (*net).0 }.uplinks_mut()[idx].add_udp_socket(sock);
 
-    Box::into_raw(Box::new(RawketUdpSocket { src_port, fd, net, uplink_idx: idx, owned_sock: None }))
+    Box::into_raw(Box::new(RawketUdpSocket { src_port, net, uplink_idx: idx, owned_sock: None }))
 }
 
 /// Deregister the UDP socket from its uplink and free the handle.
@@ -626,18 +619,13 @@ pub unsafe extern "C" fn rawket_udp_open_cb(
             Some((_, i, _)) => i,
             None => { set_errno_raw(libc::ENOENT); return ptr::null_mut(); }
         };
-        match UdpSocket::new(iface, SocketAddrV4::new(ip, src_port), recv_fn) {
-            Ok(s)  => s,
-            Err(e) => { set_errno(e); return ptr::null_mut(); }
-        }
+        UdpSocket::new(iface, SocketAddrV4::new(ip, src_port), recv_fn)
     };
     if let Some(cb) = on_recv {
         c_udp_table().push(CUdpEntry { src_port, callback: cb, userdata: recv_ud });
     }
-    let fd = sock.fd();
     Box::into_raw(Box::new(RawketUdpSocket {
         src_port,
-        fd,
         net,
         uplink_idx: usize::MAX,
         owned_sock: Some(sock),
@@ -719,13 +707,6 @@ pub unsafe extern "C" fn rawket_udp_send(
     }
     set_errno_raw(libc::ENOENT);
     -1
-}
-
-/// Return the underlying file descriptor (for poll/epoll/select).
-#[no_mangle]
-pub unsafe extern "C" fn rawket_udp_fd(sock: *const RawketUdpSocket) -> c_int {
-    if sock.is_null() { return -1; }
-    unsafe { (*sock).fd }
 }
 
 // ── TCP callback dispatch ─────────────────────────────────────────────────────
@@ -1147,10 +1128,8 @@ pub unsafe extern "C" fn rawket_arp_request(
             None => { set_errno_raw(libc::ENOENT); return -1; }
         }
     };
-    // Use the uplink's AfPacketSocket to send the ARP request.
-    // We need a mutable reference to the uplink's socket, but we already
-    // took an immutable reference above. Re-borrow mutably now.
-    match arp_cache::send_request(src_mac, src_ip, target, net_inner.uplinks_mut()[idx].socket_mut()) {
+    let sock = net_inner.uplinks_mut()[idx].socket_mut();
+    match arp_cache::send_request(src_mac, src_ip, target, |f| sock.tx_send(f)) {
         Ok(()) => 0,
         Err(e) => { set_errno(e); -1 }
     }
