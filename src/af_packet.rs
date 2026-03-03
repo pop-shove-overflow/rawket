@@ -213,11 +213,11 @@ impl TxRing {
 // ── AfPacketSocket ────────────────────────────────────────────────────────────
 
 pub struct AfPacketSocket {
-    rx:      RxRing,
-    tx:      Rc<RefCell<TxRing>>,
-    ifindex: i32,
+    rx:             RxRing,
+    tx:             Rc<RefCell<TxRing>>,
+    kernel_ifindex: i32,
     /// MAC addresses included in the current BPF filter.
-    macs:    Vec<MacAddr>,
+    macs:           Vec<MacAddr>,
 }
 
 // SAFETY: used in single-threaded context only
@@ -313,11 +313,11 @@ impl AfPacketSocket {
         let rx = RxRing { shared: Rc::clone(&shared), rx_idx: 0 };
         let tx = Rc::new(RefCell::new(TxRing { shared, tx_idx: 0 }));
 
-        Ok(AfPacketSocket { rx, tx, ifindex, macs: Vec::new() })
+        Ok(AfPacketSocket { rx, tx, kernel_ifindex: ifindex, macs: Vec::new() })
     }
 
-    /// Look up the interface index for `ifname` (NUL-terminated C string).
-    pub fn ifindex(ifname: &[u8]) -> Result<i32> {
+    /// Look up the kernel interface index for `ifname` (NUL-terminated C string).
+    pub fn kernel_ifindex(ifname: &[u8]) -> Result<i32> {
         let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
         if fd < 0 {
             return Err(Error::last_os());
@@ -360,7 +360,7 @@ impl AfPacketSocket {
         mr_address[..6].copy_from_slice(mac.as_bytes());
 
         let mreq = PacketMreq {
-            mr_ifindex: self.ifindex,
+            mr_ifindex: self.kernel_ifindex,
             mr_type:    PACKET_MR_UNICAST,
             mr_alen:    6,
             mr_address,

@@ -215,15 +215,15 @@ pub unsafe extern "C" fn rawket_network_add_intf(
         Err(_) => { set_errno_raw(libc::EINVAL); return -1; }
     };
 
-    let ifindex = match AfPacketSocket::ifindex(name_bytes) {
+    let kernel_ifindex = match AfPacketSocket::kernel_ifindex(name_bytes) {
         Ok(i)  => i,
         Err(e) => { set_errno(e); return -1; }
     };
-    let sock = match AfPacketSocket::open(ifindex) {
+    let sock = match AfPacketSocket::open(kernel_ifindex) {
         Ok(s)  => s,
         Err(e) => { set_errno(e); return -1; }
     };
-    let iface = match Interface::add(name_bytes, mac_arr) {
+    let iface = match Interface::afpacket(name_bytes, mac_arr) {
         Ok(i)  => i,
         Err(e) => { set_errno(e); return -1; }
     };

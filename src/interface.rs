@@ -12,6 +12,23 @@
 use alloc::{rc::Rc, vec, vec::Vec};
 use core::cell::{Cell, RefCell};
 use core::net::{Ipv4Addr, SocketAddrV4};
+use core::sync::atomic::{AtomicU32, Ordering};
+
+/// Rawket-managed, process-local interface identifier.
+///
+/// Allocated by a monotonically increasing `AtomicU32` counter; guaranteed
+/// unique within the process lifetime across all interface types (real and
+/// dummy).  This is distinct from the Linux kernel's interface index
+/// (`kernel_ifindex: i32`), which is only present on kernel-backed interfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IfIndex(u32);
+
+static NEXT_IFINDEX: AtomicU32 = AtomicU32::new(1);
+
+impl IfIndex {
+    fn alloc() -> Self { IfIndex(NEXT_IFINDEX.fetch_add(1, Ordering::Relaxed)) }
+    pub fn as_u32(self) -> u32 { self.0 }
+}
 use crate::{
     arp::{ArpHdr, ArpOp, HDR_LEN as ARP_HDR_LEN},
     arp_cache::ArpQueue,
@@ -357,10 +374,11 @@ impl ReassemblyTable {
 
 pub struct Interface {
     /// NUL-padded, IFNAMSIZ (16) bytes.
-    ifname_buf: [u8; 16],
-    mac:        MacAddr,
-    ifindex:    i32,
-    ip:         Option<Ipv4Cidr>,
+    ifname_buf:     [u8; 16],
+    mac:            MacAddr,
+    ifindex:        IfIndex,       // rawket-owned, always present
+    kernel_ifindex: Option<i32>,   // Linux kernel index; None for dummy interfaces
+    ip:             Option<Ipv4Cidr>,
     tx_id:      u16,
     /// Shared TX path — set by [`Uplink::attach`](crate::Uplink::attach).
     /// All sockets created from this interface clone this `Rc`.
@@ -378,20 +396,22 @@ pub struct Interface {
 }
 
 impl Interface {
-    /// Resolve `uplink`'s ifindex and create an interface with the given MAC.
+    /// Resolve `uplink`'s kernel interface index and create an AF_PACKET-backed
+    /// interface with the given MAC.
     /// `uplink` must be a NUL-terminated byte slice (e.g. `b"eth0\0"`).
     ///
     /// No AF_PACKET socket is opened here.  Attach this interface to a shared
     /// [`AfPacketSocket`] via [`Uplink::attach`](crate::Uplink::attach).
-    pub fn add(uplink: &[u8], mac: MacAddr) -> Result<Self> {
-        let ifindex = AfPacketSocket::ifindex(uplink)?;
+    pub fn afpacket(uplink: &[u8], mac: MacAddr) -> Result<Self> {
+        let kernel_ifindex = AfPacketSocket::kernel_ifindex(uplink)?;
         let mut ifname_buf = [0u8; 16];
         let len = uplink.len().min(16);
         ifname_buf[..len].copy_from_slice(&uplink[..len]);
         Ok(Interface {
             ifname_buf,
             mac,
-            ifindex,
+            ifindex:        IfIndex::alloc(),
+            kernel_ifindex: Some(kernel_ifindex),
             ip: None,
             tx_id: 0,
             tx:      Rc::new(|_| Ok(())),
@@ -401,6 +421,28 @@ impl Interface {
             ))),
             icmp_rl: IcmpRateLimit::new(100),
         })
+    }
+
+    /// Create a dummy interface that is not backed by a real kernel interface.
+    ///
+    /// Useful when the uplink is an [`EtherLink`](crate::af_packet::EtherLink)
+    /// that does not require kernel packet-socket registration (e.g. an
+    /// in-process virtual wire used in tests).
+    pub fn dummy(mac: MacAddr) -> Self {
+        Interface {
+            ifname_buf:     [0u8; 16],
+            mac,
+            ifindex:        IfIndex::alloc(),
+            kernel_ifindex: None,
+            ip:             None,
+            tx_id:          0,
+            tx:             Rc::new(|_| Ok(())),
+            arp:            ArpQueue::new(DEFAULT_ARP_MAX_AGE_MS),
+            reasm:          Rc::new(RefCell::new(ReassemblyTable::new(
+                DEFAULT_FRAG_MEM_LIMIT, DEFAULT_FRAG_TIMEOUT_MS,
+            ))),
+            icmp_rl:        IcmpRateLimit::new(100),
+        }
     }
 
     /// Consume and drop the interface descriptor.
@@ -418,8 +460,12 @@ impl Interface {
         &self.ifname_buf[..=nul]
     }
 
-    pub fn ifindex(&self) -> i32 {
+    pub fn ifindex(&self) -> IfIndex {
         self.ifindex
+    }
+
+    pub fn kernel_ifindex(&self) -> Option<i32> {
+        self.kernel_ifindex
     }
 
     /// Assign an IPv4 address and network prefix to this interface.
@@ -465,6 +511,17 @@ impl Interface {
     /// Returns `None` if no non-expired entry exists.
     pub fn arp_lookup(&self, ip: Ipv4Addr) -> Option<MacAddr> {
         self.arp.lookup(ip)
+    }
+
+    /// Insert a static ARP entry mapping `ip` to `mac`.
+    ///
+    /// Useful for pre-seeding the cache on interfaces where ARP exchanges are
+    /// undesirable (e.g. dummy interfaces used in tests, or statically
+    /// configured point-to-point links).  The entry obeys the normal TTL and
+    /// will be refreshed on cache lookup; call this again if you need a
+    /// permanent entry that survives expiry.
+    pub fn seed_arp(&mut self, ip: Ipv4Addr, mac: MacAddr) {
+        self.arp.insert(ip, mac);
     }
 
     /// Override the fragment-reassembly settings applied by

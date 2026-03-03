@@ -395,6 +395,23 @@ impl<L: EtherLink> Network<L> {
         self.uplinks.last_mut().unwrap()
     }
 
+    /// Add an uplink and immediately attach one interface to it.
+    ///
+    /// This is the standard one-step setup for callers that have exactly one
+    /// [`Interface`] per [`EtherLink`].  It is equivalent to calling
+    /// [`add_uplink`](Self::add_uplink) followed by [`Uplink::attach`], but
+    /// without requiring the caller to obtain a `&mut Timers` handle (which
+    /// is internal to `Network`).
+    ///
+    /// Returns the index of the newly created uplink.
+    pub fn add_uplink_and_attach(&mut self, sock: L, iface: Interface) -> Result<usize> {
+        self.add_uplink(sock);
+        let idx = self.uplinks.len() - 1;
+        let (uplinks, timers) = self.uplinks_and_timers_mut();
+        uplinks[idx].attach(iface, timers)?;
+        Ok(idx)
+    }
+
     pub fn uplinks(&self) -> &[Uplink<L>] {
         &self.uplinks
     }
