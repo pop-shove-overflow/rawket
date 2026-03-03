@@ -452,7 +452,7 @@ impl<L: EtherLink> Network<L> {
     ///
     /// If a route with the same destination CIDR already exists it is updated
     /// in place; otherwise the new route is appended.
-    pub(crate) fn route_add(&mut self, dst: Ipv4Cidr, nexthop: Option<Ipv4Addr>) {
+    pub fn route_add(&mut self, dst: Ipv4Cidr, nexthop: Option<Ipv4Addr>) {
         if let Some(e) = self.routes.iter_mut().find(|r| r.dst == dst) {
             e.nexthop = nexthop;
         } else {
@@ -461,7 +461,7 @@ impl<L: EtherLink> Network<L> {
     }
 
     /// Remove the route matching `dst`, if present.  No-op when absent.
-    pub(crate) fn route_del(&mut self, dst: Ipv4Cidr) {
+    pub fn route_del(&mut self, dst: Ipv4Cidr) {
         self.routes.retain(|r| r.dst != dst);
     }
 
