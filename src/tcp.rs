@@ -1978,6 +1978,17 @@ impl TcpSocket {
         Some(n)
     }
 
+    /// Abortive close: send RST and immediately transition to Closed.
+    pub fn abort(&mut self) -> Result<()> {
+        match self.state {
+            State::Closed | State::Listen => {}
+            _ => { let _ = self.send_ctrl_opts(TcpFlags::RST, &[]); }
+        }
+        self.state           = State::Closed;
+        self.rto_deadline_ms = 0;
+        Ok(())
+    }
+
     /// Initiate graceful close (sends FIN).
     pub fn close(&mut self) -> Result<()> {
         match self.state {
