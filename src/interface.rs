@@ -10,7 +10,7 @@
 /// interface clone that `Rc` so they share the same TX path.  In tests the
 /// closure is replaced with a `VirtualLink` callback before attaching.
 use alloc::{rc::Rc, vec, vec::Vec};
-use core::cell::{Cell, RefCell};
+use core::cell::RefCell;
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -40,7 +40,7 @@ use crate::{
     },
     af_packet::{AfPacketSocket, FRAME_SIZE},
     tcp::{self, SeqNum, TcpFlags, TcpHdr, HDR_LEN as TCP_HDR_LEN, TcpSocket},
-    timers::{now_ms, TimerId, Timers},
+    timers::{now_ms, Deadline, Timers},
     udp::{self, UdpSocket},
     Result,
 };
@@ -95,11 +95,9 @@ struct ReassemblyEntry {
     /// Set when a fragment with MF=0 arrives: the total reassembled payload
     /// length in bytes.
     total_len:   Option<usize>,
-    /// Timer ID so the entry's expiry timer can be cancelled on completion.
-    timer_id:    TimerId,
-    /// Shared flag: the expiry timer callback sets this to `false` when the
-    /// timeout fires.  [`ReassemblyTable::purge`] removes dead entries.
-    alive:       Rc<Cell<bool>>,
+    /// Deadline after which this entry is considered expired and will be
+    /// removed by the next [`ReassemblyTable::purge`] sweep.
+    deadline:    Deadline,
 }
 
 impl ReassemblyEntry {
@@ -189,10 +187,11 @@ impl ReassemblyTable {
         }
     }
 
-    /// Remove entries whose expiry timer has fired, reclaiming their memory.
+    /// Remove entries whose deadline has expired, reclaiming their memory.
     fn purge(&mut self) {
         let before = self.entries.len();
-        self.entries.retain(|e| e.alive.get());
+        let now = now_ms();
+        self.entries.retain(|e| !e.deadline.is_expired(now));
         if self.entries.len() != before {
             self.total_bytes = self.entries.iter().map(|e| e.total_bytes).sum();
         }
@@ -206,7 +205,6 @@ impl ReassemblyTable {
         eth:     EthHdr,
         ip:      Ipv4Hdr,
         ip_buf:  &[u8],
-        timers:  &mut Timers,
     ) -> Option<Vec<u8>> {
         self.purge(); // reclaim timed-out entries on every insert
         let key = ReassemblyKey {
@@ -235,12 +233,6 @@ impl ReassemblyTable {
                 return None;
             }
 
-            let alive      = Rc::new(Cell::new(true));
-            let alive_flag = Rc::clone(&alive);
-            let timer_id   = timers.add(self.timeout_ms, move |_| {
-                alive_flag.set(false);
-            });
-
             let total_len = if !more_frags {
                 let tl = frag_offset + frag_bytes;
                 // Max IPv4 payload is 65535 - IP_HDR_LEN; reject oversized.
@@ -257,15 +249,14 @@ impl ReassemblyTable {
                 fragments:   vec![Fragment { offset: frag_offset, data: payload.to_vec() }],
                 total_bytes: frag_bytes,
                 total_len,
-                timer_id,
-                alive,
+                deadline:    Deadline::from_now(self.timeout_ms),
             };
 
             self.total_bytes += frag_bytes;
             self.entries.push(entry);
 
             let idx = self.entries.len() - 1;
-            return self.try_reassemble(idx, timers);
+            return self.try_reassemble(idx);
         }
 
         // ── Add fragment to existing entry ────────────────────────────────────
@@ -321,12 +312,12 @@ impl ReassemblyTable {
         };
         self.total_bytes += added_bytes;
 
-        self.try_reassemble(idx, timers)
+        self.try_reassemble(idx)
     }
 
     /// If entry `idx` is complete, build the reassembled frame, remove the
     /// entry, and return the frame.  Returns `None` while still incomplete.
-    fn try_reassemble(&mut self, idx: usize, timers: &mut Timers) -> Option<Vec<u8>> {
+    fn try_reassemble(&mut self, idx: usize) -> Option<Vec<u8>> {
         if !self.entries[idx].is_complete() {
             return None;
         }
@@ -334,7 +325,6 @@ impl ReassemblyTable {
         let frame = self.build_frame(idx);
         let entry = self.entries.remove(idx);
         self.total_bytes -= entry.total_bytes;
-        timers.cancel(entry.timer_id);
         Some(frame)
     }
 
@@ -569,7 +559,6 @@ impl Interface {
         udp_sockets:    &mut [UdpSocket],
         tcp_sockets:    &mut [TcpSocket],
         standalone_tcp: &mut [TcpSocket],
-        timers:         &mut Timers,
     ) -> Result<()> {
         let cidr = match self.ip {
             Some(c) => c,
@@ -621,7 +610,7 @@ impl Interface {
                 }
 
                 if ip.is_fragment() {
-                    let maybe_frame = self.reasm.borrow_mut().insert(eth, ip, ip_buf, timers);
+                    let maybe_frame = self.reasm.borrow_mut().insert(eth, ip, ip_buf);
                     if let Some(frame) = maybe_frame {
                         self.dispatch_ipv4(&frame, udp_sockets, tcp_sockets, standalone_tcp)?;
                     }

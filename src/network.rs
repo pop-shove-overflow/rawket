@@ -16,7 +16,7 @@ use crate::{
     ip::Ipv4Cidr,
     af_packet::{AfPacketSocket, EtherLink, FRAME_SIZE},
     tcp::{TcpConfig, TcpSocket},
-    timers::Timers,
+    timers::{Timers, now_ms},
     udp::UdpSocket,
     Error, Result,
 };
@@ -518,7 +518,22 @@ impl<L: EtherLink> Network<L> {
 
         // First update: fire already-expired timers, get next deadline.
         let timer_ms = timers.update();
-        let timeout_ms: libc::c_int = match (timer_ms, max_timeout_ms) {
+
+        // Fold TCP socket deadlines into the timeout so we wake up in time
+        // to fire RTO / TLP / keep-alive / persist even when no RX arrives.
+        let tcp_now = now_ms();
+        let tcp_ms: Option<u64> = uplinks
+            .iter()
+            .flat_map(|u| u.standalone_tcp())
+            .filter_map(|s| s.next_deadline_ms(tcp_now))
+            .min();
+
+        let effective_ms = match (timer_ms, tcp_ms) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b)             => a.or(b),
+        };
+
+        let timeout_ms: libc::c_int = match (effective_ms, max_timeout_ms) {
             (Some(t), Some(m)) => t.min(m).min(libc::c_int::MAX as u64) as libc::c_int,
             (Some(t), None)    => t.min(libc::c_int::MAX as u64) as libc::c_int,
             (None,    Some(m)) => m.min(libc::c_int::MAX as u64) as libc::c_int,
@@ -549,7 +564,7 @@ impl<L: EtherLink> Network<L> {
             if rc > 0 {
                 for (uplink, pfd) in uplinks.iter_mut().zip(pollfds.iter()) {
                     if pfd.revents & libc::POLLIN != 0 {
-                        drain(uplink, timers)?;
+                        drain(uplink)?;
                     }
                 }
             }
@@ -575,7 +590,7 @@ impl<L: EtherLink> Network<L> {
 
 /// Drain all available frames from `uplink` and dispatch each to its
 /// matching [`Interface`] receive handler.
-fn drain<L: EtherLink>(uplink: &mut Uplink<L>, timers: &mut Timers) -> Result<()> {
+fn drain<L: EtherLink>(uplink: &mut Uplink<L>) -> Result<()> {
     // Allocate once; 65536-byte frame buffer is too large for a per-iteration
     // stack array, and GRO frames fill most of it so zeroing would dominate.
     let mut frame_buf = alloc::vec![0u8; FRAME_SIZE];
@@ -620,12 +635,12 @@ fn drain<L: EtherLink>(uplink: &mut Uplink<L>, timers: &mut Timers) -> Result<()
 
         if dst_mac == MacAddr::BROADCAST {
             for iface in interfaces.iter_mut() {
-                iface.receive(raw, udp_sockets, tcp_sockets, standalone_tcp, timers)?;
+                iface.receive(raw, udp_sockets, tcp_sockets, standalone_tcp)?;
             }
         } else {
             for iface in interfaces.iter_mut() {
                 if iface.mac() == dst_mac {
-                    iface.receive(raw, udp_sockets, tcp_sockets, standalone_tcp, timers)?;
+                    iface.receive(raw, udp_sockets, tcp_sockets, standalone_tcp)?;
                     break;
                 }
             }

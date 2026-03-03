@@ -9,7 +9,7 @@ use crate::{
         checksum_add, checksum_finish, pseudo_header_acc, IpProto, Ipv4Hdr,
         MIN_HDR_LEN as IP_HDR_LEN,
     },
-    timers,
+    timers::{self, Deadline},
     Error, Result,
 };
 
@@ -596,10 +596,11 @@ pub struct TcpSocket {
     /// Increased on D-SACK detection; decays toward 0 over time.
     rack_reo_wnd_ms: u64,
 
-    // Wall-clock deadlines (0 = not armed)
-    rto_deadline_ms: u64,
-    tlp_deadline_ms: u64,
-    rto_count:       u8,
+    // Deadlines (disarmed = Deadline::default())
+    // Note: rto_deadline is reused as the TIME_WAIT linger timer when state == TimeWait.
+    rto_deadline: Deadline,
+    tlp_deadline: Deadline,
+    rto_count:    u8,
 
     // Duplicate ACK counter (fast retransmit)
     dupack_count:    u8,
@@ -614,19 +615,19 @@ pub struct TcpSocket {
     ecn_cwr_needed: bool,   // received ECE in ACK; send CWR on next data seg
 
     // Keep-alive
-    last_recv_ms:          u64,   // last time we received data or ACK progress
-    keepalive_deadline_ms: u64,   // next probe wall-clock time; 0 = not armed
-    keepalive_probes:      u8,    // probes sent since last activity
+    last_recv_ms:       u64,   // last time we received data or ACK progress
+    keepalive_deadline: Deadline,
+    keepalive_probes:   u8,    // probes sent since last activity
 
     // BBRv3
     bbr: BbrState,
 
     // Zero-window persist
-    persist_deadline_ms: u64,   // 0 = not armed
-    persist_backoff_ms:  u64,   // current persist interval (doubles each probe)
+    persist_deadline: Deadline,
+    persist_backoff_ms: u64,   // current persist interval (doubles each probe)
 
     // Software pacing
-    pacing_next_ms: u64,
+    pacing_next: Deadline,
 
     // Config
     cfg: TcpConfig,
@@ -677,23 +678,23 @@ impl TcpSocket {
             rto_ms:          rto,
             rack_end_seq:    isn,
             rack_xmit_ms:    0,
-            rto_deadline_ms:       0,
-            tlp_deadline_ms:       0,
-            rto_count:             0,
-            dupack_count:          0,
-            rack_reo_wnd_ms:       0,
-            ts_enabled:            false,
-            ts_recent:             0,
-            ecn_enabled:           false,
-            ecn_ce_pending:        false,
-            ecn_cwr_needed:        false,
-            last_recv_ms:          0,
-            keepalive_deadline_ms: 0,
-            keepalive_probes:      0,
+            rto_deadline:       Deadline::default(),
+            tlp_deadline:       Deadline::default(),
+            rto_count:          0,
+            dupack_count:       0,
+            rack_reo_wnd_ms:    0,
+            ts_enabled:         false,
+            ts_recent:          0,
+            ecn_enabled:        false,
+            ecn_ce_pending:     false,
+            ecn_cwr_needed:     false,
+            last_recv_ms:       0,
+            keepalive_deadline: Deadline::default(),
+            keepalive_probes:   0,
             bbr,
-            persist_deadline_ms: 0,
-            persist_backoff_ms:  0,
-            pacing_next_ms:  0,
+            persist_deadline:   Deadline::default(),
+            persist_backoff_ms: 0,
+            pacing_next:        Deadline::default(),
             cfg,
             last_error:      None,
         }
@@ -1113,7 +1114,7 @@ impl TcpSocket {
         self.last_recv_ms     = now;
         self.keepalive_probes = 0;
         if self.cfg.keepalive_idle_ms > 0 {
-            self.keepalive_deadline_ms = now + self.cfg.keepalive_idle_ms;
+            self.keepalive_deadline.arm_from_now(self.cfg.keepalive_idle_ms, now);
         }
 
         // TS-based RTT (RFC 7323 §4.3): override Karn's sample — TS is Karn-immune
@@ -1202,16 +1203,16 @@ impl TcpSocket {
 
         // 7. Timer management
         if self.unacked.is_empty() {
-            self.rto_deadline_ms = 0;
-            self.tlp_deadline_ms = 0;
-            self.rto_count       = 0;
+            self.rto_deadline.disarm();
+            self.tlp_deadline.disarm();
+            self.rto_count = 0;
         } else {
             // Reset RTO (fresh ACK progress)
-            self.rto_deadline_ms = now + self.rto_ms;
-            self.rto_count       = 0;
+            self.rto_deadline.arm_from_now(self.rto_ms, now);
+            self.rto_count = 0;
             // Arm TLP if not set
-            if self.tlp_deadline_ms == 0 && self.srtt_ms > 0 {
-                self.tlp_deadline_ms = now + 2 * self.srtt_ms;
+            if !self.tlp_deadline.is_armed() && self.srtt_ms > 0 {
+                self.tlp_deadline.arm_from_now(2 * self.srtt_ms, now);
             }
         }
     }
@@ -1225,7 +1226,7 @@ impl TcpSocket {
             if self.send_buf.is_empty()         { break; }
 
             // Pacing gate
-            if now < self.pacing_next_ms { break; }
+            if self.pacing_next.is_armed() && !self.pacing_next.is_expired(now) { break; }
 
             // Peer receive-window gate (RFC 793 §3.7, RFC 7323 §2.3).
             // snd_wnd_raw is the raw (unscaled) value from the peer's header;
@@ -1234,14 +1235,14 @@ impl TcpSocket {
             let wnd_limit = self.snd_una + peer_wnd;
             if peer_wnd == 0 || seq_ge(self.snd_nxt, wnd_limit) {
                 // Arm persist timer when blocked by zero window
-                if self.persist_deadline_ms == 0 && !self.send_buf.is_empty() {
-                    self.persist_backoff_ms  = self.rto_ms;
-                    self.persist_deadline_ms = now + self.persist_backoff_ms;
+                if !self.persist_deadline.is_armed() && !self.send_buf.is_empty() {
+                    self.persist_backoff_ms = self.rto_ms;
+                    self.persist_deadline.arm_from_now(self.persist_backoff_ms, now);
                 }
                 break;
             }
             // Window opened — cancel persist timer
-            self.persist_deadline_ms = 0;
+            self.persist_deadline.disarm();
 
             // cwnd gate
             let bytes_in_flight = self.snd_nxt - self.snd_una;
@@ -1291,19 +1292,21 @@ impl TcpSocket {
             self.snd_nxt = seg_end;
 
             // Pacing
-            let interval        = self.pacing_interval_ms();
-            self.pacing_next_ms = if interval > 0 { now + interval } else { 0 };
+            let interval = self.pacing_interval_ms();
+            if interval > 0 { self.pacing_next.arm_from_now(interval, now); } else { self.pacing_next.disarm(); }
 
             // Arm TLP
-            if self.tlp_deadline_ms == 0 && self.srtt_ms > 0 {
-                self.tlp_deadline_ms = now + 2 * self.srtt_ms;
-            } else if self.tlp_deadline_ms == 0 {
-                self.tlp_deadline_ms = now + 10; // fallback 10 ms
+            if !self.tlp_deadline.is_armed() {
+                if self.srtt_ms > 0 {
+                    self.tlp_deadline.arm_from_now(2 * self.srtt_ms, now);
+                } else {
+                    self.tlp_deadline.arm_from_now(10, now); // fallback 10 ms
+                }
             }
 
             // Arm RTO
-            if self.rto_deadline_ms == 0 {
-                self.rto_deadline_ms = now + self.rto_ms;
+            if !self.rto_deadline.is_armed() {
+                self.rto_deadline.arm_from_now(self.rto_ms, now);
             }
         }
     }
@@ -1438,8 +1441,8 @@ impl TcpSocket {
                         retransmits: 0, sacked: false,
                         dtime_at_send: self.bbr.delivered_ms,
                     });
-                    if self.rto_deadline_ms == 0 {
-                        self.rto_deadline_ms = now + self.rto_ms;
+                    if !self.rto_deadline.is_armed() {
+                        self.rto_deadline.arm_from_now(self.rto_ms, now);
                     }
                     self.state = State::SynReceived;
                 }
@@ -1600,7 +1603,7 @@ impl TcpSocket {
                         self.last_recv_ms     = now;
                         self.keepalive_probes = 0;
                         if self.cfg.keepalive_idle_ms > 0 {
-                            self.keepalive_deadline_ms = now + self.cfg.keepalive_idle_ms;
+                            self.keepalive_deadline.arm_from_now(self.cfg.keepalive_idle_ms, now);
                         }
                     }
                     // ACK (with SACK if OOO pending)
@@ -1678,7 +1681,8 @@ impl TcpSocket {
                     let _ = self.send_ctrl(TcpFlags::ACK);
                     if fin_acked {
                         let now = timers::now_ms();
-                        self.rto_deadline_ms = now + TIME_WAIT_MS;
+                        // Reuse rto_deadline as TIME_WAIT linger timer (field is idle during TimeWait).
+                        self.rto_deadline.arm_from_now(TIME_WAIT_MS, now);
                         self.state = State::TimeWait;
                     } else {
                         self.state = State::Closing;
@@ -1718,7 +1722,8 @@ impl TcpSocket {
                     self.rcv_nxt += 1;
                     let _ = self.send_ctrl(TcpFlags::ACK);
                     let now = timers::now_ms();
-                    self.rto_deadline_ms = now + TIME_WAIT_MS;
+                    // Reuse rto_deadline as TIME_WAIT linger timer (field is idle during TimeWait).
+                    self.rto_deadline.arm_from_now(TIME_WAIT_MS, now);
                     self.state = State::TimeWait;
                 } else if !pdu.is_empty() {
                     let _ = self.send_ctrl(TcpFlags::ACK);
@@ -1729,7 +1734,8 @@ impl TcpSocket {
             State::Closing => {
                 if seg.has_flag(TcpFlags::ACK) {
                     let now = timers::now_ms();
-                    self.rto_deadline_ms = now + TIME_WAIT_MS;
+                    // Reuse rto_deadline as TIME_WAIT linger timer (field is idle during TimeWait).
+                    self.rto_deadline.arm_from_now(TIME_WAIT_MS, now);
                     self.state = State::TimeWait;
                 }
             }
@@ -1799,7 +1805,7 @@ impl TcpSocket {
             retransmits: 0, sacked: false,
             dtime_at_send: 0,
         });
-        s.rto_deadline_ms = now + s.rto_ms;
+        s.rto_deadline.arm_from_now(s.rto_ms, now);
         Ok(s)
     }
 
@@ -1839,6 +1845,19 @@ impl TcpSocket {
 
     // ── Public API ───────────────────────────────────────────────────────────
 
+    /// Minimum remaining ms across all armed deadlines; `None` if none pending.
+    /// Used by `Network::poll_rx_with_timeout` to cap the `poll(2)` sleep.
+    pub fn next_deadline_ms(&self, now: u64) -> Option<u64> {
+        [
+            self.rto_deadline.remaining_ms(now),
+            self.tlp_deadline.remaining_ms(now),
+            self.keepalive_deadline.remaining_ms(now),
+            self.persist_deadline.remaining_ms(now),
+            self.pacing_next.remaining_ms(now),
+        ]
+        .into_iter().flatten().min()
+    }
+
     /// Drive the state machine: timers, retransmit, send-buffer drain.
     ///
     /// RX is now handled by the uplink's poll loop, which calls
@@ -1847,8 +1866,8 @@ impl TcpSocket {
         let now = timers::now_ms();
 
         // ── TLP ──
-        if self.tlp_deadline_ms != 0 && now >= self.tlp_deadline_ms {
-            self.tlp_deadline_ms = 0;
+        if self.tlp_deadline.is_expired(now) {
+            self.tlp_deadline.disarm();
             // Send last unacked segment as probe
             if let Some(seg) = self.unacked.last() {
                 let tlp_seq   = seg.seq;
@@ -1865,10 +1884,10 @@ impl TcpSocket {
         }
 
         // ── RTO / TIME_WAIT ──
-        if self.rto_deadline_ms != 0 && now >= self.rto_deadline_ms {
+        if self.rto_deadline.is_expired(now) {
             if self.state == State::TimeWait {
-                self.state           = State::Closed;
-                self.rto_deadline_ms = 0;
+                self.state = State::Closed;
+                self.rto_deadline.disarm();
                 return Ok(());
             }
             // Retransmit oldest non-sacked unacked segment
@@ -1901,14 +1920,13 @@ impl TcpSocket {
                 on_error(TcpError::Timeout);
                 return Ok(());
             }
-            self.rto_ms          = (self.rto_ms * 2).min(self.cfg.rto_max_ms);
-            self.rto_deadline_ms = now + self.rto_ms;
+            self.rto_ms = (self.rto_ms * 2).min(self.cfg.rto_max_ms);
+            self.rto_deadline.arm_from_now(self.rto_ms, now);
         }
 
         // ── Keep-Alive ──
         if self.cfg.keepalive_idle_ms > 0
-            && self.keepalive_deadline_ms != 0
-            && now >= self.keepalive_deadline_ms
+            && self.keepalive_deadline.is_expired(now)
             && self.state == State::Established
         {
             self.keepalive_probes += 1;
@@ -1921,12 +1939,11 @@ impl TcpSocket {
             }
             let probe_seq = self.snd_una - 1;
             let _ = self.send_segment(probe_seq, TcpFlags::ACK, &[], &[]);
-            self.keepalive_deadline_ms = now + self.cfg.keepalive_interval_ms;
+            self.keepalive_deadline.arm_from_now(self.cfg.keepalive_interval_ms, now);
         }
 
         // ── Zero-window persist ──
-        if self.persist_deadline_ms != 0
-            && now >= self.persist_deadline_ms
+        if self.persist_deadline.is_expired(now)
             && self.state == State::Established
         {
             // Send a 1-byte window probe (data from the front of send_buf).
@@ -1942,7 +1959,7 @@ impl TcpSocket {
             // Exponential backoff, capped at rto_max
             self.persist_backoff_ms = (self.persist_backoff_ms * 2)
                 .min(self.cfg.rto_max_ms);
-            self.persist_deadline_ms = now + self.persist_backoff_ms;
+            self.persist_deadline.arm_from_now(self.persist_backoff_ms, now);
         }
 
         // ── Drain send buffer ──
@@ -1984,8 +2001,8 @@ impl TcpSocket {
             State::Closed | State::Listen => {}
             _ => { let _ = self.send_ctrl_opts(TcpFlags::RST, &[]); }
         }
-        self.state           = State::Closed;
-        self.rto_deadline_ms = 0;
+        self.state = State::Closed;
+        self.rto_deadline.disarm();
         Ok(())
     }
 
@@ -2026,8 +2043,8 @@ impl TcpSocket {
             sacked:        false,
             dtime_at_send: self.bbr.delivered_ms,
         });
-        if self.rto_deadline_ms == 0 {
-            self.rto_deadline_ms = now + self.rto_ms;
+        if !self.rto_deadline.is_armed() {
+            self.rto_deadline.arm_from_now(self.rto_ms, now);
         }
     }
 

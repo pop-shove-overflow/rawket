@@ -1,9 +1,9 @@
 /// Monotonic-clock timer list.
 ///
-/// Timers are kept in ascending order of `remaining` milliseconds so that
-/// the next-to-fire timer is always at index 0.  [`Timers::update`] should
-/// be called on every iteration of the application's main loop; it returns
-/// the number of milliseconds until the next timer fires, which can be used
+/// Timers are kept in ascending order of absolute deadline so that the
+/// next-to-fire timer is always at index 0.  [`Timers::update`] should be
+/// called on every iteration of the application's main loop; it returns the
+/// number of milliseconds until the next timer fires, which can be used
 /// directly as the `poll(2)` timeout.
 use alloc::{boxed::Box, vec::Vec};
 
@@ -19,6 +19,28 @@ pub(crate) fn now_ms() -> u64 {
     ts.tv_sec as u64 * 1_000 + ts.tv_nsec as u64 / 1_000_000
 }
 
+// ── Deadline ──────────────────────────────────────────────────────────────────
+
+/// An absolute CLOCK_MONOTONIC deadline in milliseconds.
+/// The sentinel `0` means disarmed; all real `now_ms()` values are > 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub(crate) struct Deadline(u64);
+
+impl Deadline {
+    /// Arm to fire `offset_ms` ms from now (reads clock internally).
+    pub(crate) fn from_now(offset_ms: u64) -> Self { Self(now_ms() + offset_ms) }
+    pub(crate) fn is_armed(self) -> bool { self.0 != 0 }
+    /// True iff armed and `now >= self`.
+    pub(crate) fn is_expired(self, now: u64) -> bool { self.0 != 0 && now >= self.0 }
+    pub(crate) fn disarm(&mut self) { self.0 = 0; }
+    /// Re-arm to `now + offset_ms`; pass in `now` to avoid extra syscall.
+    pub(crate) fn arm_from_now(&mut self, offset_ms: u64, now: u64) { self.0 = now + offset_ms; }
+    /// Remaining ms relative to `now`; `None` if disarmed, `Some(0)` if expired.
+    pub(crate) fn remaining_ms(self, now: u64) -> Option<u64> {
+        if self.0 == 0 { None } else { Some(self.0.saturating_sub(now)) }
+    }
+}
+
 // ── TimerId ───────────────────────────────────────────────────────────────────
 
 /// An opaque handle returned by [`Timers::add`] that can be passed to
@@ -29,9 +51,8 @@ pub struct TimerId(u64);
 // ── Timer entry ───────────────────────────────────────────────────────────────
 
 struct Timer {
-    id: TimerId,
-    /// Milliseconds remaining until this timer fires.
-    remaining: u64,
+    id:       TimerId,
+    deadline: Deadline,
     callback: Box<dyn FnOnce(&mut Timers)>,
 }
 
@@ -39,9 +60,7 @@ struct Timer {
 
 /// A sorted list of pending timers driven by a monotonic clock.
 pub struct Timers {
-    list: Vec<Timer>,
-    /// Timestamp (ms) of the most recent [`update`](Self::update) call.
-    last_tick: u64,
+    list:    Vec<Timer>,
     next_id: u64,
 }
 
@@ -50,11 +69,9 @@ impl Default for Timers {
 }
 
 impl Timers {
-    /// Create an empty timer list.  The internal clock is latched at
-    /// construction time so the first `update()` call measures elapsed time
-    /// from `new()`.
+    /// Create an empty timer list.
     pub fn new() -> Self {
-        Timers { list: Vec::new(), last_tick: now_ms(), next_id: 0 }
+        Timers { list: Vec::new(), next_id: 0 }
     }
 
     /// Schedule `callback` to be called after `duration_ms` milliseconds.
@@ -68,12 +85,11 @@ impl Timers {
         duration_ms: u64,
         callback: impl FnOnce(&mut Timers) + 'static,
     ) -> TimerId {
-        let id = TimerId(self.next_id);
+        let id  = TimerId(self.next_id);
         self.next_id += 1;
-        // partition_point returns the first index where remaining > duration_ms,
-        // so we insert after all timers with an equal or shorter deadline.
-        let pos = self.list.partition_point(|t| t.remaining <= duration_ms);
-        self.list.insert(pos, Timer { id, remaining: duration_ms, callback: Box::new(callback) });
+        let dl  = Deadline::from_now(duration_ms);
+        let pos = self.list.partition_point(|t| t.deadline <= dl);
+        self.list.insert(pos, Timer { id, deadline: dl, callback: Box::new(callback) });
         id
     }
 
@@ -89,9 +105,8 @@ impl Timers {
         }
     }
 
-    /// Advance all timers by the time elapsed since the last call, fire any
-    /// that have expired, and return the milliseconds until the next pending
-    /// timer.
+    /// Fire any expired timers and return the milliseconds until the next
+    /// pending timer.
     ///
     /// Expired timers are removed from the list *before* their callbacks are
     /// invoked.  Each callback receives `&mut Timers`, so it may safely call
@@ -100,31 +115,13 @@ impl Timers {
     /// Returns `None` when there are no pending timers after firing.
     pub fn update(&mut self) -> Option<u64> {
         let now = now_ms();
-        let elapsed = now.saturating_sub(self.last_tick);
-        self.last_tick = now;
-
-        // Subtract elapsed from every timer.  saturating_sub keeps expired
-        // timers at 0 rather than wrapping.  The sort order is preserved
-        // because every element decreases by the same amount.
-        for t in &mut self.list {
-            t.remaining = t.remaining.saturating_sub(elapsed);
-        }
-
-        // All timers with remaining == 0 are at the front of the sorted list.
-        let n_expired = self.list.partition_point(|t| t.remaining == 0);
-
-        // Drain expired entries into a local Vec so that `self` (and therefore
-        // `self.list`) is fully updated before any callback runs.  Each
-        // callback then receives `&mut self`, allowing it to call `add` or
-        // `cancel` without aliasing the drain iterator.
-        let callbacks: Vec<_> =
-            self.list.drain(..n_expired).map(|t| t.callback).collect();
-
-        for cb in callbacks {
-            cb(self);
-        }
-
-        self.list.first().map(|t| t.remaining)
+        let n   = self.list.partition_point(|t| t.deadline <= Deadline(now));
+        let cbs: Vec<_> = self.list.drain(..n).map(|t| t.callback).collect();
+        for cb in cbs { cb(self); }
+        // Re-read clock if any callback fired (they may have consumed wall time
+        // or added short-duration timers whose remaining_ms would be overstated).
+        let now = if n > 0 { now_ms() } else { now };
+        self.list.first().map(|t| t.deadline.remaining_ms(now).unwrap_or(0))
     }
 
     /// Returns `true` if there are no pending timers.
