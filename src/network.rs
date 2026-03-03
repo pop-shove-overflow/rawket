@@ -15,13 +15,12 @@ use crate::{
     interface::Interface,
     ip::Ipv4Cidr,
     af_packet::{AfPacketSocket, EtherLink, FRAME_SIZE},
-    raw_socket::TxSocket,
     tcp::{TcpConfig, TcpSocket},
     timers::Timers,
     udp::UdpSocket,
     Error, Result,
 };
-use alloc::{boxed::Box, rc::Rc, vec::Vec};
+use alloc::{boxed::Box, vec::Vec};
 
 // ── NetworkConfig ─────────────────────────────────────────────────────────────
 
@@ -218,9 +217,7 @@ impl<L: EtherLink> Uplink<L> {
     /// - Installs a recurring ARP cache expiry timer.
     pub fn attach(&mut self, mut iface: Interface, timers: &mut Timers) -> Result<()> {
         self.sock.attach_mac(&iface.mac())?;
-        // Wire up the shared TX path for this interface.
-        let tx_sock = TxSocket::open(iface.ifindex())?;
-        iface.set_tx(Rc::new(move |f: &[u8]| tx_sock.send(f)));
+        iface.set_tx(self.sock.open_tx()?);
         // Apply network-wide ARP settings and install the recurring expiry timer.
         iface.arp_queue().set_max_age_ms(self.arp_cache_max_age_ms);
         iface.arp_queue().set_max_entries(self.arp_cache_max_entries);

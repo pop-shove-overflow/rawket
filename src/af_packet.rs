@@ -9,8 +9,8 @@
 /// union of all registered MACs; [`poll`] dispatches inbound frames to the
 /// matching interface's L3 receive handler.
 use crate::{eth::MacAddr, Error, Result};
-use alloc::vec::Vec;
-use core::{mem, ptr, slice};
+use alloc::{rc::Rc, vec::Vec};
+use core::{cell::RefCell, mem, ptr, slice};
 use libc::{self, ETH_P_ALL, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE, SOCK_RAW, SOL_PACKET};
 
 // ── Kernel constants not yet in libc ─────────────────────────────────────────
@@ -77,6 +77,15 @@ pub trait EtherLink {
     /// Copy `frame` into the transmit path and dispatch it.
     fn tx_send(&mut self, frame: &[u8]) -> Result<()>;
 
+    /// Open (or clone) a standalone TX path and return it as a shareable
+    /// closure.
+    ///
+    /// Called once by [`Uplink::attach`](crate::Uplink::attach) to wire the
+    /// TX closure into every [`Interface`](crate::Interface) on this uplink.
+    /// `AfPacketSocket` clones the shared `TxRing`; `VirtualLink`
+    /// clones its `Rc`-wrapped peer queue.
+    fn open_tx(&self) -> Result<crate::TxFn>;
+
     /// Return an OS file descriptor suitable for use with `poll(2)`.
     ///
     /// Implementations that are not backed by a real file descriptor should
@@ -96,21 +105,122 @@ pub trait EtherLink {
     fn detach_mac(&mut self, _mac: &MacAddr) -> Result<()> { Ok(()) }
 }
 
+// ── RingBuffer ────────────────────────────────────────────────────────────
+
+/// Owns the AF_PACKET file descriptor and the mmap region shared by both rings.
+///
+/// Cleaned up via `Drop`; shared between [`RxRing`] and [`TxRing`] through `Rc`.
+struct RingBuffer {
+    fd:         libc::c_int,
+    map:        *mut libc::c_void,
+    ring_bytes: usize,
+}
+
+impl Drop for RingBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.map, self.ring_bytes * 2);
+            libc::close(self.fd);
+        }
+    }
+}
+
+// ── RxRing ────────────────────────────────────────────────────────────────────
+
+pub(crate) struct RxRing {
+    shared: Rc<RingBuffer>,
+    rx_idx: usize,
+}
+
+impl RxRing {
+    fn frame_ptr(&self, idx: usize) -> *mut Tpacket2Hdr {
+        let offset = (idx % FRAME_COUNT) * FRAME_SIZE;
+        unsafe { (self.shared.map as *mut u8).add(offset) as *mut Tpacket2Hdr }
+    }
+
+    fn recv(&mut self) -> Option<&[u8]> {
+        let hdr = self.frame_ptr(self.rx_idx);
+        let status = unsafe { ptr::read_volatile(&(*hdr).tp_status) };
+        if status & TP_STATUS_USER == 0 {
+            return None;
+        }
+        let snaplen = unsafe { (*hdr).tp_snaplen as usize };
+        let mac_off = unsafe { (*hdr).tp_mac as usize };
+        let base = hdr as usize + mac_off;
+        Some(unsafe { slice::from_raw_parts(base as *const u8, snaplen) })
+    }
+
+    fn release(&mut self) {
+        let hdr = self.frame_ptr(self.rx_idx);
+        unsafe { ptr::write_volatile(&mut (*hdr).tp_status, TP_STATUS_KERNEL) };
+        self.rx_idx = self.rx_idx.wrapping_add(1) % FRAME_COUNT;
+    }
+
+    fn fd(&self) -> libc::c_int {
+        self.shared.fd
+    }
+}
+
+// ── TxRing ────────────────────────────────────────────────────────────────────
+
+pub(crate) struct TxRing {
+    shared: Rc<RingBuffer>,
+    tx_idx: usize,
+}
+
+impl TxRing {
+    fn frame_ptr(&self, idx: usize) -> *mut Tpacket2Hdr {
+        let offset = self.shared.ring_bytes + (idx % FRAME_COUNT) * FRAME_SIZE;
+        unsafe { (self.shared.map as *mut u8).add(offset) as *mut Tpacket2Hdr }
+    }
+
+    fn send(&mut self, frame: &[u8]) -> Result<()> {
+        if frame.len() > FRAME_SIZE - mem::size_of::<Tpacket2Hdr>() {
+            return Err(Error::InvalidInput);
+        }
+
+        let hdr = self.frame_ptr(self.tx_idx);
+        let status = unsafe { ptr::read_volatile(&(*hdr).tp_status) };
+        if status != TP_STATUS_AVAILABLE {
+            return Err(Error::WouldBlock);
+        }
+
+        let mac_off = mem::size_of::<Tpacket2Hdr>();
+        unsafe {
+            let dst = (hdr as *mut u8).add(mac_off);
+            ptr::copy_nonoverlapping(frame.as_ptr(), dst, frame.len());
+            (*hdr).tp_len = frame.len() as u32;
+            (*hdr).tp_snaplen = frame.len() as u32;
+            (*hdr).tp_mac = mac_off as u16;
+            (*hdr).tp_net = (mac_off + 14) as u16;
+            ptr::write_volatile(&mut (*hdr).tp_status, TP_STATUS_SEND_REQUEST);
+        }
+
+        self.tx_idx = self.tx_idx.wrapping_add(1) % FRAME_COUNT;
+
+        let rc = unsafe { libc::sendto(self.shared.fd, ptr::null(), 0, 0, ptr::null(), 0) };
+        if rc < 0 {
+            let e = Error::last_os();
+            if e.raw_os() == Some(libc::ENOBUFS) {
+                return Err(Error::WouldBlock);
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+}
+
 // ── AfPacketSocket ────────────────────────────────────────────────────────────
 
 pub struct AfPacketSocket {
-    fd: libc::c_int,
+    rx:      RxRing,
+    tx:      Rc<RefCell<TxRing>>,
     ifindex: i32,
-    /// RX ring at `[0, ring_bytes)`, TX ring at `[ring_bytes, 2*ring_bytes)`.
-    map: *mut libc::c_void,
-    ring_bytes: usize,
-    rx_idx: usize,
-    tx_idx: usize,
     /// MAC addresses included in the current BPF filter.
-    macs: Vec<MacAddr>,
+    macs:    Vec<MacAddr>,
 }
 
-// SAFETY: The mmap region is exclusively owned by this struct.
+// SAFETY: used in single-threaded context only
 unsafe impl Send for AfPacketSocket {}
 
 impl AfPacketSocket {
@@ -199,7 +309,11 @@ impl AfPacketSocket {
             return Err(Error::last_os());
         }
 
-        Ok(AfPacketSocket { fd, ifindex, map, ring_bytes, rx_idx: 0, tx_idx: 0, macs: Vec::new() })
+        let shared = Rc::new(RingBuffer { fd, map, ring_bytes });
+        let rx = RxRing { shared: Rc::clone(&shared), rx_idx: 0 };
+        let tx = Rc::new(RefCell::new(TxRing { shared, tx_idx: 0 }));
+
+        Ok(AfPacketSocket { rx, tx, ifindex, macs: Vec::new() })
     }
 
     /// Look up the interface index for `ifname` (NUL-terminated C string).
@@ -223,18 +337,6 @@ impl AfPacketSocket {
             }
             Ok(ifreq.ifr_ifru.ifru_ifindex)
         }
-    }
-
-    // ── RX ───────────────────────────────────────────────────────────────────
-
-    fn rx_frame_ptr(&self, idx: usize) -> *mut Tpacket2Hdr {
-        let offset = (idx % FRAME_COUNT) * FRAME_SIZE;
-        unsafe { (self.map as *mut u8).add(offset) as *mut Tpacket2Hdr }
-    }
-
-    fn tx_frame_ptr(&self, idx: usize) -> *mut Tpacket2Hdr {
-        let offset = self.ring_bytes + (idx % FRAME_COUNT) * FRAME_SIZE;
-        unsafe { (self.map as *mut u8).add(offset) as *mut Tpacket2Hdr }
     }
 
     // ── BPF MAC filter + NIC unicast membership ──────────────────────────────
@@ -266,7 +368,7 @@ impl AfPacketSocket {
         let opt = if add { PACKET_ADD_MEMBERSHIP } else { PACKET_DROP_MEMBERSHIP };
         let rc = unsafe {
             libc::setsockopt(
-                self.fd,
+                self.rx.shared.fd,
                 SOL_PACKET,
                 opt,
                 &mreq as *const _ as *const libc::c_void,
@@ -330,7 +432,7 @@ impl AfPacketSocket {
         let fprog = SockFprog { len: prog.len() as u16, filter: prog.as_ptr() };
         let rc = unsafe {
             libc::setsockopt(
-                self.fd,
+                self.rx.shared.fd,
                 libc::SOL_SOCKET,
                 SO_ATTACH_FILTER,
                 &fprog as *const _ as *const libc::c_void,
@@ -346,64 +448,28 @@ impl EtherLink for AfPacketSocket {
     ///
     /// The caller **must** call [`rx_release`] after processing the frame.
     fn rx_recv(&mut self) -> Option<&[u8]> {
-        let hdr = self.rx_frame_ptr(self.rx_idx);
-        let status = unsafe { ptr::read_volatile(&(*hdr).tp_status) };
-        if status & TP_STATUS_USER == 0 {
-            return None;
-        }
-        let snaplen = unsafe { (*hdr).tp_snaplen as usize };
-        let mac_off = unsafe { (*hdr).tp_mac as usize };
-        let base = hdr as usize + mac_off;
-        Some(unsafe { slice::from_raw_parts(base as *const u8, snaplen) })
+        self.rx.recv()
     }
 
     /// Return the current RX frame to the kernel and advance the index.
     fn rx_release(&mut self) {
-        let hdr = self.rx_frame_ptr(self.rx_idx);
-        unsafe { ptr::write_volatile(&mut (*hdr).tp_status, TP_STATUS_KERNEL) };
-        self.rx_idx = self.rx_idx.wrapping_add(1) % FRAME_COUNT;
+        self.rx.release()
     }
 
     /// Copy `frame` into the next TX slot and signal the kernel.
     ///
     /// Returns `Err(WouldBlock)` if the ring is full.
     fn tx_send(&mut self, frame: &[u8]) -> Result<()> {
-        if frame.len() > FRAME_SIZE - mem::size_of::<Tpacket2Hdr>() {
-            return Err(Error::InvalidInput);
-        }
+        self.tx.borrow_mut().send(frame)
+    }
 
-        let hdr = self.tx_frame_ptr(self.tx_idx);
-        let status = unsafe { ptr::read_volatile(&(*hdr).tp_status) };
-        if status != TP_STATUS_AVAILABLE {
-            return Err(Error::WouldBlock);
-        }
-
-        let mac_off = mem::size_of::<Tpacket2Hdr>();
-        unsafe {
-            let dst = (hdr as *mut u8).add(mac_off);
-            ptr::copy_nonoverlapping(frame.as_ptr(), dst, frame.len());
-            (*hdr).tp_len = frame.len() as u32;
-            (*hdr).tp_snaplen = frame.len() as u32;
-            (*hdr).tp_mac = mac_off as u16;
-            (*hdr).tp_net = (mac_off + 14) as u16;
-            ptr::write_volatile(&mut (*hdr).tp_status, TP_STATUS_SEND_REQUEST);
-        }
-
-        self.tx_idx = self.tx_idx.wrapping_add(1) % FRAME_COUNT;
-
-        let rc = unsafe { libc::sendto(self.fd, ptr::null(), 0, 0, ptr::null(), 0) };
-        if rc < 0 {
-            let e = Error::last_os();
-            if e.raw_os() == Some(libc::ENOBUFS) {
-                return Err(Error::WouldBlock);
-            }
-            return Err(e);
-        }
-        Ok(())
+    fn open_tx(&self) -> Result<crate::TxFn> {
+        let tx = Rc::clone(&self.tx);
+        Ok(Rc::new(move |f: &[u8]| tx.borrow_mut().send(f)))
     }
 
     fn fd(&self) -> libc::c_int {
-        self.fd
+        self.rx.fd()
     }
 
     /// Add `mac` to the set of addresses accepted by the kernel BPF filter
@@ -429,14 +495,5 @@ impl EtherLink for AfPacketSocket {
             self.macs.retain(|m| m != mac);
         }
         self.rebuild_filter()
-    }
-}
-
-impl Drop for AfPacketSocket {
-    fn drop(&mut self) {
-        unsafe {
-            libc::munmap(self.map, self.ring_bytes * 2);
-            libc::close(self.fd);
-        }
     }
 }

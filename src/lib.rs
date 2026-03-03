@@ -13,7 +13,6 @@ pub mod interface;
 pub mod ip;
 pub mod network;
 pub mod af_packet;
-pub mod raw_socket;
 pub mod tcp;
 pub mod timers;
 pub mod udp;
