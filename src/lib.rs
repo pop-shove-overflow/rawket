@@ -1,6 +1,11 @@
-#![no_std]
+#![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+// In no_std mode the alloc crate must be brought in explicitly.
+// In std mode alloc is part of the standard library and accessible
+// as a crate path without an explicit extern crate declaration, but
+// including one here is harmless and keeps downstream `use alloc::…`
+// imports working uniformly across both build modes.
 extern crate alloc;
 extern crate libc;
 
@@ -20,34 +25,41 @@ pub mod udp;
 pub use network::{Network, NetworkConfig, Uplink};
 pub use af_packet::AfPacketSocket;
 
-// ── Global allocator (libc malloc/free) ──────────────────────────────────────
+// ── no_std runtime ────────────────────────────────────────────────────────────
+//
+// When the `std` feature is disabled rawket is fully self-contained: it
+// provides its own global allocator (libc malloc/free) and panic handler
+// (abort).  When `std` is enabled these are supplied by the Rust runtime
+// and must not be redefined here.
+
 /// Shared TX-path closure type used by interfaces and sockets.
 pub(crate) type TxFn = alloc::rc::Rc<dyn Fn(&[u8]) -> Result<()>>;
 
-use core::alloc::{GlobalAlloc, Layout};
+#[cfg(not(feature = "std"))]
+mod rt {
+    use core::alloc::{GlobalAlloc, Layout};
 
-struct LibcAllocator;
+    struct LibcAllocator;
 
-unsafe impl GlobalAlloc for LibcAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        unsafe { libc::malloc(layout.size()) as *mut u8 }
+    unsafe impl GlobalAlloc for LibcAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            unsafe { libc::malloc(layout.size()) as *mut u8 }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+            unsafe { libc::free(ptr as *mut libc::c_void) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, _layout: Layout, new_size: usize) -> *mut u8 {
+            unsafe { libc::realloc(ptr as *mut libc::c_void, new_size) as *mut u8 }
+        }
     }
-    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
-        unsafe { libc::free(ptr as *mut libc::c_void) }
+
+    #[global_allocator]
+    static ALLOCATOR: LibcAllocator = LibcAllocator;
+
+    #[panic_handler]
+    fn panic(_info: &core::panic::PanicInfo) -> ! {
+        unsafe { libc::abort() }
     }
-    unsafe fn realloc(&self, ptr: *mut u8, _layout: Layout, new_size: usize) -> *mut u8 {
-        unsafe { libc::realloc(ptr as *mut libc::c_void, new_size) as *mut u8 }
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: LibcAllocator = LibcAllocator;
-
-// ── Panic handler ─────────────────────────────────────────────────────────────
-
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    unsafe { libc::abort() }
 }
 
 // ── Error type ────────────────────────────────────────────────────────────────

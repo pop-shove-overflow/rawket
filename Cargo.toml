@@ -9,6 +9,20 @@ license = "MIT"
 name = "rawket"
 crate-type = ["staticlib", "rlib"]
 
+[features]
+# Enable the Rust standard library.
+#
+# With this feature off (the default) rawket is a self-contained no_std
+# crate: it supplies its own #[global_allocator] (libc malloc) and
+# #[panic_handler] (abort), and must be linked with musl or another
+# freestanding libc.
+#
+# With this feature on rawket becomes a normal std crate: the allocator
+# and panic handler come from the Rust runtime, musl is not required, and
+# the library can be used as a regular Rust dependency without any
+# no_std ceremony.  Intended for test harnesses and other Rust consumers.
+std = []
+
 [dependencies]
 libc = { version = "0.2", default-features = false }
 
