@@ -1764,7 +1764,7 @@ impl TcpSocket {
     /// `nexthop_ip` is the gateway IP for off-subnet destinations, or `dst_ip`
     /// itself for on-link destinations.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn connect_now(
+    pub fn connect_now(
         iface:      &Interface,
         src:        SocketAddrV4,
         dst:        SocketAddrV4,
@@ -1804,7 +1804,7 @@ impl TcpSocket {
     }
 
     /// Passive open: waits for SYN.  Drive with `poll()` until `state == Established`.
-    pub(crate) fn accept(
+    pub fn accept(
         iface:   &Interface,
         src:     SocketAddrV4,
         on_recv: for<'a> fn(TcpPacket<'a>),

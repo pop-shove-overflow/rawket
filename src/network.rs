@@ -296,7 +296,7 @@ impl<L: EtherLink> Uplink<L> {
     }
 
     /// Add a standalone TCP socket (from rawket_tcp_connect / rawket_tcp_accept).
-    pub(crate) fn add_standalone_tcp(&mut self, sock: TcpSocket) {
+    pub fn add_standalone_tcp(&mut self, sock: TcpSocket) {
         self.standalone_tcp.push(sock);
     }
 
