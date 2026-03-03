@@ -9,7 +9,8 @@ use crate::{
         checksum_add, checksum_finish, pseudo_header_acc, IpProto, Ipv4Hdr,
         MIN_HDR_LEN as IP_HDR_LEN,
     },
-    timers::{self, Deadline},
+    timers::{Clock, Deadline},
+
     Error, Result,
 };
 
@@ -552,6 +553,7 @@ fn random_u32() -> u32 {
 
 pub struct TcpSocket {
     tx:          crate::TxFn,
+    clock:       Clock,
     src_mac:     MacAddr,
     dst_mac:     MacAddr,
     src:         SocketAddrV4,
@@ -641,6 +643,7 @@ impl TcpSocket {
     #[allow(clippy::too_many_arguments)]
     fn new_raw(
         tx:        crate::TxFn,
+        clock:     Clock,
         src_mac:   MacAddr,
         src:       SocketAddrV4,
         on_recv:   for<'a> fn(TcpPacket<'a>),
@@ -652,6 +655,7 @@ impl TcpSocket {
         let bbr   = BbrState::new(&cfg);
         TcpSocket {
             tx,
+            clock,
             src_mac,
             dst_mac:         MacAddr::ZERO,
             src,
@@ -704,7 +708,7 @@ impl TcpSocket {
 
     fn syn_opts(&self) -> [u8; 24] {
         let mss = self.cfg.mss;
-        let [t0, t1, t2, t3] = (timers::now_ms() as u32).to_be_bytes();
+        let [t0, t1, t2, t3] = (self.clock.monotonic_ms() as u32).to_be_bytes();
         [
             0x02, 0x04, (mss >> 8) as u8, mss as u8,   // MSS (4)
             0x03, 0x03, LOCAL_WS_SHIFT, 0x01,            // WS (3) + NOP pad (1)
@@ -718,7 +722,7 @@ impl TcpSocket {
     // ── TCP Timestamps option (NOP NOP kind=8 len=10 TSval TSecr, 12 bytes) ──
 
     fn ts_opt(&self) -> [u8; 12] {
-        let [t0, t1, t2, t3] = (timers::now_ms() as u32).to_be_bytes();
+        let [t0, t1, t2, t3] = (self.clock.monotonic_ms() as u32).to_be_bytes();
         let [e0, e1, e2, e3] = self.ts_recent.to_be_bytes();
         [0x01, 0x01, 0x08, 0x0a, t0, t1, t2, t3, e0, e1, e2, e3]
     }
@@ -1051,7 +1055,7 @@ impl TcpSocket {
     // ── Core ACK processing ──────────────────────────────────────────────────
 
     fn on_ack(&mut self, new_ack: SeqNum, opts: &ParsedOpts) {
-        let now          = timers::now_ms();
+        let now          = self.clock.monotonic_ms();
         let mut acked    = 0u64;
         let mut rtt_sample: Option<u64> = None;
         let mut min_dtime: Option<u64>  = None;
@@ -1121,7 +1125,7 @@ impl TcpSocket {
         if self.ts_enabled {
             if let Some(ecr) = opts.ts_ecr {
                 if ecr != 0 {
-                    let ts_rtt = (timers::now_ms() as u32).wrapping_sub(ecr) as u64;
+                    let ts_rtt = (self.clock.monotonic_ms() as u32).wrapping_sub(ecr) as u64;
                     rtt_sample = Some(ts_rtt);
                 }
             }
@@ -1220,7 +1224,7 @@ impl TcpSocket {
     // ── Send buffer drain ────────────────────────────────────────────────────
 
     fn flush_send_buf(&mut self) {
-        let now = timers::now_ms();
+        let now = self.clock.monotonic_ms();
         loop {
             if self.state != State::Established { break; }
             if self.send_buf.is_empty()         { break; }
@@ -1432,7 +1436,7 @@ impl TcpSocket {
                     self.send_ctrl_opts(TcpFlags::SYN | TcpFlags::ACK | ecn_synack, &syn_opts)?;
                     self.snd_nxt += 1;
                     // Record SYN-ACK in unacked
-                    let now = timers::now_ms();
+                    let now = self.clock.monotonic_ms();
                     if self.bbr.delivered_ms == 0 { self.bbr.delivered_ms = now; }
                     self.unacked.push(TxSegment {
                         seq: isn, end_seq: isn + 1,
@@ -1529,7 +1533,7 @@ impl TcpSocket {
                         self.dupack_count = self.dupack_count.saturating_add(1);
                         if self.dupack_count >= 3 {
                             self.dupack_count = 0;
-                            let now = timers::now_ms();
+                            let now = self.clock.monotonic_ms();
                             if let Some(s) = self.unacked.iter().find(|s| !s.sacked) {
                                 let (seq, flags, data) = (s.seq, s.flags, s.data.clone());
                                 for s in &mut self.unacked {
@@ -1599,7 +1603,7 @@ impl TcpSocket {
                     self.drain_ooo(eth.src, eth.dst, ip.src, ip.dst);
                     // Keep-alive: receiving data resets the idle timer
                     {
-                        let now = timers::now_ms();
+                        let now = self.clock.monotonic_ms();
                         self.last_recv_ms     = now;
                         self.keepalive_probes = 0;
                         if self.cfg.keepalive_idle_ms > 0 {
@@ -1680,7 +1684,7 @@ impl TcpSocket {
                     self.rcv_nxt += 1;
                     let _ = self.send_ctrl(TcpFlags::ACK);
                     if fin_acked {
-                        let now = timers::now_ms();
+                        let now = self.clock.monotonic_ms();
                         // Reuse rto_deadline as TIME_WAIT linger timer (field is idle during TimeWait).
                         self.rto_deadline.arm_from_now(TIME_WAIT_MS, now);
                         self.state = State::TimeWait;
@@ -1721,7 +1725,7 @@ impl TcpSocket {
                 if seg.has_flag(TcpFlags::FIN) {
                     self.rcv_nxt += 1;
                     let _ = self.send_ctrl(TcpFlags::ACK);
-                    let now = timers::now_ms();
+                    let now = self.clock.monotonic_ms();
                     // Reuse rto_deadline as TIME_WAIT linger timer (field is idle during TimeWait).
                     self.rto_deadline.arm_from_now(TIME_WAIT_MS, now);
                     self.state = State::TimeWait;
@@ -1733,7 +1737,7 @@ impl TcpSocket {
             // ── CLOSING ─────────────────────────────────────────────────────
             State::Closing => {
                 if seg.has_flag(TcpFlags::ACK) {
-                    let now = timers::now_ms();
+                    let now = self.clock.monotonic_ms();
                     // Reuse rto_deadline as TIME_WAIT linger timer (field is idle during TimeWait).
                     self.rto_deadline.arm_from_now(TIME_WAIT_MS, now);
                     self.state = State::TimeWait;
@@ -1784,7 +1788,7 @@ impl TcpSocket {
             .ok_or(Error::WouldBlock)?;
 
         let mut s = Self::new_raw(
-            iface.tx(), iface.mac(), src, on_recv, on_error,
+            iface.tx(), iface.clock().clone(), iface.mac(), src, on_recv, on_error,
             cfg,
         );
         s.dst        = dst;
@@ -1796,7 +1800,7 @@ impl TcpSocket {
         // Advertise ECN capability in SYN (RFC 3168 §6.1.1).
         s.send_ctrl_opts(TcpFlags::SYN | TcpFlags::ECE | TcpFlags::CWR, &syn_opts)?;
         s.snd_nxt += 1;
-        let now = timers::now_ms();
+        let now = s.clock.monotonic_ms();
         if s.bbr.delivered_ms == 0 { s.bbr.delivered_ms = now; }
         s.unacked.push(TxSegment {
             seq: isn, end_seq: isn + 1,
@@ -1818,7 +1822,7 @@ impl TcpSocket {
         cfg:     TcpConfig,
     ) -> Result<Self> {
         let mut s = Self::new_raw(
-            iface.tx(), iface.mac(), src, on_recv, on_error,
+            iface.tx(), iface.clock().clone(), iface.mac(), src, on_recv, on_error,
             cfg,
         );
         s.state = State::Listen;
@@ -1863,7 +1867,7 @@ impl TcpSocket {
     /// RX is now handled by the uplink's poll loop, which calls
     /// [`process_segment`] directly.
     pub fn poll(&mut self) -> Result<()> {
-        let now = timers::now_ms();
+        let now = self.clock.monotonic_ms();
 
         // ── TLP ──
         if self.tlp_deadline.is_expired(now) {
@@ -2031,7 +2035,7 @@ impl TcpSocket {
     /// Push a FIN into the retransmit buffer and arm RTO so a lost FIN is
     /// retransmitted.
     fn record_fin(&mut self, fin_seq: SeqNum) {
-        let now = timers::now_ms();
+        let now = self.clock.monotonic_ms();
         self.unacked.push(TxSegment {
             seq:           fin_seq,
             end_seq:       fin_seq + 1, // FIN occupies 1 sequence byte

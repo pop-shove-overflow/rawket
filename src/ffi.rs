@@ -17,6 +17,7 @@ use crate::{
     network::{Network, NetworkConfig},
     af_packet::{AfPacketSocket, EtherLink},
     tcp::{State, TcpError, TcpPacket, TcpSocket},
+    timers::Clock,
     udp::{UdpPacket, UdpSocket},
     Error,
 };
@@ -179,7 +180,7 @@ pub unsafe extern "C" fn rawket_network_new(
     } else {
         NetworkConfig::from(unsafe { core::ptr::read(config) })
     };
-    Box::into_raw(Box::new(RawketNetwork(Network::with_config(rust_config))))
+    Box::into_raw(Box::new(RawketNetwork(Network::with_config(rust_config, Clock::default()))))
 }
 
 #[no_mangle]

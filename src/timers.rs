@@ -7,28 +7,147 @@
 /// directly as the `poll(2)` timeout.
 use alloc::{boxed::Box, vec::Vec};
 
-// ── Time source ───────────────────────────────────────────────────────────────
+// ── Clock (production) ───────────────────────────────────────────────────────
 
-/// Returns the current monotonic time in milliseconds.
-///
-/// `CLOCK_MONOTONIC` never goes backwards and is unaffected by wall-clock
-/// adjustments, making it safe for elapsed-time arithmetic.
-pub(crate) fn now_ms() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64 * 1_000 + ts.tv_nsec as u64 / 1_000_000
+#[cfg(not(feature = "test-internals"))]
+#[derive(Clone, Default)]
+pub struct Clock;
+
+#[cfg(not(feature = "test-internals"))]
+impl Clock {
+    /// Monotonic time in milliseconds (`CLOCK_MONOTONIC`).  Never goes
+    /// backwards and is unaffected by wall-clock adjustments.
+    pub fn monotonic_ms(&self) -> u64 {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        ts.tv_sec as u64 * 1_000 + ts.tv_nsec as u64 / 1_000_000
+    }
+    /// Wall-clock time in milliseconds since the Unix epoch (`CLOCK_REALTIME`).
+    pub fn wall_clock_ms(&self) -> u64 {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+        ts.tv_sec as u64 * 1_000 + ts.tv_nsec as u64 / 1_000_000
+    }
+}
+
+// ── Clock (test-internals) ───────────────────────────────────────────────────
+
+#[cfg(feature = "test-internals")]
+use alloc::rc::Rc;
+#[cfg(feature = "test-internals")]
+use core::cell::Cell;
+
+#[cfg(feature = "test-internals")]
+struct ClockInner {
+    offset_ms:        Cell<i64>,
+    paused:           Cell<bool>,
+    frozen_monotonic: Cell<u64>,
+    frozen_wall:      Cell<u64>,
+}
+
+#[cfg(feature = "test-internals")]
+#[derive(Clone)]
+pub struct Clock {
+    inner: Rc<ClockInner>,
+}
+
+#[cfg(feature = "test-internals")]
+impl Default for Clock {
+    fn default() -> Self {
+        Clock {
+            inner: Rc::new(ClockInner {
+                offset_ms:        Cell::new(0),
+                paused:           Cell::new(false),
+                frozen_monotonic: Cell::new(0),
+                frozen_wall:      Cell::new(0),
+            }),
+        }
+    }
+}
+
+#[cfg(feature = "test-internals")]
+impl Clock {
+    fn raw_monotonic_ms() -> u64 {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        ts.tv_sec as u64 * 1_000 + ts.tv_nsec as u64 / 1_000_000
+    }
+
+    fn raw_wall_clock_ms() -> u64 {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+        ts.tv_sec as u64 * 1_000 + ts.tv_nsec as u64 / 1_000_000
+    }
+
+    pub fn monotonic_ms(&self) -> u64 {
+        if self.inner.paused.get() {
+            self.inner.frozen_monotonic.get()
+        } else {
+            let raw = Self::raw_monotonic_ms();
+            (raw as i64 + self.inner.offset_ms.get()) as u64
+        }
+    }
+
+    pub fn wall_clock_ms(&self) -> u64 {
+        if self.inner.paused.get() {
+            self.inner.frozen_wall.get()
+        } else {
+            let raw = Self::raw_wall_clock_ms();
+            (raw as i64 + self.inner.offset_ms.get()) as u64
+        }
+    }
+
+    /// Advance apparent time by `ms` milliseconds.
+    ///
+    /// If paused, adjusts the frozen values directly; otherwise adjusts the
+    /// offset applied to `clock_gettime` results.
+    pub fn advance(&self, ms: i64) {
+        if self.inner.paused.get() {
+            let m = self.inner.frozen_monotonic.get();
+            let w = self.inner.frozen_wall.get();
+            self.inner.frozen_monotonic.set((m as i64 + ms) as u64);
+            self.inner.frozen_wall.set((w as i64 + ms) as u64);
+        } else {
+            let off = self.inner.offset_ms.get();
+            self.inner.offset_ms.set(off + ms);
+        }
+    }
+
+    /// Freeze time: subsequent calls to `monotonic_ms` / `wall_clock_ms`
+    /// return the apparent time at the moment of this call until [`resume`]
+    /// is called.
+    pub fn pause(&self) {
+        if !self.inner.paused.get() {
+            self.inner.frozen_monotonic.set(self.monotonic_ms());
+            self.inner.frozen_wall.set(self.wall_clock_ms());
+            self.inner.paused.set(true);
+        }
+    }
+
+    /// Resume real-time progression from the current frozen time.
+    ///
+    /// Adjusts the offset so that the apparent time immediately after resume
+    /// matches the frozen time at the moment of the last [`pause`].
+    pub fn resume(&self) {
+        if self.inner.paused.get() {
+            let frozen_m = self.inner.frozen_monotonic.get();
+            let raw_m = Self::raw_monotonic_ms();
+            self.inner.offset_ms.set(frozen_m as i64 - raw_m as i64);
+            self.inner.paused.set(false);
+        }
+    }
 }
 
 // ── Deadline ──────────────────────────────────────────────────────────────────
 
 /// An absolute CLOCK_MONOTONIC deadline in milliseconds.
-/// The sentinel `0` means disarmed; all real `now_ms()` values are > 0.
+/// The sentinel `0` means disarmed; all real clock values are > 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(crate) struct Deadline(u64);
 
 impl Deadline {
-    /// Arm to fire `offset_ms` ms from now (reads clock internally).
-    pub(crate) fn from_now(offset_ms: u64) -> Self { Self(now_ms() + offset_ms) }
+    /// Arm to fire `offset_ms` ms from `now`.
+    pub(crate) fn from_now(offset_ms: u64, now: u64) -> Self { Self(now + offset_ms) }
     pub(crate) fn is_armed(self) -> bool { self.0 != 0 }
     /// True iff armed and `now >= self`.
     pub(crate) fn is_expired(self, now: u64) -> bool { self.0 != 0 && now >= self.0 }
@@ -50,28 +169,31 @@ pub struct TimerId(u64);
 
 // ── Timer entry ───────────────────────────────────────────────────────────────
 
+type TimerCallback = Box<dyn FnOnce(&mut Timers)>;
+
 struct Timer {
     id:       TimerId,
     deadline: Deadline,
-    callback: Box<dyn FnOnce(&mut Timers)>,
+    callback: TimerCallback,
 }
 
 // ── Timers ────────────────────────────────────────────────────────────────────
 
-/// A sorted list of pending timers driven by a monotonic clock.
+/// A sorted list of pending timers driven by a [`Clock`].
 pub struct Timers {
     list:    Vec<Timer>,
     next_id: u64,
+    clock:   Clock,
 }
 
 impl Default for Timers {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self { Self::new(Clock::default()) }
 }
 
 impl Timers {
-    /// Create an empty timer list.
-    pub fn new() -> Self {
-        Timers { list: Vec::new(), next_id: 0 }
+    /// Create an empty timer list driven by `clock`.
+    pub fn new(clock: Clock) -> Self {
+        Timers { list: Vec::new(), next_id: 0, clock }
     }
 
     /// Schedule `callback` to be called after `duration_ms` milliseconds.
@@ -87,7 +209,8 @@ impl Timers {
     ) -> TimerId {
         let id  = TimerId(self.next_id);
         self.next_id += 1;
-        let dl  = Deadline::from_now(duration_ms);
+        let now = self.clock.monotonic_ms();
+        let dl  = Deadline::from_now(duration_ms, now);
         let pos = self.list.partition_point(|t| t.deadline <= dl);
         self.list.insert(pos, Timer { id, deadline: dl, callback: Box::new(callback) });
         id
@@ -114,13 +237,13 @@ impl Timers {
     ///
     /// Returns `None` when there are no pending timers after firing.
     pub fn update(&mut self) -> Option<u64> {
-        let now = now_ms();
+        let now = self.clock.monotonic_ms();
         let n   = self.list.partition_point(|t| t.deadline <= Deadline(now));
         let cbs: Vec<_> = self.list.drain(..n).map(|t| t.callback).collect();
         for cb in cbs { cb(self); }
         // Re-read clock if any callback fired (they may have consumed wall time
         // or added short-duration timers whose remaining_ms would be overstated).
-        let now = if n > 0 { now_ms() } else { now };
+        let now = if n > 0 { self.clock.monotonic_ms() } else { now };
         self.list.first().map(|t| t.deadline.remaining_ms(now).unwrap_or(0))
     }
 
@@ -133,4 +256,7 @@ impl Timers {
     pub fn len(&self) -> usize {
         self.list.len()
     }
+
+    /// Returns a reference to the clock driving this timer list.
+    pub fn clock(&self) -> &Clock { &self.clock }
 }

@@ -3,7 +3,7 @@
 /// A [`Network`] owns a set of [`Uplink`]s — one per physical interface
 /// (ifindex).  Each [`Uplink`] pairs one shared [`EtherLink`] with the
 /// [`Interface`]s (Layer-3 virtual NICs) that are multiplexed over it, plus
-/// the [`UdpSocket`]s and [`TcpSocket`]s registered on that uplink.
+/// the [`UdpSocket`]s and [`TcpSocket`]s registered on those interfaces.
 ///
 /// [`Network::poll_rx`] is the single entry point for inbound traffic: it
 /// updates the timer system, blocks in `poll(2)` for the appropriate
@@ -16,7 +16,7 @@ use crate::{
     ip::Ipv4Cidr,
     af_packet::{AfPacketSocket, EtherLink, FRAME_SIZE},
     tcp::{TcpConfig, TcpSocket},
-    timers::{Timers, now_ms},
+    timers::{Clock, Timers},
     udp::UdpSocket,
     Error, Result,
 };
@@ -206,17 +206,20 @@ pub struct Uplink<L: EtherLink> {
     icmp_rate_limit_per_sec: u32,
     eth_callbacks:           Vec<EthEntry>,
     next_eth_id:             usize,
+    clock:                   Clock,
 }
 
 impl<L: EtherLink> Uplink<L> {
     /// Attach `iface` to this uplink.
     ///
     /// - Registers the interface's MAC in the socket's BPF filter.
+    /// - Injects the network-wide clock into the interface.
     /// - Applies [`NetworkConfig::arp_cache_max_age_ms`] to the interface's
     ///   ARP cache.
     /// - Installs a recurring ARP cache expiry timer.
     pub fn attach(&mut self, mut iface: Interface, timers: &mut Timers) -> Result<()> {
         self.sock.attach_mac(&iface.mac())?;
+        iface.set_clock(self.clock.clone());
         iface.set_tx(self.sock.open_tx()?);
         // Apply network-wide ARP settings and install the recurring expiry timer.
         iface.arp_queue().set_max_age_ms(self.arp_cache_max_age_ms);
@@ -354,6 +357,7 @@ pub struct Network<L: EtherLink> {
     config:  NetworkConfig,
     timers:  Timers,
     routes:  Vec<Route>,
+    clock:   Clock,
 }
 
 impl Default for Network<AfPacketSocket> {
@@ -361,16 +365,22 @@ impl Default for Network<AfPacketSocket> {
 }
 
 impl Network<AfPacketSocket> {
-    /// Create a network runtime with default configuration.
+    /// Create a network runtime with default configuration and the Linux clock.
     pub fn new() -> Self {
-        Self::with_config(NetworkConfig::default())
+        Self::with_config(NetworkConfig::default(), Clock::default())
     }
 }
 
 impl<L: EtherLink> Network<L> {
-    /// Create a network runtime with the given configuration.
-    pub fn with_config(config: NetworkConfig) -> Self {
-        Network { uplinks: Vec::new(), config, timers: Timers::new(), routes: Vec::new() }
+    /// Create a network runtime with the given configuration and clock.
+    pub fn with_config(config: NetworkConfig, clock: Clock) -> Self {
+        Network {
+            uplinks: Vec::new(),
+            config,
+            timers:  Timers::new(clock.clone()),
+            routes:  Vec::new(),
+            clock,
+        }
     }
 
     /// Register an [`EtherLink`] as an uplink and return a mutable reference
@@ -391,6 +401,7 @@ impl<L: EtherLink> Network<L> {
             icmp_rate_limit_per_sec: self.config.icmp_rate_limit_per_sec,
             eth_callbacks:           Vec::new(),
             next_eth_id:             0,
+            clock:                   self.clock.clone(),
         });
         self.uplinks.last_mut().unwrap()
     }
@@ -521,7 +532,7 @@ impl<L: EtherLink> Network<L> {
 
         // Fold TCP socket deadlines into the timeout so we wake up in time
         // to fire RTO / TLP / keep-alive / persist even when no RX arrives.
-        let tcp_now = now_ms();
+        let tcp_now = timers.clock().monotonic_ms();
         let tcp_ms: Option<u64> = uplinks
             .iter()
             .flat_map(|u| u.standalone_tcp())

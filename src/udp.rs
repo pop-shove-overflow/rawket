@@ -96,11 +96,11 @@ pub struct UdpPacket<'a> {
 // ── Higher-level socket-like API ──────────────────────────────────────────────
 
 pub struct UdpSocket {
-    tx:       Rc<dyn Fn(&[u8]) -> Result<()>>,
-    src_mac:  MacAddr,
-    src:      SocketAddrV4,
-    tx_id:    u16,
-    on_recv:  for<'a> fn(UdpPacket<'a>),
+    tx:        crate::TxFn,
+    src_mac:   MacAddr,
+    src:       SocketAddrV4,
+    tx_id:     u16,
+    on_recv:   for<'a> fn(UdpPacket<'a>),
     /// Combined ARP cache + frame queue, shared with the owning interface.
     /// All MAC lookups and frame queuing go through this single handle.
     arp_queue: ArpQueue,

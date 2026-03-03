@@ -12,9 +12,10 @@ use core::net::Ipv4Addr;
 use crate::{
     arp::{ArpHdr, ArpOp, HDR_LEN as ARP_HDR_LEN},
     eth::{EthHdr, EtherType, MacAddr, HDR_LEN as ETH_HDR_LEN},
-    timers::{now_ms, Timers},
+    timers::{Clock, Timers},
     Result,
 };
+
 
 // ── Entry ─────────────────────────────────────────────────────────────────────
 
@@ -47,8 +48,8 @@ impl ArpCache {
     /// If an entry for `ip` already exists it is updated in place; otherwise
     /// a new entry is appended.  When the cache is full, the oldest entry
     /// (FIFO) is evicted to make room.  The expiry is set to `now + max_age_ms`.
-    pub fn insert(&mut self, ip: Ipv4Addr, mac: MacAddr) {
-        let expires_at = now_ms() + self.max_age_ms;
+    pub fn insert(&mut self, ip: Ipv4Addr, mac: MacAddr, now: u64) {
+        let expires_at = now + self.max_age_ms;
         if let Some(e) = self.entries.iter_mut().find(|e| e.ip == ip) {
             e.mac = mac;
             e.expires_at = expires_at;
@@ -63,8 +64,7 @@ impl ArpCache {
 
     /// Return the cached MAC address for `ip`, or `None` if not present or
     /// expired.
-    pub fn lookup(&self, ip: Ipv4Addr) -> Option<MacAddr> {
-        let now = now_ms();
+    pub fn lookup(&self, ip: Ipv4Addr, now: u64) -> Option<MacAddr> {
         self.entries
             .iter()
             .find(|e| e.ip == ip && e.expires_at > now)
@@ -74,8 +74,7 @@ impl ArpCache {
     /// Like [`lookup`](Self::lookup), but also extends the entry's expiry to
     /// `now + max_age_ms` on a hit, preventing frequently-used entries from
     /// aging out while traffic is flowing.
-    pub fn lookup_and_refresh(&mut self, ip: Ipv4Addr) -> Option<MacAddr> {
-        let now = now_ms();
+    pub fn lookup_and_refresh(&mut self, ip: Ipv4Addr, now: u64) -> Option<MacAddr> {
         if let Some(e) = self.entries.iter_mut().find(|e| e.ip == ip && e.expires_at > now) {
             e.expires_at = now + self.max_age_ms;
             Some(e.mac)
@@ -87,8 +86,7 @@ impl ArpCache {
     /// Remove all entries whose expiry timestamp has passed.
     ///
     /// Called automatically by the timer installed via [`schedule_expiry`].
-    pub fn expire(&mut self) {
-        let now = now_ms();
+    pub fn expire(&mut self, now: u64) {
         self.entries.retain(|e| e.expires_at > now);
     }
 }
@@ -126,14 +124,16 @@ pub(crate) enum PushResult {
 
 /// Combined ARP cache + outbound-frame queue for one interface.
 ///
-/// Both halves are stored behind `Rc<RefCell<>>` so a cheap `clone()` can be
-/// given to each socket; all clones share the same live state.
+/// Both halves (cache and pending queue) are stored behind `Rc<RefCell<>>` so a
+/// cheap `clone()` can be given to each socket; all clones share the same live
+/// state.
 pub(crate) struct ArpQueue {
     cache:   Rc<RefCell<ArpCache>>,
     pending: Rc<RefCell<PendingQueue>>,
     /// Set to `false` by [`mark_dead`] when the owning interface is detached.
     /// The self-rescheduling expiry timer checks this flag and stops firing.
     alive:   Rc<Cell<bool>>,
+    clock:   Clock,
 }
 
 impl Clone for ArpQueue {
@@ -142,16 +142,18 @@ impl Clone for ArpQueue {
             cache:   Rc::clone(&self.cache),
             pending: Rc::clone(&self.pending),
             alive:   Rc::clone(&self.alive),
+            clock:   self.clock.clone(),
         }
     }
 }
 
 impl ArpQueue {
-    pub fn new(max_age_ms: u64) -> Self {
+    pub fn new(max_age_ms: u64, clock: Clock) -> Self {
         ArpQueue {
             cache:   Rc::new(RefCell::new(ArpCache::new(max_age_ms))),
             pending: Rc::new(RefCell::new(PendingQueue { entries: Vec::new(), max_per_ip: 4 })),
             alive:   Rc::new(Cell::new(true)),
+            clock,
         }
     }
 
@@ -172,6 +174,13 @@ impl ArpQueue {
         self.cache.borrow().max_age_ms
     }
 
+    /// Replace the clock with `clock`.  Called by
+    /// [`Interface::set_clock`](crate::interface::Interface::set_clock) after
+    /// `Uplink::attach` injects the network-wide shared clock.
+    pub(crate) fn set_clock(&mut self, clock: Clock) {
+        self.clock = clock;
+    }
+
     /// Set the maximum number of ARP cache entries.  When the cache is full,
     /// the oldest entry is evicted (FIFO) to make room.  Default: 256.
     pub fn set_max_entries(&self, n: usize) {
@@ -186,22 +195,26 @@ impl ArpQueue {
 
     /// Insert or refresh a cache entry (called on ARP receipt).
     pub fn insert(&self, ip: Ipv4Addr, mac: MacAddr) {
-        self.cache.borrow_mut().insert(ip, mac);
+        let now = self.clock.monotonic_ms();
+        self.cache.borrow_mut().insert(ip, mac, now);
     }
 
     /// Purge expired entries (called by the recurring timer).
     pub fn expire(&self) {
-        self.cache.borrow_mut().expire();
+        let now = self.clock.monotonic_ms();
+        self.cache.borrow_mut().expire(now);
     }
 
     /// Look up `ip` without extending its TTL.
     pub fn lookup(&self, ip: Ipv4Addr) -> Option<MacAddr> {
-        self.cache.borrow().lookup(ip)
+        let now = self.clock.monotonic_ms();
+        self.cache.borrow().lookup(ip, now)
     }
 
     /// Look up `ip` and extend its TTL on a hit.
     pub fn lookup_and_refresh(&self, ip: Ipv4Addr) -> Option<MacAddr> {
-        self.cache.borrow_mut().lookup_and_refresh(ip)
+        let now = self.clock.monotonic_ms();
+        self.cache.borrow_mut().lookup_and_refresh(ip, now)
     }
 
     /// Try to route `frame` to `dst_ip`:
@@ -212,7 +225,8 @@ impl ArpQueue {
     /// - **First for IP** → appends and returns [`PushResult::FirstForIp`];
     ///   the caller must send an ARP Request and add a drop timer.
     pub fn push_frame(&self, dst_ip: Ipv4Addr, mut frame: Vec<u8>) -> PushResult {
-        if let Some(mac) = self.cache.borrow_mut().lookup_and_refresh(dst_ip) {
+        let now = self.clock.monotonic_ms();
+        if let Some(mac) = self.cache.borrow_mut().lookup_and_refresh(dst_ip, now) {
             frame[0..6].copy_from_slice(mac.as_bytes());
             return PushResult::Sent(frame);
         }
@@ -292,7 +306,10 @@ pub fn send_request(
 /// [`ArpQueue::expire`] to purge stale entries, then re-adds itself.
 /// Stops rescheduling once [`ArpQueue::mark_dead`] has been called (i.e.
 /// after the owning interface is detached).
-pub(crate) fn schedule_expiry(arp: ArpQueue, timers: &mut Timers) {
+pub(crate) fn schedule_expiry(
+    arp: ArpQueue,
+    timers: &mut Timers,
+) {
     let interval_ms = arp.max_age_ms();
     timers.add(interval_ms, move |timers| {
         if !arp.alive.get() { return; }   // interface detached; stop

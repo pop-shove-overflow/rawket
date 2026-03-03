@@ -24,6 +24,7 @@ pub mod udp;
 
 pub use network::{Network, NetworkConfig, Uplink};
 pub use af_packet::AfPacketSocket;
+pub use timers::Clock;
 
 // ── no_std runtime ────────────────────────────────────────────────────────────
 //

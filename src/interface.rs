@@ -40,7 +40,8 @@ use crate::{
     },
     af_packet::{AfPacketSocket, FRAME_SIZE},
     tcp::{self, SeqNum, TcpFlags, TcpHdr, HDR_LEN as TCP_HDR_LEN, TcpSocket},
-    timers::{now_ms, Deadline, Timers},
+    timers::{Clock, Deadline, Timers},
+
     udp::{self, UdpSocket},
     Result,
 };
@@ -131,6 +132,8 @@ struct ReassemblyTable {
     /// fragment stream from a source already has this many open entries, the
     /// new fragment is dropped.  Default: 4.
     per_src_max: usize,
+    /// Time source; used by `insert` (deadline arming) and `purge`.
+    clock:       Clock,
 }
 
 // ── ICMP rate limiter ─────────────────────────────────────────────────────────
@@ -157,11 +160,11 @@ impl IcmpRateLimit {
     }
 
     /// Returns `true` if an ICMP Unreachable may be sent, consuming one token.
-    fn allow(&mut self) -> bool {
+    /// `now` is `clock.monotonic_ms()` from the owning `Interface`.
+    fn allow(&mut self, now: u64) -> bool {
         if self.rate_per_sec == 0 {
             return true; // unlimited
         }
-        let now = now_ms();
         let elapsed_ms = now.saturating_sub(self.last_refill);
         let add = ((elapsed_ms.saturating_mul(self.rate_per_sec as u64)) / 1000) as u32;
         if add > 0 {
@@ -177,20 +180,21 @@ impl IcmpRateLimit {
 }
 
 impl ReassemblyTable {
-    fn new(mem_limit: usize, timeout_ms: u64) -> Self {
+    fn new(mem_limit: usize, timeout_ms: u64, clock: Clock) -> Self {
         ReassemblyTable {
             entries:     Vec::new(),
             total_bytes: 0,
             mem_limit,
             timeout_ms,
             per_src_max: 4,
+            clock,
         }
     }
 
     /// Remove entries whose deadline has expired, reclaiming their memory.
     fn purge(&mut self) {
         let before = self.entries.len();
-        let now = now_ms();
+        let now = self.clock.monotonic_ms();
         self.entries.retain(|e| !e.deadline.is_expired(now));
         if self.entries.len() != before {
             self.total_bytes = self.entries.iter().map(|e| e.total_bytes).sum();
@@ -217,6 +221,7 @@ impl ReassemblyTable {
         let payload     = ip.payload(ip_buf);
         let frag_bytes  = payload.len();
         let more_frags  = (ip.flags_frag & FLAG_MF) != 0;
+        let now         = self.clock.monotonic_ms();
 
         // ── Locate or create a reassembly entry ──────────────────────────────
 
@@ -249,7 +254,7 @@ impl ReassemblyTable {
                 fragments:   vec![Fragment { offset: frag_offset, data: payload.to_vec() }],
                 total_bytes: frag_bytes,
                 total_len,
-                deadline:    Deadline::from_now(self.timeout_ms),
+                deadline:    Deadline::from_now(self.timeout_ms, now),
             };
 
             self.total_bytes += frag_bytes;
@@ -383,6 +388,8 @@ pub struct Interface {
     reasm:      Rc<RefCell<ReassemblyTable>>,
     /// Token-bucket rate limiter for outbound ICMP Unreachable messages.
     icmp_rl:    IcmpRateLimit,
+    /// Time source — injected by [`Uplink::attach`] via [`set_clock`].
+    clock:      Clock,
 }
 
 impl Interface {
@@ -397,6 +404,7 @@ impl Interface {
         let mut ifname_buf = [0u8; 16];
         let len = uplink.len().min(16);
         ifname_buf[..len].copy_from_slice(&uplink[..len]);
+        let clock = Clock::default();
         Ok(Interface {
             ifname_buf,
             mac,
@@ -405,11 +413,12 @@ impl Interface {
             ip: None,
             tx_id: 0,
             tx:      Rc::new(|_| Ok(())),
-            arp:     ArpQueue::new(DEFAULT_ARP_MAX_AGE_MS),
+            arp:     ArpQueue::new(DEFAULT_ARP_MAX_AGE_MS, clock.clone()),
             reasm:   Rc::new(RefCell::new(ReassemblyTable::new(
-                DEFAULT_FRAG_MEM_LIMIT, DEFAULT_FRAG_TIMEOUT_MS,
+                DEFAULT_FRAG_MEM_LIMIT, DEFAULT_FRAG_TIMEOUT_MS, clock.clone(),
             ))),
             icmp_rl: IcmpRateLimit::new(100),
+            clock,
         })
     }
 
@@ -419,6 +428,7 @@ impl Interface {
     /// that does not require kernel packet-socket registration (e.g. an
     /// in-process virtual wire used in tests).
     pub fn dummy(mac: MacAddr) -> Self {
+        let clock = Clock::default();
         Interface {
             ifname_buf:     [0u8; 16],
             mac,
@@ -427,14 +437,17 @@ impl Interface {
             ip:             None,
             tx_id:          0,
             tx:             Rc::new(|_| Ok(())),
-            arp:            ArpQueue::new(DEFAULT_ARP_MAX_AGE_MS),
+            arp:            ArpQueue::new(DEFAULT_ARP_MAX_AGE_MS, clock.clone()),
             reasm:          Rc::new(RefCell::new(ReassemblyTable::new(
-                DEFAULT_FRAG_MEM_LIMIT, DEFAULT_FRAG_TIMEOUT_MS,
+                DEFAULT_FRAG_MEM_LIMIT, DEFAULT_FRAG_TIMEOUT_MS, clock.clone(),
             ))),
             icmp_rl:        IcmpRateLimit::new(100),
+            clock,
         }
     }
+}
 
+impl Interface {
     /// Consume and drop the interface descriptor.
     pub fn remove(self) {
         drop(self);
@@ -486,6 +499,22 @@ impl Interface {
     pub(crate) fn tx(&self) -> crate::TxFn {
         Rc::clone(&self.tx)
     }
+
+    /// Inject the network-wide shared clock.
+    ///
+    /// Called by [`Uplink::attach`](crate::Uplink::attach) so that this
+    /// interface and all objects derived from it use the same time source.
+    /// Must be called before any sockets are created from this interface.
+    pub(crate) fn set_clock(&mut self, clock: Clock) {
+        self.clock = clock.clone();
+        self.arp.set_clock(clock.clone());
+        self.reasm.borrow_mut().clock = clock;
+    }
+
+    /// Return a reference to the clock driving this interface.
+    ///
+    /// Socket constructors clone it to propagate the time source.
+    pub(crate) fn clock(&self) -> &Clock { &self.clock }
 
     /// Return a reference to this interface's combined ARP cache + frame queue.
     ///
@@ -791,7 +820,8 @@ impl Interface {
         raw:  &[u8],
         code: u8,
     ) -> Result<()> {
-        if !self.icmp_rl.allow() {
+        let now = self.clock.monotonic_ms();
+        if !self.icmp_rl.allow(now) {
             return Ok(());
         }
         let cidr = self.ip.unwrap(); // guaranteed Some by callers
@@ -930,7 +960,10 @@ fn is_martian_src(src: Ipv4Addr, own_ip: Ipv4Addr) -> bool {
 /// Install a self-rescheduling 1-second timer that purges timed-out
 /// reassembly entries on `reasm`.  This ensures memory is reclaimed even
 /// when no new fragments arrive to trigger the on-insert purge.
-fn schedule_frag_purge_inner(reasm: Rc<RefCell<ReassemblyTable>>, timers: &mut Timers) {
+fn schedule_frag_purge_inner(
+    reasm: Rc<RefCell<ReassemblyTable>>,
+    timers: &mut Timers,
+) {
     timers.add(1_000, move |timers| {
         reasm.borrow_mut().purge();
         schedule_frag_purge_inner(reasm, timers);
