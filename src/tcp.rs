@@ -749,6 +749,26 @@ impl TcpSocket {
         total
     }
 
+    /// Build a D-SACK option per RFC 2883 §3.
+    /// First block is the duplicate range; up to 3 OOO blocks follow.
+    fn build_dsack_opts(&self, buf: &mut [u8; 40], left: SeqNum, right: SeqNum) -> usize {
+        let ooo_n   = self.rx_ooo.len().min(3);
+        let n       = 1 + ooo_n;
+        let opt_len = 2 + 8 * n;
+        let total   = 2 + opt_len;
+        buf[0] = 0x01; buf[1] = 0x01; // NOPs
+        buf[2] = 0x05; buf[3] = opt_len as u8;
+        buf[4..8].copy_from_slice(&left.as_u32().to_be_bytes());
+        buf[8..12].copy_from_slice(&right.as_u32().to_be_bytes());
+        for (i, ooo) in self.rx_ooo.iter().take(3).enumerate() {
+            let off = 12 + i * 8;
+            buf[off..off + 4].copy_from_slice(&ooo.seq.as_u32().to_be_bytes());
+            let r = ooo.seq + ooo.data.len() as u32;
+            buf[off + 4..off + 8].copy_from_slice(&r.as_u32().to_be_bytes());
+        }
+        total
+    }
+
     // ── Frame builder / sender ───────────────────────────────────────────────
 
     /// Send a TCP segment with explicit sequence number, flags, payload and options.
@@ -1511,8 +1531,24 @@ impl TcpSocket {
                 let is_keepalive = seg.seq == self.rcv_nxt - 1;
 
                 if !in_window && !is_keepalive {
-                    // Duplicate or out-of-window: send ACK and discard
-                    let _ = self.send_ctrl(TcpFlags::ACK);
+                    // Duplicate or out-of-window: send ACK and discard.
+                    // For duplicate data (seq < rcv_nxt, non-empty) send D-SACK (RFC 2883 §3).
+                    let payload_start = seg.hdr_len().min(tcp_buf.len());
+                    let pdu = &tcp_buf[payload_start..];
+                    if self.sack_ok && !pdu.is_empty() && seq_lt(seg.seq, self.rcv_nxt) {
+                        let dsack_left  = seg.seq;
+                        let dsack_right = if seq_lt(seg.seq + pdu.len() as u32, self.rcv_nxt) {
+                            seg.seq + pdu.len() as u32
+                        } else {
+                            self.rcv_nxt
+                        };
+                        let mut sack_buf = [0u8; 40];
+                        let sack_len = self.build_dsack_opts(&mut sack_buf, dsack_left, dsack_right);
+                        let snd = self.snd_nxt;
+                        let _ = self.send_segment(snd, TcpFlags::ACK, &[], &sack_buf[..sack_len]);
+                    } else {
+                        let _ = self.send_ctrl(TcpFlags::ACK);
+                    }
                     return Ok(());
                 }
 
