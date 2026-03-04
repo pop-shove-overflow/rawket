@@ -1585,6 +1585,12 @@ impl TcpSocket {
                     return Ok(());
                 }
 
+                // RFC 5961 §4: SYN in synchronized state → challenge ACK
+                if seg.has_flag(TcpFlags::SYN) {
+                    self.send_challenge_ack();
+                    return Ok(());
+                }
+
                 // Payload slice computed here so dupack can check pdu.is_empty().
                 let payload_start = seg.hdr_len().min(tcp_buf.len());
                 let pdu           = &tcp_buf[payload_start..];
