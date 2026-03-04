@@ -1412,8 +1412,8 @@ impl TcpSocket {
                     self.dst     = SocketAddrV4::new(ip.src, seg.src_port);
                     self.dst_mac = eth.src;
                     self.rcv_nxt  = seg.seq + 1;
-                    // Learn peer MSS
-                    if let Some(m) = opts.mss { self.peer_mss = m; }
+                    // Learn peer MSS; RFC 793 §3.1: assume 536 if absent
+                    self.peer_mss = opts.mss.unwrap_or(536);
                     self.sack_ok = opts.sack_permitted;
                     // Window scaling: only active if both sides include WS in SYN.
                     // We always send WS in our SYN-ACK; record the peer's shift.
@@ -1464,7 +1464,7 @@ impl TcpSocket {
             // ── SYN_SENT ────────────────────────────────────────────────────
             State::SynSent => {
                 if seg.has_flag(TcpFlags::SYN) && seg.has_flag(TcpFlags::ACK) {
-                    if let Some(m) = opts.mss { self.peer_mss = m; }
+                    self.peer_mss = opts.mss.unwrap_or(536);
                     self.sack_ok = opts.sack_permitted;
                     // Window scaling negotiated iff SYN-ACK includes WS option.
                     self.snd_scale = opts.ws_shift.unwrap_or(0);
@@ -1486,7 +1486,7 @@ impl TcpSocket {
                 } else if seg.has_flag(TcpFlags::SYN) {
                     // Simultaneous open (RFC 793 §3.4): bare SYN without ACK.
                     // Transition to SYN_RECEIVED and send SYN+ACK.
-                    if let Some(m) = opts.mss { self.peer_mss = m; }
+                    self.peer_mss = opts.mss.unwrap_or(536);
                     self.sack_ok = opts.sack_permitted;
                     self.snd_scale = opts.ws_shift.unwrap_or(0);
                     self.rcv_scale = if opts.ws_shift.is_some() { LOCAL_WS_SHIFT } else { 0 };
