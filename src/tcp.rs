@@ -607,6 +607,10 @@ pub struct TcpSocket {
     // Duplicate ACK counter (fast retransmit)
     dupack_count:    u8,
 
+    // Challenge ACK rate limit (RFC 5961 §5)
+    challenge_ack_count:    u8,
+    challenge_ack_epoch_ms: u64,
+
     // TCP Timestamps (RFC 7323)
     ts_enabled:      bool,   // both sides negotiated timestamps
     ts_recent:       u32,    // last TSval received from peer (echoed as TSecr)
@@ -686,6 +690,8 @@ impl TcpSocket {
             tlp_deadline:       Deadline::default(),
             rto_count:          0,
             dupack_count:       0,
+            challenge_ack_count:    0,
+            challenge_ack_epoch_ms: 0,
             rack_reo_wnd_ms:    0,
             ts_enabled:         false,
             ts_recent:          0,
@@ -851,6 +857,21 @@ impl TcpSocket {
             self.send_ctrl_opts(flags, &ts)
         } else {
             self.send_ctrl_opts(flags, &[])
+        }
+    }
+
+    /// Challenge ACK with per-second rate limit (RFC 5961 §5).
+    fn send_challenge_ack(&mut self) {
+        const CHALLENGE_ACK_LIMIT: u8 = 10;
+        const CHALLENGE_ACK_WINDOW_MS: u64 = 1000;
+        let now = self.clock.monotonic_ms();
+        if now.wrapping_sub(self.challenge_ack_epoch_ms) >= CHALLENGE_ACK_WINDOW_MS {
+            self.challenge_ack_count = 0;
+            self.challenge_ack_epoch_ms = now;
+        }
+        if self.challenge_ack_count < CHALLENGE_ACK_LIMIT {
+            let _ = self.send_ctrl(TcpFlags::ACK);
+            self.challenge_ack_count += 1;
         }
     }
 
@@ -1379,15 +1400,27 @@ impl TcpSocket {
                 State::Listen | State::Closed | State::TimeWait => return Ok(()),
                 _ => {}
             }
+            // SynSent has its own RST validation (ACK field, not seq window).
+            if self.state == State::SynSent {
+                self.state      = State::Closed;
+                self.last_error = Some(TcpError::Reset);
+                (self.on_error)(TcpError::Reset);
+                return Ok(());
+            }
             // Validate RST is within receive window (use actual advertised window).
             let rcv_wnd   = RECV_BUF_MAX.saturating_sub(self.recv_buf.len() as u32);
             let in_window = seq_ge(seg.seq, self.rcv_nxt)
                 && seq_lt(seg.seq, self.rcv_nxt + rcv_wnd);
-            if in_window || self.state == State::SynSent {
-                self.state      = State::Closed;
-                self.last_error = Some(TcpError::Reset);
-                let on_error    = self.on_error;
-                on_error(TcpError::Reset);
+            if in_window {
+                if seg.seq == self.rcv_nxt {
+                    // Exact match → genuine reset
+                    self.state      = State::Closed;
+                    self.last_error = Some(TcpError::Reset);
+                    (self.on_error)(TcpError::Reset);
+                } else {
+                    // RFC 5961 §3: in-window but not exact → challenge ACK
+                    self.send_challenge_ack();
+                }
                 return Ok(());
             }
             return Ok(());
