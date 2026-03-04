@@ -22,6 +22,9 @@ crate-type = ["staticlib", "rlib"]
 # the library can be used as a regular Rust dependency without any
 # no_std ceremony.  Intended for test harnesses and other Rust consumers.
 std = []
+# Expose internal TcpSocket fields via accessor methods.  Intended for
+# system-test-validator; never enabled in production builds.
+test-internals = []
 
 [dependencies]
 libc = { version = "0.2", default-features = false }

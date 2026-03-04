@@ -320,8 +320,8 @@ struct RxOooSegment {
 
 // ── BBRv3 ─────────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BbrPhase {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BbrPhase {
     Startup,
     Drain,
     ProbeBw,
@@ -2088,6 +2088,31 @@ impl TcpSocket {
         }
     }
 
+}
+
+// ── Test-internals accessors ────────────────────────────────────────────────
+
+#[cfg(feature = "test-internals")]
+impl TcpSocket {
+    pub fn bbr_cwnd(&self) -> u32 { self.bbr.cwnd }
+    pub fn bbr_inflight_lo(&self) -> u32 { self.bbr.inflight_lo }
+    pub fn bbr_inflight_hi(&self) -> u32 { self.bbr.inflight_hi }
+    pub fn bbr_phase(&self) -> BbrPhase { self.bbr.phase }
+    pub fn bbr_max_bw(&self) -> u64 { self.bbr.max_bw }
+    pub fn bbr_bw_lo(&self) -> u64 { self.bbr.bw_lo }
+    pub fn bbr_min_rtt_ms(&self) -> u64 { self.bbr.min_rtt_ms }
+    pub fn rack_reo_wnd_ms(&self) -> u64 { self.rack_reo_wnd_ms }
+    pub fn dupack_count(&self) -> u8 { self.dupack_count }
+    pub fn snd_wnd(&self) -> u32 { (self.snd_wnd_raw as u32) << self.snd_scale }
+    pub fn srtt_ms(&self) -> u64 { self.srtt_ms }
+    pub fn rto_ms(&self) -> u64 { self.rto_ms }
+    pub fn sack_ok(&self) -> bool { self.sack_ok }
+    pub fn ts_enabled(&self) -> bool { self.ts_enabled }
+    pub fn ecn_enabled(&self) -> bool { self.ecn_enabled }
+    pub fn peer_mss(&self) -> u16 { self.peer_mss }
+    pub fn snd_nxt(&self) -> u32 { self.snd_nxt.as_u32() }
+    pub fn snd_una(&self) -> u32 { self.snd_una.as_u32() }
+    pub fn rcv_nxt(&self) -> u32 { self.rcv_nxt.as_u32() }
 }
 
 // ── L4 dispatch ───────────────────────────────────────────────────────────────
