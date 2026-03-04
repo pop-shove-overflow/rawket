@@ -1376,7 +1376,7 @@ impl TcpSocket {
         // RST handling (all states that have an established peer)
         if seg.has_flag(TcpFlags::RST) {
             match self.state {
-                State::Listen | State::Closed => return Ok(()),
+                State::Listen | State::Closed | State::TimeWait => return Ok(()),
                 _ => {}
             }
             // Validate RST is within receive window (use actual advertised window).
