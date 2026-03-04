@@ -1299,7 +1299,9 @@ impl TcpSocket {
             // Both gates: cap chunk at the tighter of cwnd room and window room.
             let wnd_room   = (wnd_limit - self.snd_nxt) as usize;
             let available  = ((limit - bytes_in_flight) as usize).min(wnd_room);
-            let chunk_len  = (self.peer_mss as usize)
+            let ts_overhead = if self.ts_enabled { 12 } else { 0 };
+            let effective_mss = (self.peer_mss as usize).saturating_sub(ts_overhead);
+            let chunk_len  = effective_mss
                 .min(self.send_buf.len())
                 .min(available);
             if chunk_len == 0 { break; }
