@@ -585,6 +585,7 @@ pub struct TcpSocket {
     // Receive path
     recv_buf:    Vec<u8>,
     rx_ooo:      Vec<RxOooSegment>,
+    rx_ooo_last: Option<SeqNum>, // most recently received OOO seq (for SACK ordering)
 
     // RTT / RTO (RFC 6298)
     srtt_ms:     u64,   // 0 = no sample yet
@@ -681,6 +682,7 @@ impl TcpSocket {
             rcv_scale:       0,
             recv_buf:        Vec::new(),
             rx_ooo:          Vec::new(),
+            rx_ooo_last:     None,
             srtt_ms:         0,
             rttvar_ms:       0,
             rto_ms:          rto,
@@ -745,12 +747,26 @@ impl TcpSocket {
         buf[1] = 0x01; // NOP
         buf[2] = 0x05; // SACK kind
         buf[3] = opt_len as u8;
-        for (i, ooo) in self.rx_ooo.iter().take(4).enumerate() {
-            let left  = ooo.seq;
+        // RFC 2018 §4: most recently received block must be first.
+        let last_idx = self.rx_ooo_last
+            .and_then(|seq| self.rx_ooo.iter().position(|s| s.seq == seq));
+        let mut slot = 0;
+        if let Some(idx) = last_idx {
+            let ooo = &self.rx_ooo[idx];
+            let off = 4;
+            buf[off..off + 4].copy_from_slice(&ooo.seq.as_u32().to_be_bytes());
             let right = ooo.seq + ooo.data.len() as u32;
-            let off   = 4 + i * 8;
-            buf[off..off + 4].copy_from_slice(&left.as_u32().to_be_bytes());
             buf[off + 4..off + 8].copy_from_slice(&right.as_u32().to_be_bytes());
+            slot = 1;
+        }
+        for (i, ooo) in self.rx_ooo.iter().enumerate() {
+            if slot >= 4 { break; }
+            if Some(i) == last_idx { continue; }
+            let off = 4 + slot * 8;
+            buf[off..off + 4].copy_from_slice(&ooo.seq.as_u32().to_be_bytes());
+            let right = ooo.seq + ooo.data.len() as u32;
+            buf[off + 4..off + 8].copy_from_slice(&right.as_u32().to_be_bytes());
+            slot += 1;
         }
         total
     }
@@ -1706,6 +1722,7 @@ impl TcpSocket {
                         // Check for duplicate
                         let dup = self.rx_ooo.iter().any(|s| s.seq == seg.seq);
                         if !dup {
+                            self.rx_ooo_last = Some(seg.seq);
                             self.rx_ooo.push(RxOooSegment { seq: seg.seq, data: pdu.to_vec() });
                             // Sort by seq
                             self.rx_ooo.sort_by(|a, b| {
