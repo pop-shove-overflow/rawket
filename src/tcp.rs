@@ -1594,6 +1594,7 @@ impl TcpSocket {
 
                 // Process cumulative ACK; also update the peer's window.
                 if seg.has_flag(TcpFlags::ACK) {
+                    let prev_wnd = self.snd_wnd_raw;
                     self.snd_wnd_raw = seg.window;
                     if seq_gt(seg.ack, self.snd_una) {
                         self.dupack_count = 0;
@@ -1601,6 +1602,7 @@ impl TcpSocket {
                     } else if seg.ack == self.snd_una
                            && self.snd_una != self.snd_nxt
                            && pdu.is_empty()
+                           && seg.window == prev_wnd
                     {
                         self.dupack_count = self.dupack_count.saturating_add(1);
                         if self.dupack_count >= 3 {
