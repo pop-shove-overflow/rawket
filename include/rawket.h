@@ -15,6 +15,7 @@
 #ifndef RAWKET_H
 #define RAWKET_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -147,6 +148,23 @@ typedef struct {
      * this value.  Default: 8.
      */
     size_t   tcp_rx_ooo_max;
+
+    /* ── Checksum validation ─────────────────────────────────────────────── */
+
+    /**
+     * Validate IPv4 header checksum on received frames.
+     *
+     * When false the checksum is not verified — safe when the NIC or kernel
+     * has already checked it (the common AF_PACKET case).  Enable for
+     * software-only paths (e.g. virtual links in tests).  Default: false.
+     */
+    bool     checksum_validate_ip;
+
+    /** Validate TCP checksum on received segments.  Default: false. */
+    bool     checksum_validate_tcp;
+
+    /** Validate UDP checksum on received datagrams.  Default: false. */
+    bool     checksum_validate_udp;
 } RawketNetworkConfig;
 
 /**
