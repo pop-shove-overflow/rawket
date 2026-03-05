@@ -37,6 +37,7 @@ use crate::{
     ip::{
         IpProto, Ipv4Cidr, Ipv4Hdr, FLAG_MF,
         MIN_HDR_LEN as IP_HDR_LEN,
+        checksum_add, checksum_finish, pseudo_header_acc,
     },
     af_packet::{AfPacketSocket, FRAME_SIZE},
     tcp::{self, SeqNum, TcpFlags, TcpHdr, HDR_LEN as TCP_HDR_LEN, TcpSocket},
@@ -741,6 +742,14 @@ impl Interface {
             IpProto::UDP  => { udp::dispatch(self, raw, udp_sockets)?; }
             IpProto::TCP  => {
                 let tcp_buf = ip.payload(ip_buf);
+                if self.checksum_validate_tcp {
+                    let tcp_len = tcp_buf.len() as u16;
+                    let acc = pseudo_header_acc(&ip.src, &ip.dst, IpProto::TCP, tcp_len);
+                    let acc = checksum_add(acc, tcp_buf);
+                    if checksum_finish(acc) != 0 {
+                        return Ok(()); // bad checksum — silently drop
+                    }
+                }
                 if tcp_buf.len() >= 4 {
                     let dst_port = u16::from_be_bytes([tcp_buf[2], tcp_buf[3]]);
                     for s in standalone_tcp.iter_mut() {
