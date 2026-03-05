@@ -39,6 +39,19 @@ pub struct Ipv4Hdr {
 
 impl Ipv4Hdr {
     pub fn parse(buf: &[u8]) -> Result<Self> {
+        Self::parse_inner(buf, true)
+    }
+
+    /// Parse without verifying the header checksum.
+    ///
+    /// Use when the checksum has already been validated by the NIC or kernel
+    /// (the common AF_PACKET path), or when re-parsing a frame that was
+    /// already checked earlier in the pipeline.
+    pub fn parse_no_checksum(buf: &[u8]) -> Result<Self> {
+        Self::parse_inner(buf, false)
+    }
+
+    fn parse_inner(buf: &[u8], validate_checksum: bool) -> Result<Self> {
         if buf.len() < MIN_HDR_LEN {
             return Err(Error::InvalidData);
         }
@@ -55,11 +68,13 @@ impl Ipv4Hdr {
         if buf.len() < hdr_len {
             return Err(Error::InvalidData);
         }
-        // Verify header checksum: one's-complement sum over all header bytes
-        // (including the checksum field) must fold to 0xFFFF, which
-        // checksum_finish() maps to 0.
-        if checksum(&buf[..hdr_len]) != 0 {
-            return Err(Error::InvalidData);
+        if validate_checksum {
+            // Verify header checksum: one's-complement sum over all header bytes
+            // (including the checksum field) must fold to 0xFFFF, which
+            // checksum_finish() maps to 0.
+            if checksum(&buf[..hdr_len]) != 0 {
+                return Err(Error::InvalidData);
+            }
         }
         let total_len = u16::from_be_bytes([buf[2], buf[3]]);
         // total_len covers header + payload; it cannot be less than the header.

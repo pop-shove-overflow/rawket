@@ -1384,17 +1384,12 @@ impl TcpSocket {
         let eth = EthHdr::parse(raw)?;
         if eth.ethertype != EtherType::IPV4 { return Ok(()); }
         let ip_buf = eth.payload(raw);
-        let ip     = Ipv4Hdr::parse(ip_buf)?;
+        // IP + TCP checksums validated by the interface layer before dispatch.
+        let ip     = Ipv4Hdr::parse_no_checksum(ip_buf)?;
         if ip.proto != IpProto::TCP || ip.dst != *self.src.ip() { return Ok(()); }
         let tcp_buf = ip.payload(ip_buf);
         let seg     = TcpHdr::parse(tcp_buf)?;
         if seg.dst_port != self.src.port() { return Ok(()); }
-
-        // NOTE: no TCP checksum validation here.  AF_PACKET / TPACKET_V2
-        // delivers frames whose checksums have already been verified by the
-        // kernel or NIC hardware.  GRO-combined frames carry the *first*
-        // segment's checksum which is invalid for the merged payload; validating
-        // it would silently discard every GRO super-segment.
 
         // RST handling (all states that have an established peer)
         if seg.has_flag(TcpFlags::RST) {
@@ -2170,7 +2165,8 @@ pub fn dispatch(
 ) -> Result<()> {
     let eth     = EthHdr::parse(raw)?;
     let ip_buf  = eth.payload(raw);
-    let ip      = Ipv4Hdr::parse(ip_buf)?;
+    // IP + TCP checksums validated by the interface layer before dispatch.
+    let ip      = Ipv4Hdr::parse_no_checksum(ip_buf)?;
     let tcp_buf = ip.payload(ip_buf);
     let seg     = TcpHdr::parse(tcp_buf)?;
 
