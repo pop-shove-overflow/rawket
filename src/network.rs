@@ -110,6 +110,21 @@ pub struct NetworkConfig {
     /// beyond this limit are dropped; the sender must retransmit them.  At
     /// most 4 SACK blocks are emitted regardless of this value.  Default: 8.
     pub tcp_rx_ooo_max: usize,
+
+    // ── Checksum validation ─────────────────────────────────────────────────
+
+    /// Validate the IPv4 header checksum on received frames.  Default: false.
+    ///
+    /// When false, the checksum is not verified — safe when the NIC or kernel
+    /// has already checked it (the common AF_PACKET case).  Enable for
+    /// software-only paths (e.g. VirtualLink in tests).
+    pub checksum_validate_ip: bool,
+
+    /// Validate TCP checksums on received segments.  Default: false.
+    pub checksum_validate_tcp: bool,
+
+    /// Validate UDP checksums on received datagrams.  Default: false.
+    pub checksum_validate_udp: bool,
 }
 
 impl Default for NetworkConfig {
@@ -135,6 +150,9 @@ impl Default for NetworkConfig {
             tcp_keepalive_count:           9,
             tcp_send_buf_max:              1 << 20,
             tcp_rx_ooo_max:                8,
+            checksum_validate_ip:          false,
+            checksum_validate_tcp:         false,
+            checksum_validate_udp:         false,
         }
     }
 }
@@ -204,6 +222,9 @@ pub struct Uplink<L: EtherLink> {
     ip_frag_mem_limit:       usize,
     ip_frag_per_src_max:     usize,
     icmp_rate_limit_per_sec: u32,
+    checksum_validate_ip:    bool,
+    checksum_validate_tcp:   bool,
+    checksum_validate_udp:   bool,
     eth_callbacks:           Vec<EthEntry>,
     next_eth_id:             usize,
     clock:                   Clock,
@@ -236,6 +257,12 @@ impl<L: EtherLink> Uplink<L> {
         iface.schedule_frag_purge(timers);
         // Apply ICMP rate limit.
         iface.set_icmp_rate_limit(self.icmp_rate_limit_per_sec);
+        // Apply checksum validation settings.
+        iface.set_checksum_validation(
+            self.checksum_validate_ip,
+            self.checksum_validate_tcp,
+            self.checksum_validate_udp,
+        );
         self.interfaces.push(iface);
         Ok(())
     }
@@ -399,6 +426,9 @@ impl<L: EtherLink> Network<L> {
             ip_frag_mem_limit:       self.config.ip_frag_mem_limit,
             ip_frag_per_src_max:     self.config.ip_frag_per_src_max,
             icmp_rate_limit_per_sec: self.config.icmp_rate_limit_per_sec,
+            checksum_validate_ip:    self.config.checksum_validate_ip,
+            checksum_validate_tcp:   self.config.checksum_validate_tcp,
+            checksum_validate_udp:   self.config.checksum_validate_udp,
             eth_callbacks:           Vec::new(),
             next_eth_id:             0,
             clock:                   self.clock.clone(),

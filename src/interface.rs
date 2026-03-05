@@ -390,6 +390,12 @@ pub struct Interface {
     icmp_rl:    IcmpRateLimit,
     /// Time source — injected by [`Uplink::attach`] via [`set_clock`].
     clock:      Clock,
+    /// Validate IPv4 header checksum on RX.
+    pub(crate) checksum_validate_ip:  bool,
+    /// Validate TCP checksum on RX.
+    pub(crate) checksum_validate_tcp: bool,
+    /// Validate UDP checksum on RX.
+    pub(crate) checksum_validate_udp: bool,
 }
 
 impl Interface {
@@ -419,6 +425,9 @@ impl Interface {
             ))),
             icmp_rl: IcmpRateLimit::new(100),
             clock,
+            checksum_validate_ip:  false,
+            checksum_validate_tcp: false,
+            checksum_validate_udp: false,
         })
     }
 
@@ -443,6 +452,9 @@ impl Interface {
             ))),
             icmp_rl:        IcmpRateLimit::new(100),
             clock,
+            checksum_validate_ip:  false,
+            checksum_validate_tcp: false,
+            checksum_validate_udp: false,
         }
     }
 }
@@ -555,6 +567,13 @@ impl Interface {
     /// Set the ICMP Unreachable rate limit (tokens per second; 0 = unlimited).
     pub(crate) fn set_icmp_rate_limit(&mut self, rate_per_sec: u32) {
         self.icmp_rl = IcmpRateLimit::new(rate_per_sec);
+    }
+
+    /// Set per-protocol checksum validation flags.
+    pub(crate) fn set_checksum_validation(&mut self, ip: bool, tcp: bool, udp: bool) {
+        self.checksum_validate_ip  = ip;
+        self.checksum_validate_tcp = tcp;
+        self.checksum_validate_udp = udp;
     }
 
     /// Install a 1-second periodic timer that purges timed-out reassembly

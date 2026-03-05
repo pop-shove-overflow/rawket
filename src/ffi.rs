@@ -78,6 +78,13 @@ pub struct RawketNetworkConfig {
     /// Segments beyond this limit are dropped; at most 4 SACK blocks are
     /// emitted regardless of this value.  Default: 8.
     pub tcp_rx_ooo_max:                libc::size_t,
+    // ── Checksum validation ─────────────────────────────────────────────────
+    /// Validate IPv4 header checksum on received frames.  Default: false.
+    pub checksum_validate_ip:          bool,
+    /// Validate TCP checksum on received segments.  Default: false.
+    pub checksum_validate_tcp:         bool,
+    /// Validate UDP checksum on received datagrams.  Default: false.
+    pub checksum_validate_udp:         bool,
 }
 
 /// Return a `RawketNetworkConfig` initialised with the library defaults.
@@ -105,6 +112,9 @@ pub extern "C" fn rawket_network_config_default() -> RawketNetworkConfig {
         tcp_keepalive_count:           c.tcp_keepalive_count,
         tcp_send_buf_max:              c.tcp_send_buf_max,
         tcp_rx_ooo_max:                c.tcp_rx_ooo_max,
+        checksum_validate_ip:          c.checksum_validate_ip,
+        checksum_validate_tcp:         c.checksum_validate_tcp,
+        checksum_validate_udp:         c.checksum_validate_udp,
     }
 }
 
@@ -167,6 +177,9 @@ impl From<RawketNetworkConfig> for NetworkConfig {
             tcp_keepalive_count:           c.tcp_keepalive_count,
             tcp_send_buf_max:              c.tcp_send_buf_max,
             tcp_rx_ooo_max:                c.tcp_rx_ooo_max,
+            checksum_validate_ip:          c.checksum_validate_ip,
+            checksum_validate_tcp:         c.checksum_validate_tcp,
+            checksum_validate_udp:         c.checksum_validate_udp,
         }
     }
 }
