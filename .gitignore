@@ -1,2 +1,5 @@
 # Build output
 /target/
+
+# Beads issue tracking
+/.beads
