@@ -643,7 +643,11 @@ impl Interface {
             }
             EtherType::IPV4 => {
                 let ip_buf = eth.payload(raw);
-                let ip = match Ipv4Hdr::parse(ip_buf) {
+                let ip = match if self.checksum_validate_ip {
+                    Ipv4Hdr::parse(ip_buf)
+                } else {
+                    Ipv4Hdr::parse_no_checksum(ip_buf)
+                } {
                     Ok(h)  => h,
                     Err(_) => return Ok(()),
                 };
@@ -688,7 +692,8 @@ impl Interface {
     ) -> Result<()> {
         let eth    = EthHdr::parse(raw)?;
         let ip_buf = eth.payload(raw);
-        let ip     = Ipv4Hdr::parse(ip_buf)?;
+        // IP checksum was already validated in receive(); skip here.
+        let ip     = Ipv4Hdr::parse_no_checksum(ip_buf)?;
 
         // Drop packets with martian source addresses before any L4 dispatch.
         let own_ip = self.ip.map(|c| c.addr()).unwrap_or(Ipv4Addr::UNSPECIFIED);
@@ -712,7 +717,7 @@ impl Interface {
                         // Fragmentation Needed (RFC 1191 §4): update MSS on the
                         // matching TCP socket.
                         let embedded = &icmp_buf[ICMP_HDR_LEN..];
-                        if let Ok(orig_ip) = Ipv4Hdr::parse(embedded) {
+                        if let Ok(orig_ip) = Ipv4Hdr::parse_no_checksum(embedded) {
                             let orig_tcp_buf = orig_ip.payload(embedded);
                             if orig_ip.proto == IpProto::TCP && orig_tcp_buf.len() >= 4 {
                                 let orig_src_port =

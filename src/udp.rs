@@ -257,7 +257,8 @@ pub fn dispatch(
 ) -> Result<()> {
     let eth = EthHdr::parse(raw)?;
     let ip_buf = eth.payload(raw);
-    let ip = Ipv4Hdr::parse(ip_buf)?;
+    // IP checksum validated by the interface layer before dispatch.
+    let ip = Ipv4Hdr::parse_no_checksum(ip_buf)?;
     let udp_buf = ip.payload(ip_buf);
     let udp = UdpHdr::parse(udp_buf)?;
 
