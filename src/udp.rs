@@ -261,11 +261,15 @@ pub fn dispatch(
     let udp_buf = ip.payload(ip_buf);
     let udp = UdpHdr::parse(udp_buf)?;
 
-    // NOTE: no UDP checksum validation here.  Same rationale as TCP: the
-    // kernel / NIC hardware has already verified the checksum before the
-    // frame reaches our AF_PACKET TPACKET_V2 ring.  GRO/LRO-combined
-    // frames would fail a re-check because the header carries only the
-    // first segment's checksum.
+    // Checksum validation (off by default; enable for software-only paths).
+    // RFC 768: checksum field = 0 means "no checksum computed" — skip.
+    if iface.checksum_validate_udp && udp.checksum != 0 {
+        let acc = pseudo_header_acc(&ip.src, &ip.dst, IpProto::UDP, udp.length);
+        let acc = checksum_add(acc, udp_buf);
+        if checksum_finish(acc) != 0 {
+            return Ok(()); // bad checksum — silently drop
+        }
+    }
 
     for s in sockets.iter_mut() {
         if s.src_port() == udp.dst_port {
