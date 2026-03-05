@@ -620,6 +620,7 @@ pub struct TcpSocket {
     ecn_enabled:    bool,   // both sides negotiated ECN at SYN time
     ecn_ce_pending: bool,   // received CE-marked IP; echo ECE in next ACK
     ecn_cwr_needed: bool,   // received ECE in ACK; send CWR on next data seg
+    fin_pending:    bool,   // close() called with data in send_buf; piggyback FIN
 
     // Keep-alive
     last_recv_ms:       u64,   // last time we received data or ACK progress
@@ -700,6 +701,7 @@ impl TcpSocket {
             ecn_enabled:        false,
             ecn_ce_pending:     false,
             ecn_cwr_needed:     false,
+            fin_pending:        false,
             last_recv_ms:       0,
             keepalive_deadline: Deadline::default(),
             keepalive_probes:   0,
@@ -1283,7 +1285,7 @@ impl TcpSocket {
     fn flush_send_buf(&mut self) {
         let now = self.clock.monotonic_ms();
         loop {
-            if self.state != State::Established { break; }
+            if self.state != State::Established && self.state != State::CloseWait { break; }
             if self.send_buf.is_empty()         { break; }
 
             // Pacing gate
@@ -1326,12 +1328,17 @@ impl TcpSocket {
             let chunk: Vec<u8> = self.send_buf.drain(..chunk_len).collect();
             let seg_seq        = self.snd_nxt;
 
+            // Piggyback FIN on the last data segment if close() is pending.
+            let mut flags = TcpFlags::PSH | TcpFlags::ACK;
+            let piggybacked_fin = self.fin_pending && self.send_buf.is_empty();
+            if piggybacked_fin { flags |= TcpFlags::FIN; }
+
             // Send (include Timestamps option when negotiated)
             let ts_arr;
             let ts_slice: &[u8] = if self.ts_enabled {
                 ts_arr = self.ts_opt(); &ts_arr
             } else { &[] };
-            if self.send_segment(seg_seq, TcpFlags::PSH | TcpFlags::ACK, &chunk, ts_slice).is_err() {
+            if self.send_segment(seg_seq, flags, &chunk, ts_slice).is_err() {
                 // On TX error, put bytes back and give up.
                 let mut tmp = chunk;
                 tmp.append(&mut self.send_buf);
@@ -1339,12 +1346,15 @@ impl TcpSocket {
                 break;
             }
 
+            // FIN occupies one sequence byte.
+            let fin_extra = if piggybacked_fin { 1u32 } else { 0 };
+
             // Record in retransmit buffer
-            let seg_end = seg_seq + chunk.len() as u32;
+            let seg_end = seg_seq + chunk.len() as u32 + fin_extra;
             self.unacked.push(TxSegment {
                 seq:              seg_seq,
                 end_seq:          seg_end,
-                flags:            TcpFlags::PSH | TcpFlags::ACK,
+                flags,
                 data:             chunk,
                 first_sent_ms:    now,
                 last_sent_ms:     now,
@@ -1353,6 +1363,14 @@ impl TcpSocket {
                 dtime_at_send:    self.bbr.delivered_ms,
             });
             self.snd_nxt = seg_end;
+
+            if piggybacked_fin {
+                self.fin_pending = false;
+                self.state = match self.state {
+                    State::CloseWait => State::LastAck,
+                    _                => State::FinWait1,
+                };
+            }
 
             // Pacing
             let interval = self.pacing_interval_ms();
@@ -2105,18 +2123,31 @@ impl TcpSocket {
     pub fn close(&mut self) -> Result<()> {
         match self.state {
             State::Established => {
-                let fin_seq = self.snd_nxt;
-                self.send_ctrl(TcpFlags::FIN | TcpFlags::ACK)?;
-                self.snd_nxt += 1;
-                self.record_fin(fin_seq);
-                self.state = State::FinWait1;
+                if self.send_buf.is_empty() {
+                    let fin_seq = self.snd_nxt;
+                    self.send_ctrl(TcpFlags::FIN | TcpFlags::ACK)?;
+                    self.snd_nxt += 1;
+                    self.record_fin(fin_seq);
+                    self.state = State::FinWait1;
+                } else {
+                    // Piggyback FIN on the last data segment.
+                    self.fin_pending = true;
+                    self.flush_send_buf();
+                    // If flush didn't drain (pacing/cwnd gate), FIN will be
+                    // piggybacked on a future flush_send_buf call.
+                }
             }
             State::CloseWait => {
-                let fin_seq = self.snd_nxt;
-                self.send_ctrl(TcpFlags::FIN | TcpFlags::ACK)?;
-                self.snd_nxt += 1;
-                self.record_fin(fin_seq);
-                self.state = State::LastAck;
+                if self.send_buf.is_empty() {
+                    let fin_seq = self.snd_nxt;
+                    self.send_ctrl(TcpFlags::FIN | TcpFlags::ACK)?;
+                    self.snd_nxt += 1;
+                    self.record_fin(fin_seq);
+                    self.state = State::LastAck;
+                } else {
+                    self.fin_pending = true;
+                    self.flush_send_buf();
+                }
             }
             _ => {}
         }
