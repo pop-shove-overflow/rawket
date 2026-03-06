@@ -2200,10 +2200,20 @@ impl TcpSocket {
     pub fn bbr_max_bw(&self) -> u64 { self.bbr.max_bw }
     pub fn bbr_bw_lo(&self) -> u64 { self.bbr.bw_lo }
     pub fn bbr_min_rtt_ms(&self) -> u64 { self.bbr.min_rtt_ms }
+    pub fn bbr_pacing_rate_bps(&self) -> u64 { self.pacing_rate_bps() }
+    pub fn bbr_probe_bw_in_up(&self) -> bool { self.bbr.probe_bw_in_up }
+    pub fn bbr_round_count(&self) -> u64 { self.bbr.round_count }
+    pub fn bbr_filled_pipe(&self) -> bool { self.bbr.filled_pipe }
+    pub fn bbr_loss_bytes_round(&self) -> u64 { self.bbr.loss_bytes_round }
+    pub fn bbr_acked_bytes_round(&self) -> u64 { self.bbr.acked_bytes_round }
+    pub fn bbr_prior_cwnd(&self) -> u32 { self.bbr.prior_cwnd }
     pub fn rack_reo_wnd_ms(&self) -> u64 { self.rack_reo_wnd_ms }
+    pub fn rack_end_seq(&self) -> u32 { self.rack_end_seq.0 }
+    pub fn rack_xmit_ms(&self) -> u64 { self.rack_xmit_ms }
     pub fn dupack_count(&self) -> u8 { self.dupack_count }
     pub fn snd_wnd(&self) -> u32 { (self.snd_wnd_raw as u32) << self.snd_scale }
     pub fn srtt_ms(&self) -> u64 { self.srtt_ms }
+    pub fn rttvar_ms(&self) -> u64 { self.rttvar_ms }
     pub fn rto_ms(&self) -> u64 { self.rto_ms }
     pub fn sack_ok(&self) -> bool { self.sack_ok }
     pub fn ts_enabled(&self) -> bool { self.ts_enabled }
