@@ -996,6 +996,18 @@ impl TcpSocket {
 
         // Phase transitions
         self.bbr_phase_update(now);
+
+        // If the stale pacing deadline is farther in the future than one new
+        // pacing interval, disarm it.  The next flush_send_buf call will send
+        // a segment immediately and then re-arm with the correct interval.
+        // This matches real BBR semantics: when a better BW sample arrives the
+        // sender is immediately eligible to send at the new rate.
+        if let Some(remaining) = self.pacing_next.remaining_ms(now) {
+            let new_interval = self.pacing_interval_ms();
+            if remaining > new_interval {
+                self.pacing_next.disarm();
+            }
+        }
     }
 
     fn bbr_phase_update(&mut self, now: u64) {
@@ -1213,22 +1225,6 @@ impl TcpSocket {
         self.bbr_on_ack(acked, rtt_sample, now);
 
         // 6. RACK loss detection
-        // Detect D-SACK (RFC 2883): first SACK block covers data below snd_una
-        // → a previously retransmitted segment was re-delivered → spurious
-        // retransmit due to reordering → widen the adaptive reorder window.
-        if opts.sack_count > 0 {
-            if let Some((left, _)) = opts.sack_blocks[0] {
-                if seq_lt(SeqNum::new(left), self.snd_una) {
-                    let inc = (self.srtt_ms / 4).max(1);
-                    self.rack_reo_wnd_ms =
-                        (self.rack_reo_wnd_ms + inc).min(self.srtt_ms);
-                }
-            }
-        }
-        // Decay rack_reo_wnd_ms on each ACK round (×7/8 per round).
-        self.rack_reo_wnd_ms =
-            self.rack_reo_wnd_ms.saturating_sub(self.rack_reo_wnd_ms / 8 + 1);
-
         let rack_rtt       = self.srtt_ms.max(1);
         let reorder_window = (rack_rtt / 4).max(1) + self.rack_reo_wnd_ms;
         // Collect segments to retransmit to avoid borrow conflict
@@ -1655,6 +1651,23 @@ impl TcpSocket {
                             }
                         }
                     }
+                    // D-SACK detection (RFC 2883): first SACK block < snd_una means a
+                    // retransmitted segment arrived at the peer as a duplicate → spurious
+                    // retransmit due to reordering → widen adaptive reorder window.
+                    // Runs for ALL ACKs (advancing, dup, and already-fully-acked), so that
+                    // a D-SACK arriving after its companion cumulative ACK is not missed.
+                    if opts.sack_count > 0 {
+                        if let Some((left, _)) = opts.sack_blocks[0] {
+                            if seq_lt(SeqNum::new(left), self.snd_una) {
+                                let inc = (self.srtt_ms / 4).max(1);
+                                self.rack_reo_wnd_ms =
+                                    (self.rack_reo_wnd_ms + inc).min(self.srtt_ms);
+                            }
+                        }
+                    }
+                    // Decay rack_reo_wnd_ms on each ACK round (×7/8 per round).
+                    self.rack_reo_wnd_ms =
+                        self.rack_reo_wnd_ms.saturating_sub(self.rack_reo_wnd_ms / 8 + 1);
                 }
 
                 // ECN: detect CE-marked packets (dscp_ecn low bits == 0b11).
