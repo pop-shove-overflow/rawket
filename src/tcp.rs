@@ -2300,6 +2300,8 @@ impl TcpSocket {
             }
             self.rto_ms = (self.rto_ms * 2).min(self.cfg.rto_max_ms);
             self.rto_deadline.arm_from_now(self.rto_ms, now);
+            // RFC 8985 §7.2: cancel TLP when RTO fires.
+            self.tlp_deadline.disarm();
         }
 
         // ── Keep-Alive ──
