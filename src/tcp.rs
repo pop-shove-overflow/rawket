@@ -378,6 +378,8 @@ struct BbrState {
     // Per-round loss tracking (for Startup exit only)
     loss_bytes_round:     u64,
     acked_bytes_round:    u64,
+    loss_events_in_round: u32,           // discontiguous lost ranges this round (spec §5.3.1.3)
+    last_loss_end_seq:    u32,           // end_seq of previous lost segment (for range merging)
 }
 
 impl BbrState {
@@ -411,6 +413,8 @@ impl BbrState {
             last_probe_rtt_ms:    0,
             loss_bytes_round:     0,
             acked_bytes_round:    0,
+            loss_events_in_round: 0,
+            last_loss_end_seq:    0,
         }
     }
 }
@@ -944,7 +948,7 @@ impl TcpSocket {
     /// Returns (pacing_gain_x100, cwnd_gain_x100) per spec §5.6.1 gains table.
     fn bbr_gains(&self) -> (ScaledFloat, ScaledFloat) {
         match self.bbr.phase {
-            BbrPhase::Startup      => (ScaledFloat::new(288), ScaledFloat::new(200)),
+            BbrPhase::Startup      => (ScaledFloat::new(277), ScaledFloat::new(200)),
             BbrPhase::Drain        => (ScaledFloat::new(35),  ScaledFloat::new(200)),
             BbrPhase::ProbeBwDown  => (ScaledFloat::new(90),  ScaledFloat::new(200)),
             BbrPhase::ProbeBwCruise=> (ScaledFloat::new(100), ScaledFloat::new(200)),
@@ -1011,8 +1015,10 @@ impl TcpSocket {
             let bytes_in_flight           = (self.snd_nxt - self.snd_una) as u64;
             self.bbr.next_round_delivered = self.bbr.delivered + bytes_in_flight.max(1);
             // Reset per-round Startup loss tracking at new round
-            self.bbr.loss_bytes_round  = 0;
-            self.bbr.acked_bytes_round = 0;
+            self.bbr.loss_bytes_round     = 0;
+            self.bbr.acked_bytes_round    = 0;
+            self.bbr.loss_events_in_round = 0;
+            self.bbr.last_loss_end_seq    = 0;
         }
 
         // ── BBRUpdateMaxBw — windowed max BW ────────────────────────────
@@ -1161,11 +1167,17 @@ impl TcpSocket {
                             self.bbr.filled_pipe = true;
                         }
                     }
-                    // Loss-based exit (>2% loss rate in a round)
-                    if self.bbr.acked_bytes_round > 0 {
+                    // Loss-based exit (spec §5.3.1.3): all three must hold:
+                    // 1. loss_in_round (at least one full round in recovery)
+                    // 2. loss rate > 2% (BBR.LossThresh)
+                    // 3. ≥ 6 discontiguous lost sequence ranges (BBRStartupFullLossCnt)
+                    if self.bbr.loss_in_round && self.bbr.acked_bytes_round > 0 {
                         let loss_rate = self.bbr.loss_bytes_round * 100 / self.bbr.acked_bytes_round;
-                        if loss_rate > 2 {
+                        if loss_rate > 2 && self.bbr.loss_events_in_round >= 6 {
                             self.bbr.filled_pipe = true;
+                            // Set inflight_longterm per spec: max(bdp, inflight_latest)
+                            let bdp = self.bbr_bdp() as u32;
+                            self.bbr.inflight_longterm = bdp.max(self.bbr.inflight_latest as u32);
                         }
                     }
                 }
@@ -1269,9 +1281,16 @@ impl TcpSocket {
     }
 
     /// Record loss — sets boolean loss_in_round flag (spec §5.5).
-    fn bbr_on_loss(&mut self, lost_bytes: u64) {
+    /// `seq`/`end_seq` are used to count discontiguous lost ranges (spec §5.3.1.3).
+    fn bbr_on_loss(&mut self, lost_bytes: u64, seq: SeqNum, end_seq: SeqNum) {
         self.bbr.loss_bytes_round += lost_bytes;
         self.bbr.loss_in_round = true;
+        // Count discontiguous lost sequence ranges: if this segment is not
+        // contiguous with the previous lost segment, it starts a new range.
+        if self.bbr.loss_events_in_round == 0 || seq.0 != self.bbr.last_loss_end_seq {
+            self.bbr.loss_events_in_round += 1;
+        }
+        self.bbr.last_loss_end_seq = end_seq.0;
     }
 
     // ── Core ACK processing ──────────────────────────────────────────────────
@@ -1406,7 +1425,9 @@ impl TcpSocket {
                     s.last_sent_ms = now;
                 }
             }
-            self.bbr_on_loss(data.len() as u64 + if !(flags & (TcpFlags::SYN | TcpFlags::FIN)).is_empty() { 1 } else { 0 });
+            let syn_fin_bytes = if !(flags & (TcpFlags::SYN | TcpFlags::FIN)).is_empty() { 1 } else { 0 };
+            let end_seq = seq + data.len() as u32 + syn_fin_bytes;
+            self.bbr_on_loss(data.len() as u64 + syn_fin_bytes as u64, seq, end_seq);
             let opts_arr;
             let ts_arr;
             let opts_slice: &[u8] = if flags.has(TcpFlags::SYN) {
@@ -1849,7 +1870,7 @@ impl TcpSocket {
                 }
                 // ECN: react to ECE on incoming ACKs — reduce cwnd as if loss.
                 if self.ecn_enabled && seg.has_flag(TcpFlags::ECE) && !seg.has_flag(TcpFlags::SYN) {
-                    self.bbr_on_loss(self.cfg.mss as u64);
+                    self.bbr_on_loss(self.cfg.mss as u64, SeqNum::new(0), SeqNum::new(0));
                     self.ecn_cwr_needed = true;
                 }
                 // ECN: CWR from sender acknowledges our ECE (RFC 3168 §6.1.3).
@@ -2226,7 +2247,8 @@ impl TcpSocket {
                     &[]
                 };
                 let _ = self.send_segment(seq, flags, &data, opts_slice);
-                self.bbr_on_loss(data.len() as u64);
+                let end_seq = seq + data.len() as u32;
+                self.bbr_on_loss(data.len() as u64, seq, end_seq);
             }
             self.rto_count += 1;
             if self.rto_count >= self.cfg.max_retransmits {
@@ -2398,6 +2420,7 @@ impl TcpSocket {
     pub fn bbr_filled_pipe(&self) -> bool { self.bbr.filled_pipe }
     pub fn bbr_loss_in_round(&self) -> bool { self.bbr.loss_in_round }
     pub fn bbr_loss_bytes_round(&self) -> u64 { self.bbr.loss_bytes_round }
+    pub fn bbr_loss_events_in_round(&self) -> u32 { self.bbr.loss_events_in_round }
     pub fn bbr_acked_bytes_round(&self) -> u64 { self.bbr.acked_bytes_round }
     pub fn bbr_prior_cwnd(&self) -> u32 { self.bbr.prior_cwnd }
     pub fn rack_reo_wnd_ms(&self) -> u64 { self.rack_reo_wnd_ms }
