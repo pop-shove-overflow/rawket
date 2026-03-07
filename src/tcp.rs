@@ -980,6 +980,8 @@ impl TcpSocket {
 
         // Round counting: advance round when we've ACKed past next_round_delivered.
         if self.bbr.delivered >= self.bbr.next_round_delivered {
+            // Check per-round loss rate before resetting counters (RFC 9438 §4.5).
+            self.bbr_check_loss_round();
             self.bbr.round_count          += 1;
             let bytes_in_flight           = (self.snd_nxt - self.snd_una) as u64;
             self.bbr.next_round_delivered = self.bbr.delivered + bytes_in_flight.max(1);
@@ -1139,10 +1141,14 @@ impl TcpSocket {
 
     fn bbr_on_loss(&mut self, lost_bytes: u64) {
         self.bbr.loss_bytes_round += lost_bytes;
-        // Loss signal: reduce bw_lo and inflight_lo
+    }
+
+    /// Check per-round loss rate and reduce bw_lo/inflight_lo if > 2%.
+    /// Called at round boundaries before resetting counters (RFC 9438 §4.5).
+    fn bbr_check_loss_round(&mut self) {
         if self.bbr.acked_bytes_round > 0 {
             let loss_rate = self.bbr.loss_bytes_round * 100
-                / self.bbr.acked_bytes_round.max(1);
+                / self.bbr.acked_bytes_round;
             if loss_rate > 2 {
                 if self.bbr.max_bw > 0 {
                     let new_lo = self.bbr.max_bw / 2;
@@ -1150,9 +1156,6 @@ impl TcpSocket {
                 }
                 let new_inf = self.bbr.cwnd / 2;
                 if new_inf < self.bbr.inflight_lo { self.bbr.inflight_lo = new_inf; }
-                // Also reduce cwnd so it tracks inflight_lo strictly; prevents
-                // cwnd from sitting above inflight_lo and growing again before
-                // the bounds are cleared (BBRv3 §4.5).
                 let floor = (4 * self.cfg.mss as u32).max(self.bbr.inflight_lo);
                 if self.bbr.cwnd > floor { self.bbr.cwnd = floor; }
             }
