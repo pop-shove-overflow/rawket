@@ -1894,8 +1894,9 @@ impl TcpSocket {
                             if seq_lt(SeqNum::new(left), self.snd_una) {
                                 let min_rtt = if self.bbr.min_rtt_ms < u64::MAX { self.bbr.min_rtt_ms } else { self.srtt_ms };
                                 let inc = (min_rtt / 4).max(1);
+                                // RFC 8985 §6.2: upper-bound is SRTT, not min_RTT.
                                 self.rack_reo_wnd_ms =
-                                    (self.rack_reo_wnd_ms + inc).min(min_rtt);
+                                    (self.rack_reo_wnd_ms + inc).min(self.srtt_ms);
                             }
                         }
                     }
