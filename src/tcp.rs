@@ -908,7 +908,7 @@ impl TcpSocket {
             BbrPhase::Drain    => (ScaledFloat::new(35),  ScaledFloat::new(200)),
             BbrPhase::ProbeBw  => {
                 if self.bbr.probe_bw_in_up {
-                    (ScaledFloat::new(125), ScaledFloat::new(225))
+                    (ScaledFloat::new(125), ScaledFloat::new(200))
                 } else {
                     (ScaledFloat::new(75),  ScaledFloat::new(200))
                 }
