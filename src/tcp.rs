@@ -1889,9 +1889,10 @@ impl TcpSocket {
                     if opts.sack_count > 0 {
                         if let Some((left, _)) = opts.sack_blocks[0] {
                             if seq_lt(SeqNum::new(left), self.snd_una) {
-                                let inc = (self.srtt_ms / 4).max(1);
+                                let min_rtt = if self.bbr.min_rtt_ms < u64::MAX { self.bbr.min_rtt_ms } else { self.srtt_ms };
+                                let inc = (min_rtt / 4).max(1);
                                 self.rack_reo_wnd_ms =
-                                    (self.rack_reo_wnd_ms + inc).min(self.srtt_ms);
+                                    (self.rack_reo_wnd_ms + inc).min(min_rtt);
                             }
                         }
                     }
