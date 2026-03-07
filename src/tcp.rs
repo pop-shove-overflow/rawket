@@ -1212,7 +1212,8 @@ impl TcpSocket {
                 self.rttvar_ms = self.rttvar_ms - self.rttvar_ms / 4 + diff / 4;
                 self.srtt_ms   = self.srtt_ms   - self.srtt_ms   / 8 + rtt / 8;
             }
-            self.rto_ms = (self.srtt_ms + 4 * self.rttvar_ms)
+            // RFC 6298 §2: RTO = SRTT + max(G, 4*RTTVAR) where G=1ms clock granularity.
+            self.rto_ms = (self.srtt_ms + (4 * self.rttvar_ms).max(1))
                 .max(self.cfg.rto_min_ms)
                 .min(self.cfg.rto_max_ms);
         }
