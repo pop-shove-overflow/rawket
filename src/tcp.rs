@@ -618,6 +618,9 @@ pub struct TcpSocket {
     ts_enabled:      bool,   // both sides negotiated timestamps
     ts_recent:       u32,    // last TSval received from peer (echoed as TSecr)
 
+    // Window scaling (RFC 7323)
+    peer_offered_ws: bool,  // peer included WS option in SYN (for SYN-ACK emission)
+
     // ECN (RFC 3168)
     ecn_enabled:    bool,   // both sides negotiated ECN at SYN time
     ecn_ce_pending: bool,   // received CE-marked IP; echo ECE in next ACK
@@ -702,6 +705,7 @@ impl TcpSocket {
             rack_reo_wnd_ms:    0,
             ts_enabled:         false,
             ts_recent:          0,
+            peer_offered_ws:    true,   // default true for client SYN; set from SYN in Listen
             ecn_enabled:        false,
             ecn_ce_pending:     false,
             ecn_cwr_needed:     false,
@@ -723,9 +727,15 @@ impl TcpSocket {
     fn syn_opts(&self) -> [u8; 24] {
         let mss = self.cfg.mss;
         let [t0, t1, t2, t3] = (self.clock.monotonic_ms() as u32).to_be_bytes();
+        // RFC 7323 §2.2: omit WS in SYN-ACK when peer omitted it in SYN.
+        let (ws_kind, ws_len, ws_val, ws_pad) = if self.peer_offered_ws {
+            (0x03u8, 0x03u8, LOCAL_WS_SHIFT, 0x01u8)    // WS (3) + NOP pad (1)
+        } else {
+            (0x01u8, 0x01u8, 0x01u8, 0x01u8)            // 4 NOPs (no WS)
+        };
         [
             0x02, 0x04, (mss >> 8) as u8, mss as u8,   // MSS (4)
-            0x03, 0x03, LOCAL_WS_SHIFT, 0x01,            // WS (3) + NOP pad (1)
+            ws_kind, ws_len, ws_val, ws_pad,             // WS (3)+NOP or 4 NOPs
             0x04, 0x02, 0x01, 0x01,                      // SACK-Permitted (2) + 2 NOPs
             0x01, 0x01, 0x08, 0x0a,                      // NOP NOP kind=8 len=10
             t0, t1, t2, t3,                              // TSval = now
@@ -1523,8 +1533,8 @@ impl TcpSocket {
                     self.peer_mss = opts.mss.unwrap_or(536);
                     self.sack_ok = opts.sack_permitted;
                     // Window scaling: only active if both sides include WS in SYN.
-                    // We always send WS in our SYN-ACK; record the peer's shift.
-                    // If the peer omitted WS we must advertise an unscaled window.
+                    // RFC 7323 §2.2: omit WS in SYN-ACK when peer omitted it.
+                    self.peer_offered_ws = opts.ws_shift.is_some();
                     self.snd_scale = opts.ws_shift.unwrap_or(0);
                     self.rcv_scale = if opts.ws_shift.is_some() { LOCAL_WS_SHIFT } else { 0 };
                     self.snd_wnd_raw = seg.window;
