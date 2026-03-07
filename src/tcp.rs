@@ -1403,13 +1403,12 @@ impl TcpSocket {
             let interval = self.pacing_interval_ms();
             if interval > 0 { self.pacing_next.arm_from_now(interval, now); } else { self.pacing_next.disarm(); }
 
-            // Arm TLP
-            if !self.tlp_deadline.is_armed() {
-                if self.srtt_ms > 0 {
-                    self.tlp_deadline.arm_from_now(self.tlp_deadline_ms(), now);
-                } else {
-                    self.tlp_deadline.arm_from_now(10, now); // fallback 10 ms
-                }
+            // Arm/re-arm TLP (RFC 8985 §7.4): deadline depends on
+            // FlightSize, so re-compute each time a new segment is sent.
+            if self.srtt_ms > 0 {
+                self.tlp_deadline.arm_from_now(self.tlp_deadline_ms(), now);
+            } else if !self.tlp_deadline.is_armed() {
+                self.tlp_deadline.arm_from_now(10, now); // fallback 10 ms
             }
 
             // Arm RTO
