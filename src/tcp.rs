@@ -2073,10 +2073,10 @@ impl TcpSocket {
         if self.persist_deadline.is_expired(now)
             && self.state == State::Established
         {
-            // Send a 1-byte window probe (data from the front of send_buf).
+            // Send a 1-byte window probe (RFC 9293 §3.8.6.1: seq = SND.NXT - 1).
             if !self.send_buf.is_empty() {
                 let probe_byte = self.send_buf[0];
-                let seq = self.snd_nxt;
+                let seq = self.snd_nxt - 1;
                 let ts_arr;
                 let ts_slice: &[u8] = if self.ts_enabled {
                     ts_arr = self.ts_opt(); &ts_arr
