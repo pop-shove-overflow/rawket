@@ -700,7 +700,7 @@ impl TcpSocket {
             on_error,
             send_buf:        Vec::new(),
             unacked:         Vec::new(),
-            sack_ok:         false,
+            sack_ok:         true,    // default true for client SYN; set from SYN in Listen/SynSent
             peer_mss:        cfg.mss,
             snd_scale:       0,
             snd_wnd_raw:     0,
@@ -758,7 +758,10 @@ impl TcpSocket {
         [
             0x02, 0x04, (mss >> 8) as u8, mss as u8,   // MSS (4)
             ws_kind, ws_len, ws_val, ws_pad,             // WS (3)+NOP or 4 NOPs
-            0x04, 0x02, 0x01, 0x01,                      // SACK-Permitted (2) + 2 NOPs
+            // RFC 2018 §2: only include SACK-Permitted if peer offered it (or initial SYN).
+            if self.sack_ok { 0x04 } else { 0x01 },
+            if self.sack_ok { 0x02 } else { 0x01 },
+            0x01, 0x01,                                   // 2 NOPs (pad)
             0x01, 0x01, 0x08, 0x0a,                      // NOP NOP kind=8 len=10
             t0, t1, t2, t3,                              // TSval = now
             e0, e1, e2, e3,                              // TSecr
