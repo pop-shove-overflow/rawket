@@ -797,6 +797,19 @@ impl TcpSocket {
         total
     }
 
+    /// TLP deadline: RFC 8985 §7.4.
+    /// FlightSize > 1 → max(2*SRTT, 1.5*SRTT + WCDelAckT).
+    /// FlightSize == 1 → 2*SRTT.
+    fn tlp_deadline_ms(&self) -> u64 {
+        const WC_DEL_ACK_T: u64 = 25; // ms, per RFC 8985 §7.4.1
+        let two_srtt = 2 * self.srtt_ms;
+        if self.unacked.len() > 1 {
+            two_srtt.max(3 * self.srtt_ms / 2 + WC_DEL_ACK_T)
+        } else {
+            two_srtt
+        }
+    }
+
     // ── Frame builder / sender ───────────────────────────────────────────────
 
     /// Send a TCP segment with explicit sequence number, flags, payload and options.
@@ -1279,7 +1292,7 @@ impl TcpSocket {
             self.rto_count = 0;
             // Arm TLP if not set
             if !self.tlp_deadline.is_armed() && self.srtt_ms > 0 {
-                self.tlp_deadline.arm_from_now(2 * self.srtt_ms, now);
+                self.tlp_deadline.arm_from_now(self.tlp_deadline_ms(), now);
             }
         }
     }
@@ -1383,7 +1396,7 @@ impl TcpSocket {
             // Arm TLP
             if !self.tlp_deadline.is_armed() {
                 if self.srtt_ms > 0 {
-                    self.tlp_deadline.arm_from_now(2 * self.srtt_ms, now);
+                    self.tlp_deadline.arm_from_now(self.tlp_deadline_ms(), now);
                 } else {
                     self.tlp_deadline.arm_from_now(10, now); // fallback 10 ms
                 }
