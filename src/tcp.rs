@@ -1059,7 +1059,7 @@ impl TcpSocket {
                     && self.bbr.probe_rtt_done_ms == 0
                 {
                     self.bbr.prior_cwnd        = self.bbr.cwnd;
-                    self.bbr.cwnd              = (4 * self.cfg.mss as u32).max(self.bbr.prior_cwnd / 4);
+                    self.bbr.cwnd              = 4 * self.cfg.mss as u32;
                     self.bbr.probe_rtt_done_ms = now + self.cfg.bbr_probe_rtt_duration_ms;
                     self.bbr.phase             = BbrPhase::ProbeRtt;
                     self.bbr.last_probe_rtt_ms = now;
