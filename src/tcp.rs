@@ -592,9 +592,10 @@ pub struct TcpSocket {
     rttvar_ms:   u64,
     rto_ms:      u64,
 
-    // RACK
+    // RACK (RFC 8985 §7.2)
     rack_end_seq:    SeqNum,
     rack_xmit_ms:    u64,
+    rack_rtt_ms:     u64,    // RTT of the most recently delivered segment
     /// Extra reorder tolerance added to the RACK timer deadline (ms).
     /// Increased on D-SACK detection; decays toward 0 over time.
     rack_reo_wnd_ms: u64,
@@ -689,6 +690,7 @@ impl TcpSocket {
             rto_ms:          rto,
             rack_end_seq:    isn,
             rack_xmit_ms:    0,
+            rack_rtt_ms:     0,
             rto_deadline:       Deadline::default(),
             tlp_deadline:       Deadline::default(),
             rto_count:          0,
@@ -1153,10 +1155,11 @@ impl TcpSocket {
                 {
                     min_dtime = Some(seg.dtime_at_send);
                 }
-                // RACK: update rack_end_seq/xmit_ms from ACKed segment
+                // RACK: update rack_end_seq/xmit_ms/rtt from ACKed segment
                 if seq_gt(seg.end_seq, self.rack_end_seq) {
                     self.rack_end_seq  = seg.end_seq;
                     self.rack_xmit_ms  = seg.last_sent_ms;
+                    self.rack_rtt_ms   = now.saturating_sub(seg.last_sent_ms).max(1);
                 }
                 self.unacked.remove(i);
             } else {
@@ -1175,6 +1178,7 @@ impl TcpSocket {
                         if seq_gt(seg.end_seq, self.rack_end_seq) {
                             self.rack_end_seq = seg.end_seq;
                             self.rack_xmit_ms = seg.last_sent_ms;
+                            self.rack_rtt_ms  = now.saturating_sub(seg.last_sent_ms).max(1);
                         }
                     }
                 }
@@ -1225,9 +1229,10 @@ impl TcpSocket {
         }
         self.bbr_on_ack(acked, rtt_sample, now);
 
-        // 6. RACK loss detection
-        let rack_rtt       = self.srtt_ms.max(1);
-        let reorder_window = (rack_rtt / 4).max(1) + self.rack_reo_wnd_ms;
+        // 6. RACK loss detection (RFC 8985 §7.2)
+        let rack_rtt = if self.rack_rtt_ms > 0 { self.rack_rtt_ms } else { self.srtt_ms.max(1) };
+        let min_rtt  = if self.bbr.min_rtt_ms < u64::MAX { self.bbr.min_rtt_ms } else { rack_rtt };
+        let reorder_window = (min_rtt / 4).max(1) + self.rack_reo_wnd_ms;
         // Collect segments to retransmit to avoid borrow conflict
         let mut retx: Vec<(SeqNum, TcpFlags, Vec<u8>)> = Vec::new();
         for seg in &self.unacked {
