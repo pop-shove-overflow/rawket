@@ -806,7 +806,7 @@ impl TcpSocket {
         if self.ecn_enabled {
             if flags.has(TcpFlags::ACK) && !flags.has(TcpFlags::SYN) && self.ecn_ce_pending {
                 flags |= TcpFlags::ECE;
-                self.ecn_ce_pending = false;
+                // RFC 3168 §6.1.3: keep ecn_ce_pending=true; cleared only on CWR receipt.
             }
             if !payload.is_empty() && self.ecn_cwr_needed {
                 flags |= TcpFlags::CWR;
@@ -1679,6 +1679,10 @@ impl TcpSocket {
                 if self.ecn_enabled && seg.has_flag(TcpFlags::ECE) && !seg.has_flag(TcpFlags::SYN) {
                     self.bbr_on_loss(self.cfg.mss as u64);
                     self.ecn_cwr_needed = true;
+                }
+                // ECN: CWR from sender acknowledges our ECE (RFC 3168 §6.1.3).
+                if self.ecn_enabled && seg.has_flag(TcpFlags::CWR) {
+                    self.ecn_ce_pending = false;
                 }
 
                 // Data / FIN
