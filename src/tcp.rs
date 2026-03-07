@@ -326,7 +326,10 @@ struct RxOooSegment {
 pub enum BbrPhase {
     Startup,
     Drain,
-    ProbeBw,
+    ProbeBwDown,
+    ProbeBwCruise,
+    ProbeBwRefill,
+    ProbeBwUp,
     ProbeRtt,
 }
 
@@ -340,33 +343,39 @@ struct BbrState {
     phase:                BbrPhase,
     // Bandwidth estimation
     max_bw:               u64,           // bytes/sec, windowed max
-    bw_lo:                u64,           // lower bound from loss
+    bw_shortterm:         u64,           // short-term lower bound (spec: BBR.bw_shortterm)
     bw_samples:           [BwSample; 10],
     bw_sample_idx:        usize,
+    // Latest delivery signals (1-round-trip max, spec §5.5)
+    bw_latest:            u64,           // max delivery rate this round
+    inflight_latest:      u64,           // max delivered bytes this round
     // RTT
     min_rtt_ms:           u64,
     min_rtt_stamp_ms:     u64,
     // Congestion window
     cwnd:                 u32,
-    inflight_lo:          u32,
-    inflight_hi:          u32,
+    inflight_shortterm:   u32,           // short-term lower bound (spec: BBR.inflight_shortterm)
+    inflight_longterm:    u32,           // long-term upper bound (spec: BBR.inflight_longterm)
     // Delivery rate tracking
     delivered:            u64,           // total bytes ACKed
     // Round counting
     round_count:          u64,
     next_round_delivered: u64,
+    // Loss round tracking (spec §5.5)
+    loss_round_delivered: u64,           // C.delivered at start of current loss round
+    loss_round_start:     bool,          // true when a loss round ends on this ACK
+    loss_in_round:        bool,          // any loss detected in this round
     // STARTUP convergence
     filled_pipe:          bool,
     full_bw_at_round:     u64,
     full_bw_cnt:          u8,
     // PROBE_BW cycling
-    probe_bw_in_up:       bool,
     cycle_stamp_ms:       u64,
     // PROBE_RTT
     probe_rtt_done_ms:    u64,           // 0 = not in PROBE_RTT
     prior_cwnd:           u32,
     last_probe_rtt_ms:    u64,
-    // Per-round loss tracking
+    // Per-round loss tracking (for Startup exit only)
     loss_bytes_round:     u64,
     acked_bytes_round:    u64,
 }
@@ -377,21 +386,25 @@ impl BbrState {
         BbrState {
             phase:                BbrPhase::Startup,
             max_bw:               0,
-            bw_lo:                u64::MAX,
+            bw_shortterm:         u64::MAX,
             bw_samples:           [BwSample { round: 0, bw: 0 }; 10],
             bw_sample_idx:        0,
+            bw_latest:            0,
+            inflight_latest:      0,
             min_rtt_ms:           u64::MAX,
             min_rtt_stamp_ms:     0,
             cwnd:                 init_cwnd,
-            inflight_lo:          u32::MAX,
-            inflight_hi:          u32::MAX,
+            inflight_shortterm:   u32::MAX,
+            inflight_longterm:    u32::MAX,
             delivered:            0,
             round_count:          0,
             next_round_delivered: 0,
+            loss_round_delivered: 0,
+            loss_round_start:     false,
+            loss_in_round:        false,
             filled_pipe:          false,
             full_bw_at_round:     0,
             full_bw_cnt:          0,
-            probe_bw_in_up:       true,
             cycle_stamp_ms:       0,
             probe_rtt_done_ms:    0,
             prior_cwnd:           init_cwnd,
@@ -928,28 +941,26 @@ impl TcpSocket {
 
     // ── BBR helpers ──────────────────────────────────────────────────────────
 
-    /// Returns (pacing_gain_x100, cwnd_gain_x100).
+    /// Returns (pacing_gain_x100, cwnd_gain_x100) per spec §5.6.1 gains table.
     fn bbr_gains(&self) -> (ScaledFloat, ScaledFloat) {
         match self.bbr.phase {
-            BbrPhase::Startup  => (ScaledFloat::new(288), ScaledFloat::new(200)),
-            BbrPhase::Drain    => (ScaledFloat::new(35),  ScaledFloat::new(200)),
-            BbrPhase::ProbeBw  => {
-                if self.bbr.probe_bw_in_up {
-                    (ScaledFloat::new(125), ScaledFloat::new(200))
-                } else {
-                    (ScaledFloat::new(75),  ScaledFloat::new(200))
-                }
-            }
-            BbrPhase::ProbeRtt => (ScaledFloat::new(100), ScaledFloat::new(100)),
+            BbrPhase::Startup      => (ScaledFloat::new(288), ScaledFloat::new(200)),
+            BbrPhase::Drain        => (ScaledFloat::new(35),  ScaledFloat::new(200)),
+            BbrPhase::ProbeBwDown  => (ScaledFloat::new(90),  ScaledFloat::new(200)),
+            BbrPhase::ProbeBwCruise=> (ScaledFloat::new(100), ScaledFloat::new(200)),
+            BbrPhase::ProbeBwRefill=> (ScaledFloat::new(100), ScaledFloat::new(200)),
+            BbrPhase::ProbeBwUp    => (ScaledFloat::new(125), ScaledFloat::new(225)),
+            BbrPhase::ProbeRtt     => (ScaledFloat::new(100), ScaledFloat::new(50)),
         }
     }
 
     /// Bytes-per-second pacing rate given current BBR state.
+    /// Spec §5.5: BBR.bw = min(BBR.max_bw, BBR.bw_shortterm)
     fn pacing_rate_bps(&self) -> u64 {
-        let effective_bw = if self.bbr.bw_lo == u64::MAX {
+        let effective_bw = if self.bbr.bw_shortterm == u64::MAX {
             self.bbr.max_bw
         } else {
-            self.bbr.max_bw.min(self.bbr.bw_lo)
+            self.bbr.max_bw.min(self.bbr.bw_shortterm)
         };
         if effective_bw == 0 { return 0; }
         let (pacing_gain, _) = self.bbr_gains();
@@ -963,53 +974,73 @@ impl TcpSocket {
         self.cfg.mss as u64 * 1_000 / rate
     }
 
+    /// Spec §5.5: BBRIsProbingBW() — true for phases that are probing bandwidth.
+    /// Loss adaptation is SKIPPED during these phases.
+    pub(crate) fn bbr_is_probing_bw(&self) -> bool {
+        matches!(self.bbr.phase,
+            BbrPhase::Startup | BbrPhase::ProbeBwRefill | BbrPhase::ProbeBwUp)
+    }
+
     /// Update BBR windowed-max bandwidth and cwnd after receiving ACKs.
     fn bbr_on_ack(
         &mut self,
         acked_bytes: u64,
+        delivery_rate: u64,
         rtt_ms: Option<u64>,
         now: u64,
-        oldest_delivered: Option<u64>,
-        oldest_delivered_time: Option<u64>,
     ) {
         if acked_bytes == 0 { return; }
 
         // Deliver accounting
-        self.bbr.delivered     += acked_bytes;
+        self.bbr.delivered         += acked_bytes;
         self.bbr.acked_bytes_round += acked_bytes;
+
+        // ── BBRUpdateLatestDeliverySignals (spec §5.5) ──────────────────
+        self.bbr.loss_round_start = false;
+        self.bbr.bw_latest        = self.bbr.bw_latest.max(delivery_rate);
+        self.bbr.inflight_latest  = self.bbr.inflight_latest.max(acked_bytes);
+        if self.bbr.delivered >= self.bbr.loss_round_delivered {
+            self.bbr.loss_round_delivered = self.bbr.delivered
+                + ((self.snd_nxt - self.snd_una) as u64).max(1);
+            self.bbr.loss_round_start = true;
+        }
 
         // Round counting: advance round when we've ACKed past next_round_delivered.
         if self.bbr.delivered >= self.bbr.next_round_delivered {
-            // Check per-round loss rate before resetting counters (RFC 9438 §4.5).
-            self.bbr_check_loss_round();
             self.bbr.round_count          += 1;
             let bytes_in_flight           = (self.snd_nxt - self.snd_una) as u64;
             self.bbr.next_round_delivered = self.bbr.delivered + bytes_in_flight.max(1);
-            // Reset per-round loss tracking at new round
+            // Reset per-round Startup loss tracking at new round
             self.bbr.loss_bytes_round  = 0;
             self.bbr.acked_bytes_round = 0;
         }
 
-        // RFC 9438 §4.1 delivery rate: (C.delivered - P.delivered) /
-        // (C.delivered_time - P.delivered_time), where P is the snapshot
-        // from the oldest ACKed segment.
-        if let (Some(p_delivered), Some(p_time)) = (oldest_delivered, oldest_delivered_time) {
-            let interval_ms = now.saturating_sub(p_time).max(1);
-            let bytes_delivered = self.bbr.delivered.saturating_sub(p_delivered);
-            let bw_sample = bytes_delivered * 1_000 / interval_ms; // bytes/sec
+        // ── BBRUpdateMaxBw — windowed max BW ────────────────────────────
+        if delivery_rate > 0 {
             let n_rounds   = (self.cfg.bbr_bw_filter_rounds as usize).clamp(1, 10);
             let idx        = self.bbr.bw_sample_idx;
-            self.bbr.bw_samples[idx] = BwSample { round: self.bbr.round_count, bw: bw_sample };
+            self.bbr.bw_samples[idx] = BwSample { round: self.bbr.round_count, bw: delivery_rate };
             self.bbr.bw_sample_idx   = (idx + 1) % n_rounds;
-            // Windowed max over last n_rounds
             let cur_round = self.bbr.round_count;
             self.bbr.max_bw = self.bbr.bw_samples[..n_rounds]
                 .iter()
                 .filter(|s| s.bw > 0 && cur_round.saturating_sub(s.round) < n_rounds as u64)
                 .map(|s| s.bw)
                 .max()
-                .unwrap_or(bw_sample)
-                .max(bw_sample);
+                .unwrap_or(delivery_rate)
+                .max(delivery_rate);
+        }
+
+        // ── BBRUpdateCongestionSignals (spec §5.5) ──────────────────────
+        if self.bbr.loss_round_start {
+            self.bbr_adapt_lower_bounds();
+            self.bbr.loss_in_round = false;
+        }
+
+        // ── BBRAdvanceLatestDeliverySignals (spec §5.5) ─────────────────
+        if self.bbr.loss_round_start {
+            self.bbr.bw_latest       = delivery_rate;
+            self.bbr.inflight_latest = acked_bytes;
         }
 
         // Min RTT filter
@@ -1032,19 +1063,86 @@ impl TcpSocket {
         let new_cwnd      = self.bbr.cwnd.saturating_add(acked_bytes as u32);
         self.bbr.cwnd     = new_cwnd.min(cwnd_target).max(four_mss);
 
+        // ── BBRBoundCwndForModel (spec §5.6.3) ─────────────────────────
+        self.bbr_bound_cwnd_for_model();
+
         // Phase transitions
         self.bbr_phase_update(now);
 
         // If the stale pacing deadline is farther in the future than one new
         // pacing interval, disarm it.  The next flush_send_buf call will send
         // a segment immediately and then re-arm with the correct interval.
-        // This matches real BBR semantics: when a better BW sample arrives the
-        // sender is immediately eligible to send at the new rate.
         if let Some(remaining) = self.pacing_next.remaining_ms(now) {
             let new_interval = self.pacing_interval_ms();
             if remaining > new_interval {
                 self.pacing_next.disarm();
             }
+        }
+    }
+
+    /// Spec §5.5: BBRAdaptLowerBoundsFromCongestion — once per round-trip.
+    fn bbr_adapt_lower_bounds(&mut self) {
+        if self.bbr_is_probing_bw() {
+            return; // skip during Startup, ProbeBW_REFILL, ProbeBW_UP
+        }
+        if self.bbr.loss_in_round {
+            self.bbr_init_lower_bounds();
+            self.bbr_loss_lower_bounds();
+        }
+    }
+
+    /// Spec §5.5: BBRInitLowerBounds — initialize from max_bw on first loss.
+    fn bbr_init_lower_bounds(&mut self) {
+        if self.bbr.bw_shortterm == u64::MAX {
+            self.bbr.bw_shortterm = self.bbr.max_bw;
+        }
+        if self.bbr.inflight_shortterm == u32::MAX {
+            self.bbr.inflight_shortterm = self.bbr.cwnd;
+        }
+    }
+
+    /// Spec §5.5: BBRLossLowerBounds — Beta=0.7 multiplicative decrease.
+    fn bbr_loss_lower_bounds(&mut self) {
+        // bw_shortterm = max(bw_latest, Beta * bw_shortterm)
+        self.bbr.bw_shortterm = self.bbr.bw_latest
+            .max(self.bbr.bw_shortterm * 70 / 100);
+        // inflight_shortterm = max(inflight_latest, Beta * inflight_shortterm)
+        self.bbr.inflight_shortterm = (self.bbr.inflight_latest as u32)
+            .max(self.bbr.inflight_shortterm * 70 / 100);
+    }
+
+    /// Spec §5.5: BBRResetShortTermModel — called at REFILL entry and ProbeRTT exit.
+    fn bbr_reset_short_term_model(&mut self) {
+        self.bbr.bw_shortterm       = u64::MAX;
+        self.bbr.inflight_shortterm = u32::MAX;
+    }
+
+    /// Spec §5.5: BBRResetCongestionSignals.
+    fn bbr_reset_congestion_signals(&mut self) {
+        self.bbr.loss_in_round   = false;
+        self.bbr.bw_latest       = 0;
+        self.bbr.inflight_latest = 0;
+    }
+
+    /// Spec §5.6.3: BBRBoundCwndForModel — apply inflight bounds to cwnd.
+    fn bbr_bound_cwnd_for_model(&mut self) {
+        let cap = match self.bbr.phase {
+            BbrPhase::ProbeBwDown | BbrPhase::ProbeBwUp | BbrPhase::ProbeBwRefill
+            | BbrPhase::Drain =>
+                self.bbr.inflight_longterm,
+            BbrPhase::ProbeBwCruise | BbrPhase::ProbeRtt => {
+                // 0.85 * inflight_longterm (headroom)
+                if self.bbr.inflight_longterm == u32::MAX { u32::MAX }
+                else { self.bbr.inflight_longterm * 85 / 100 }
+            }
+            _ => u32::MAX, // Startup: no longterm cap
+        };
+        // Apply inflight_shortterm (possibly infinite)
+        let cap = cap.min(self.bbr.inflight_shortterm);
+        let min_pipe_cwnd = 4 * self.cfg.mss as u32;
+        let cap = cap.max(min_pipe_cwnd);
+        if self.bbr.cwnd > cap {
+            self.bbr.cwnd = cap;
         }
     }
 
@@ -1063,7 +1161,7 @@ impl TcpSocket {
                             self.bbr.filled_pipe = true;
                         }
                     }
-                    // Loss-based exit
+                    // Loss-based exit (>2% loss rate in a round)
                     if self.bbr.acked_bytes_round > 0 {
                         let loss_rate = self.bbr.loss_bytes_round * 100 / self.bbr.acked_bytes_round;
                         if loss_rate > 2 {
@@ -1077,89 +1175,103 @@ impl TcpSocket {
             }
             BbrPhase::Drain => {
                 let bytes_in_flight = (self.snd_nxt - self.snd_una) as u64;
-                let bdp = if self.bbr.min_rtt_ms < u64::MAX && self.bbr.max_bw > 0 {
-                    self.bbr.max_bw * self.bbr.min_rtt_ms / 1_000
-                } else { 0 };
+                let bdp = self.bbr_bdp();
                 if bytes_in_flight <= bdp.max(1) {
-                    self.bbr.phase         = BbrPhase::ProbeBw;
-                    self.bbr.probe_bw_in_up = true;
-                    self.bbr.cycle_stamp_ms = now;
-                    // Reset inflight bounds
-                    self.bbr.bw_lo       = u64::MAX;
-                    self.bbr.inflight_lo = u32::MAX;
-                    self.bbr.inflight_hi = u32::MAX;
+                    self.bbr_enter_probe_bw_down(now);
                 }
             }
-            BbrPhase::ProbeBw => {
-                // Enter PROBE_RTT periodically
-                if self.cfg.bbr_probe_rtt_interval_ms > 0
-                    && now.saturating_sub(self.bbr.min_rtt_stamp_ms) > self.cfg.bbr_probe_rtt_interval_ms
-                    && self.bbr.probe_rtt_done_ms == 0
-                {
-                    self.bbr.prior_cwnd        = self.bbr.cwnd;
-                    self.bbr.cwnd              = 4 * self.cfg.mss as u32;
-                    self.bbr.probe_rtt_done_ms = now + self.cfg.bbr_probe_rtt_duration_ms;
-                    self.bbr.phase             = BbrPhase::ProbeRtt;
-                    self.bbr.last_probe_rtt_ms = now;
-                    return;
+            BbrPhase::ProbeBwDown => {
+                if self.bbr_check_probe_rtt(now) { return; }
+                // Transition to CRUISE when in-flight ≤ BDP
+                let bytes_in_flight = (self.snd_nxt - self.snd_una) as u64;
+                let bdp = self.bbr_bdp();
+                if bytes_in_flight <= bdp.max(1) {
+                    self.bbr.phase = BbrPhase::ProbeBwCruise;
                 }
-                // Cycle PROBE_UP → PROBE_DOWN based on round count
-                if self.bbr.probe_bw_in_up {
-                    // Stay UP for one round then drain
-                    if self.bbr.round_count > 0
-                        && now.saturating_sub(self.bbr.cycle_stamp_ms) >= self.srtt_ms.max(1)
-                    {
-                        self.bbr.probe_bw_in_up = false;
-                        self.bbr.cycle_stamp_ms = now;
-                    }
-                } else {
-                    // Drain until in-flight ≤ BDP, then cruise
-                    let bytes_in_flight = (self.snd_nxt - self.snd_una) as u64;
-                    let bdp = if self.bbr.min_rtt_ms < u64::MAX && self.bbr.max_bw > 0 {
-                        self.bbr.max_bw * self.bbr.min_rtt_ms / 1_000
-                    } else { 0 };
-                    if bytes_in_flight <= bdp.max(1) {
-                        self.bbr.probe_bw_in_up = true;
-                        self.bbr.cycle_stamp_ms = now;
-                        // Reset loss bounds for new UP phase
-                        self.bbr.bw_lo       = u64::MAX;
-                        self.bbr.inflight_lo = u32::MAX;
-                    }
+            }
+            BbrPhase::ProbeBwCruise => {
+                if self.bbr_check_probe_rtt(now) { return; }
+                // Time to probe? After min_rtt interval, transition to REFILL
+                if self.bbr.round_count > 0
+                    && now.saturating_sub(self.bbr.cycle_stamp_ms) >= self.srtt_ms.max(1) * 4
+                {
+                    self.bbr_enter_probe_bw_refill();
+                }
+            }
+            BbrPhase::ProbeBwRefill => {
+                // After one round of REFILL, start UP
+                if self.bbr.round_count > 0
+                    && now.saturating_sub(self.bbr.cycle_stamp_ms) >= self.srtt_ms.max(1)
+                {
+                    self.bbr_enter_probe_bw_up(now);
+                }
+            }
+            BbrPhase::ProbeBwUp => {
+                // Stay UP for one round then go DOWN
+                if self.bbr.round_count > 0
+                    && now.saturating_sub(self.bbr.cycle_stamp_ms) >= self.srtt_ms.max(1)
+                {
+                    self.bbr_enter_probe_bw_down(now);
                 }
             }
             BbrPhase::ProbeRtt => {
                 if self.bbr.probe_rtt_done_ms > 0 && now >= self.bbr.probe_rtt_done_ms {
                     self.bbr.probe_rtt_done_ms = 0;
                     self.bbr.cwnd              = self.bbr.prior_cwnd;
-                    self.bbr.phase             = BbrPhase::ProbeBw;
-                    self.bbr.probe_bw_in_up    = true;
-                    self.bbr.cycle_stamp_ms    = now;
+                    // Spec: BBRResetShortTermModel at ProbeRTT exit
+                    self.bbr_reset_short_term_model();
+                    self.bbr_enter_probe_bw_down(now);
                 }
             }
         }
     }
 
+    /// BDP estimate in bytes.
+    fn bbr_bdp(&self) -> u64 {
+        if self.bbr.min_rtt_ms < u64::MAX && self.bbr.max_bw > 0 {
+            self.bbr.max_bw * self.bbr.min_rtt_ms / 1_000
+        } else { 0 }
+    }
+
+    /// Enter ProbeBW_DOWN: start a new ProbeBW cycle.
+    fn bbr_enter_probe_bw_down(&mut self, now: u64) {
+        self.bbr_reset_congestion_signals();
+        self.bbr.phase           = BbrPhase::ProbeBwDown;
+        self.bbr.cycle_stamp_ms  = now;
+    }
+
+    /// Enter ProbeBW_REFILL: reset short-term model.
+    fn bbr_enter_probe_bw_refill(&mut self) {
+        self.bbr_reset_short_term_model();
+        self.bbr.phase = BbrPhase::ProbeBwRefill;
+    }
+
+    /// Enter ProbeBW_UP: probe for more bandwidth.
+    fn bbr_enter_probe_bw_up(&mut self, now: u64) {
+        self.bbr.phase           = BbrPhase::ProbeBwUp;
+        self.bbr.cycle_stamp_ms  = now;
+    }
+
+    /// Check if it's time to enter ProbeRTT. Returns true if we transitioned.
+    fn bbr_check_probe_rtt(&mut self, now: u64) -> bool {
+        if self.cfg.bbr_probe_rtt_interval_ms > 0
+            && now.saturating_sub(self.bbr.min_rtt_stamp_ms) > self.cfg.bbr_probe_rtt_interval_ms
+            && self.bbr.probe_rtt_done_ms == 0
+        {
+            self.bbr.prior_cwnd        = self.bbr.cwnd;
+            self.bbr.cwnd              = 4 * self.cfg.mss as u32;
+            self.bbr.probe_rtt_done_ms = now + self.cfg.bbr_probe_rtt_duration_ms;
+            self.bbr.phase             = BbrPhase::ProbeRtt;
+            self.bbr.last_probe_rtt_ms = now;
+            return true;
+        }
+        false
+    }
+
+    /// Record loss — sets boolean loss_in_round flag (spec §5.5).
     fn bbr_on_loss(&mut self, lost_bytes: u64) {
         self.bbr.loss_bytes_round += lost_bytes;
-    }
-
-    /// Check per-round loss rate and reduce bw_lo/inflight_lo if > 2%.
-    /// Called at round boundaries before resetting counters (RFC 9438 §4.5).
-    fn bbr_check_loss_round(&mut self) {
-        if self.bbr.acked_bytes_round > 0 {
-            let loss_rate = self.bbr.loss_bytes_round * 100
-                / self.bbr.acked_bytes_round;
-            if loss_rate > 2 {
-                if self.bbr.max_bw > 0 {
-                    let new_lo = self.bbr.max_bw / 2;
-                    if new_lo < self.bbr.bw_lo { self.bbr.bw_lo = new_lo; }
-                }
-                let new_inf = self.bbr.cwnd / 2;
-                if new_inf < self.bbr.inflight_lo { self.bbr.inflight_lo = new_inf; }
-                let floor = (4 * self.cfg.mss as u32).max(self.bbr.inflight_lo);
-                if self.bbr.cwnd > floor { self.bbr.cwnd = floor; }
-            }
-        }
+        self.bbr.loss_in_round = true;
     }
 
     // ── Core ACK processing ──────────────────────────────────────────────────
@@ -1262,8 +1374,15 @@ impl TcpSocket {
         }
 
         // 5. BBRv3 bandwidth update (RFC 9438 §4.1 delivery rate)
-        self.bbr_on_ack(acked, rtt_sample, now,
-                        oldest_delivered, oldest_delivered_time);
+        // Compute delivery rate before bbr_on_ack updates delivered counter.
+        // C.delivered (after this ACK) - P.delivered / (now - P.delivered_time)
+        let delivery_rate = if let (Some(p_delivered), Some(p_time)) =
+            (oldest_delivered, oldest_delivered_time) {
+            let interval_ms = now.saturating_sub(p_time).max(1);
+            let c_delivered = self.bbr.delivered + acked;
+            c_delivered.saturating_sub(p_delivered) * 1_000 / interval_ms
+        } else { 0 };
+        self.bbr_on_ack(acked, delivery_rate, rtt_sample, now);
 
         // 6. RACK loss detection (RFC 8985 §7.2)
         let rack_rtt = if self.rack_rtt_ms > 0 { self.rack_rtt_ms } else { self.srtt_ms.max(1) };
@@ -1345,16 +1464,13 @@ impl TcpSocket {
             // Window opened — cancel persist timer
             self.persist_deadline.disarm();
 
-            // cwnd gate
+            // cwnd gate (cwnd already bounded by BBRBoundCwndForModel)
             let bytes_in_flight = self.snd_nxt - self.snd_una;
-            let limit = self.bbr.cwnd
-                .min(self.bbr.inflight_lo)
-                .min(self.bbr.inflight_hi);
-            if bytes_in_flight >= limit { break; }
+            if bytes_in_flight >= self.bbr.cwnd { break; }
 
             // Both gates: cap chunk at the tighter of cwnd room and window room.
             let wnd_room   = (wnd_limit - self.snd_nxt) as usize;
-            let available  = ((limit - bytes_in_flight) as usize).min(wnd_room);
+            let available  = ((self.bbr.cwnd - bytes_in_flight) as usize).min(wnd_room);
             let ts_overhead = if self.ts_enabled { 12 } else { 0 };
             let effective_mss = (self.peer_mss as usize).saturating_sub(ts_overhead);
             let chunk_len  = effective_mss
@@ -2269,16 +2385,18 @@ impl TcpSocket {
 #[cfg(feature = "test-internals")]
 impl TcpSocket {
     pub fn bbr_cwnd(&self) -> u32 { self.bbr.cwnd }
-    pub fn bbr_inflight_lo(&self) -> u32 { self.bbr.inflight_lo }
-    pub fn bbr_inflight_hi(&self) -> u32 { self.bbr.inflight_hi }
+    pub fn bbr_inflight_shortterm(&self) -> u32 { self.bbr.inflight_shortterm }
+    pub fn bbr_inflight_longterm(&self) -> u32 { self.bbr.inflight_longterm }
     pub fn bbr_phase(&self) -> BbrPhase { self.bbr.phase }
     pub fn bbr_max_bw(&self) -> u64 { self.bbr.max_bw }
-    pub fn bbr_bw_lo(&self) -> u64 { self.bbr.bw_lo }
+    pub fn bbr_bw_shortterm(&self) -> u64 { self.bbr.bw_shortterm }
+    pub fn bbr_bw_latest(&self) -> u64 { self.bbr.bw_latest }
+    pub fn bbr_inflight_latest(&self) -> u64 { self.bbr.inflight_latest }
     pub fn bbr_min_rtt_ms(&self) -> u64 { self.bbr.min_rtt_ms }
     pub fn bbr_pacing_rate_bps(&self) -> u64 { self.pacing_rate_bps() }
-    pub fn bbr_probe_bw_in_up(&self) -> bool { self.bbr.probe_bw_in_up }
     pub fn bbr_round_count(&self) -> u64 { self.bbr.round_count }
     pub fn bbr_filled_pipe(&self) -> bool { self.bbr.filled_pipe }
+    pub fn bbr_loss_in_round(&self) -> bool { self.bbr.loss_in_round }
     pub fn bbr_loss_bytes_round(&self) -> u64 { self.bbr.loss_bytes_round }
     pub fn bbr_acked_bytes_round(&self) -> u64 { self.bbr.acked_bytes_round }
     pub fn bbr_prior_cwnd(&self) -> u32 { self.bbr.prior_cwnd }
