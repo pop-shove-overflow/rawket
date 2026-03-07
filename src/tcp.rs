@@ -580,6 +580,7 @@ pub struct TcpSocket {
     snd_nxt:     SeqNum,
     snd_una:     SeqNum,
     rcv_nxt:     SeqNum,
+    last_ack_sent: SeqNum, // RFC 7323 §4.3: for ts_recent update gating
     tx_id:       u16,
     on_recv:     for<'a> fn(TcpPacket<'a>),
     on_error:    fn(TcpError),
@@ -693,6 +694,7 @@ impl TcpSocket {
             snd_nxt:         isn,
             snd_una:         isn,
             rcv_nxt:         SeqNum::new(0),
+            last_ack_sent:   SeqNum::new(0),
             tx_id:           0,
             on_recv,
             on_error,
@@ -771,11 +773,14 @@ impl TcpSocket {
         [0x01, 0x01, 0x08, 0x0a, t0, t1, t2, t3, e0, e1, e2, e3]
     }
 
-    // ── SACK option for receiver (up to 4 OOO blocks, max 36 bytes) ─────────
+    // ── SACK option for receiver ────────────────────────────────────────────
+    //
+    // max_blocks: 4 without timestamps, 3 with timestamps (to fit in 40-byte
+    // option space: 12 TS + 2 NOP + 2 SACK hdr + 8*3 = 40).
 
-    /// Returns the number of bytes written into `buf`.  Buf must be at least 36 bytes.
-    fn build_sack_opts(&self, buf: &mut [u8; 40]) -> usize {
-        let n = self.rx_ooo.len().min(4);
+    /// Returns the number of bytes written into `buf`.
+    fn build_sack_opts(&self, buf: &mut [u8; 40], max_blocks: usize) -> usize {
+        let n = self.rx_ooo.len().min(max_blocks);
         if n == 0 { return 0; }
         let opt_len = 2 + 8 * n; // SACK kind (1) + len (1) + 8*n
         let total   = 2 + opt_len; // 2 NOPs + kind + len + blocks
@@ -796,7 +801,7 @@ impl TcpSocket {
             slot = 1;
         }
         for (i, ooo) in self.rx_ooo.iter().enumerate() {
-            if slot >= 4 { break; }
+            if slot >= max_blocks { break; }
             if Some(i) == last_idx { continue; }
             let off = 4 + slot * 8;
             buf[off..off + 4].copy_from_slice(&ooo.seq.as_u32().to_be_bytes());
@@ -808,9 +813,10 @@ impl TcpSocket {
     }
 
     /// Build a D-SACK option per RFC 2883 §3.
-    /// First block is the duplicate range; up to 3 OOO blocks follow.
-    fn build_dsack_opts(&self, buf: &mut [u8; 40], left: SeqNum, right: SeqNum) -> usize {
-        let ooo_n   = self.rx_ooo.len().min(3);
+    /// First block is the duplicate range; remaining blocks are OOO ranges.
+    /// max_blocks: total SACK blocks (including the D-SACK block itself).
+    fn build_dsack_opts(&self, buf: &mut [u8; 40], left: SeqNum, right: SeqNum, max_blocks: usize) -> usize {
+        let ooo_n   = self.rx_ooo.len().min(max_blocks - 1);
         let n       = 1 + ooo_n;
         let opt_len = 2 + 8 * n;
         let total   = 2 + opt_len;
@@ -818,7 +824,7 @@ impl TcpSocket {
         buf[2] = 0x05; buf[3] = opt_len as u8;
         buf[4..8].copy_from_slice(&left.as_u32().to_be_bytes());
         buf[8..12].copy_from_slice(&right.as_u32().to_be_bytes());
-        for (i, ooo) in self.rx_ooo.iter().take(3).enumerate() {
+        for (i, ooo) in self.rx_ooo.iter().take(max_blocks - 1).enumerate() {
             let off = 12 + i * 8;
             buf[off..off + 4].copy_from_slice(&ooo.seq.as_u32().to_be_bytes());
             let r = ooo.seq + ooo.data.len() as u32;
@@ -826,6 +832,27 @@ impl TcpSocket {
         }
         total
     }
+
+    /// Send an ACK with optional TS and SACK/D-SACK options combined.
+    /// RFC 7323 §3.2: TS MUST be included on every non-RST segment.
+    fn send_ack_with_opts(&mut self, opts: &[u8]) -> Result<()> {
+        if self.ts_enabled {
+            let ts = self.ts_opt();
+            let mut buf = [0u8; 52]; // 12 TS + 40 SACK max
+            buf[..12].copy_from_slice(&ts);
+            buf[12..12 + opts.len()].copy_from_slice(opts);
+            let seq = self.snd_nxt;
+            self.send_segment(seq, TcpFlags::ACK, &[], &buf[..12 + opts.len()])
+        } else if !opts.is_empty() {
+            let seq = self.snd_nxt;
+            self.send_segment(seq, TcpFlags::ACK, &[], opts)
+        } else {
+            self.send_ctrl_opts(TcpFlags::ACK, &[])
+        }
+    }
+
+    /// Max SACK blocks that fit in option space, accounting for timestamps.
+    fn max_sack_blocks(&self) -> usize { if self.ts_enabled { 3 } else { 4 } }
 
     /// TLP deadline: RFC 8985 §7.4.
     /// FlightSize > 1 → max(2*SRTT, 1.5*SRTT + WCDelAckT).
@@ -911,6 +938,7 @@ impl TcpSocket {
         let csum = checksum_finish(acc);
         frame[tcp_off + 16..tcp_off + 18].copy_from_slice(&csum.to_be_bytes());
 
+        if flags.has(TcpFlags::ACK) { self.last_ack_sent = self.rcv_nxt; }
         (self.tx)(frame)
     }
 
@@ -1668,9 +1696,14 @@ impl TcpSocket {
             }
         }
 
-        // Update ts_recent after the PAWS check passes.
+        // RFC 7323 §4.3: update ts_recent only when SEG.SEQ <= Last.ACK.sent.
+        // This prevents ts_recent from advancing on reordered/OOO segments.
         if self.ts_enabled {
-            if let Some(tsv) = opts.ts_val { self.ts_recent = tsv; }
+            if let Some(tsv) = opts.ts_val {
+                if !seq_lt(self.last_ack_sent, seg.seq) {
+                    self.ts_recent = tsv;
+                }
+            }
         }
 
         match self.state {
@@ -1797,9 +1830,9 @@ impl TcpSocket {
                             self.rcv_nxt
                         };
                         let mut sack_buf = [0u8; 40];
-                        let sack_len = self.build_dsack_opts(&mut sack_buf, dsack_left, dsack_right);
-                        let snd = self.snd_nxt;
-                        let _ = self.send_segment(snd, TcpFlags::ACK, &[], &sack_buf[..sack_len]);
+                        let max = self.max_sack_blocks();
+                        let sack_len = self.build_dsack_opts(&mut sack_buf, dsack_left, dsack_right, max);
+                        let _ = self.send_ack_with_opts(&sack_buf[..sack_len]);
                     } else {
                         let _ = self.send_ctrl(TcpFlags::ACK);
                     }
@@ -1837,9 +1870,12 @@ impl TcpSocket {
                                 for s in &mut self.unacked {
                                     if s.seq == seq { s.retransmits += 1; s.last_sent_ms = now; }
                                 }
-                                let opts_arr;
+                                let syn_arr;
+                                let ts_arr;
                                 let opts_slice: &[u8] = if flags.has(TcpFlags::SYN) {
-                                    opts_arr = self.syn_opts(); &opts_arr
+                                    syn_arr = self.syn_opts(); &syn_arr
+                                } else if self.ts_enabled {
+                                    ts_arr = self.ts_opt(); &ts_arr
                                 } else { &[] };
                                 let _ = self.send_segment(seq, flags, &data, opts_slice);
                             }
@@ -1947,13 +1983,9 @@ impl TcpSocket {
                     }
                     // ACK (with SACK if OOO pending)
                     let mut sack_buf = [0u8; 40];
-                    let sack_len     = if self.sack_ok { self.build_sack_opts(&mut sack_buf) } else { 0 };
-                    let seq = self.snd_nxt;
-                    if sack_len > 0 {
-                        self.send_segment(seq, TcpFlags::ACK, &[], &sack_buf[..sack_len])?;
-                    } else {
-                        self.send_ctrl(TcpFlags::ACK)?;
-                    }
+                    let max = self.max_sack_blocks();
+                    let sack_len = if self.sack_ok { self.build_sack_opts(&mut sack_buf, max) } else { 0 };
+                    self.send_ack_with_opts(&sack_buf[..sack_len])?;
                     let on_recv = self.on_recv;
                     on_recv(TcpPacket {
                         eth_src: eth.src, eth_dst: eth.dst,
@@ -1979,13 +2011,9 @@ impl TcpSocket {
                     }
                     // Send ACK with SACK
                     let mut sack_buf = [0u8; 40];
-                    let sack_len     = if self.sack_ok { self.build_sack_opts(&mut sack_buf) } else { 0 };
-                    let seq = self.snd_nxt;
-                    if sack_len > 0 {
-                        self.send_segment(seq, TcpFlags::ACK, &[], &sack_buf[..sack_len])?;
-                    } else {
-                        self.send_ctrl(TcpFlags::ACK)?;
-                    }
+                    let max = self.max_sack_blocks();
+                    let sack_len = if self.sack_ok { self.build_sack_opts(&mut sack_buf, max) } else { 0 };
+                    self.send_ack_with_opts(&sack_buf[..sack_len])?;
                 }
                 // else: seq < rcv_nxt (retransmit of already-received data) → ACK only
             }
@@ -2213,13 +2241,17 @@ impl TcpSocket {
                 let tlp_seq   = seg.seq;
                 let tlp_flags = seg.flags;
                 let tlp_data  = seg.data.clone();
-                let _ = self.send_segment(tlp_seq, tlp_flags, &tlp_data, &[]);
+                let ts;
+                let opts: &[u8] = if self.ts_enabled { ts = self.ts_opt(); &ts } else { &[] };
+                let _ = self.send_segment(tlp_seq, tlp_flags, &tlp_data, opts);
             } else if !self.send_buf.is_empty() {
                 // Probe with tail of send_buf
                 let probe_len = (self.cfg.mss as usize).min(self.send_buf.len());
                 let probe: Vec<u8> = self.send_buf[..probe_len].to_vec();
                 let seq = self.snd_nxt;
-                let _ = self.send_segment(seq, TcpFlags::PSH | TcpFlags::ACK, &probe, &[]);
+                let ts;
+                let opts: &[u8] = if self.ts_enabled { ts = self.ts_opt(); &ts } else { &[] };
+                let _ = self.send_segment(seq, TcpFlags::PSH | TcpFlags::ACK, &probe, opts);
             }
         }
 
@@ -2279,7 +2311,9 @@ impl TcpSocket {
                 return Ok(());
             }
             let probe_seq = self.snd_una - 1;
-            let _ = self.send_segment(probe_seq, TcpFlags::ACK, &[], &[]);
+            let ts;
+            let opts: &[u8] = if self.ts_enabled { ts = self.ts_opt(); &ts } else { &[] };
+            let _ = self.send_segment(probe_seq, TcpFlags::ACK, &[], opts);
             self.keepalive_deadline.arm_from_now(self.cfg.keepalive_interval_ms, now);
         }
 
