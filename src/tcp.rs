@@ -1592,8 +1592,14 @@ impl TcpSocket {
             // ── ESTABLISHED ─────────────────────────────────────────────────
             State::Established => {
                 // Window check: use actual advertised receive window.
+                // RFC 793 §3.3: a segment that starts before rcv_nxt but
+                // extends past it carries new data and must be accepted
+                // (the overlap is trimmed later, at the delivery path).
                 let rcv_wnd   = RECV_BUF_MAX.saturating_sub(self.recv_buf.len() as u32);
-                let in_window = seq_ge(seg.seq, self.rcv_nxt)
+                let payload_start_wc = seg.hdr_len().min(tcp_buf.len());
+                let seg_end   = seg.seq + (tcp_buf.len() - payload_start_wc) as u32;
+                let in_window = (seq_ge(seg.seq, self.rcv_nxt)
+                    || seq_gt(seg_end, self.rcv_nxt))
                     && seq_lt(seg.seq, self.rcv_nxt + rcv_wnd);
                 let is_keepalive = seg.seq == self.rcv_nxt - 1;
 
@@ -1727,7 +1733,20 @@ impl TcpSocket {
 
                 if pdu.is_empty() { return Ok(()); }
 
-                if seg.seq == self.rcv_nxt {
+                // RFC 793 §3.3: trim overlap when segment starts before rcv_nxt.
+                let (pdu, seg_seq) = if seq_lt(seg.seq, self.rcv_nxt) {
+                    let overlap = (self.rcv_nxt - seg.seq) as usize;
+                    if overlap >= pdu.len() {
+                        // Entirely old data — send ACK only.
+                        let _ = self.send_ctrl(TcpFlags::ACK);
+                        return Ok(());
+                    }
+                    (&pdu[overlap..], self.rcv_nxt)
+                } else {
+                    (pdu, seg.seq)
+                };
+
+                if seg_seq == self.rcv_nxt {
                     // In-order segment
                     self.rcv_nxt += pdu.len() as u32;
                     self.recv_buf.extend_from_slice(pdu);
@@ -1758,14 +1777,14 @@ impl TcpSocket {
                         dst: SocketAddrV4::new(ip.dst, seg.dst_port),
                         pdu,
                     });
-                } else if seq_gt(seg.seq, self.rcv_nxt) {
+                } else if seq_gt(seg_seq, self.rcv_nxt) {
                     // Out-of-order: buffer and SACK
                     if self.rx_ooo.len() < self.cfg.rx_ooo_max {
                         // Check for duplicate
-                        let dup = self.rx_ooo.iter().any(|s| s.seq == seg.seq);
+                        let dup = self.rx_ooo.iter().any(|s| s.seq == seg_seq);
                         if !dup {
-                            self.rx_ooo_last = Some(seg.seq);
-                            self.rx_ooo.push(RxOooSegment { seq: seg.seq, data: pdu.to_vec() });
+                            self.rx_ooo_last = Some(seg_seq);
+                            self.rx_ooo.push(RxOooSegment { seq: seg_seq, data: pdu.to_vec() });
                             // Sort by seq
                             self.rx_ooo.sort_by(|a, b| {
                                 if seq_lt(a.seq, b.seq) { core::cmp::Ordering::Less }
