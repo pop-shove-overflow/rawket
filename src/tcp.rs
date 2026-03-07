@@ -1428,11 +1428,17 @@ impl TcpSocket {
                 State::Listen | State::Closed | State::TimeWait => return Ok(()),
                 _ => {}
             }
-            // SynSent has its own RST validation (ACK field, not seq window).
+            // SynSent RST validation (RFC 793 §3.4 step 2):
+            // RST must carry ACK with valid ack field (SND.UNA <= SEG.ACK <= SND.NXT).
             if self.state == State::SynSent {
-                self.state      = State::Closed;
-                self.last_error = Some(TcpError::Reset);
-                (self.on_error)(TcpError::Reset);
+                if seg.has_flag(TcpFlags::ACK)
+                    && seq_ge(seg.ack, self.snd_una)
+                    && seq_le(seg.ack, self.snd_nxt)
+                {
+                    self.state      = State::Closed;
+                    self.last_error = Some(TcpError::Reset);
+                    (self.on_error)(TcpError::Reset);
+                }
                 return Ok(());
             }
             // Validate RST is within receive window (use actual advertised window).
