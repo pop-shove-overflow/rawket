@@ -2222,6 +2222,13 @@ impl TcpSocket {
     pub fn snd_nxt(&self) -> u32 { self.snd_nxt.as_u32() }
     pub fn snd_una(&self) -> u32 { self.snd_una.as_u32() }
     pub fn rcv_nxt(&self) -> u32 { self.rcv_nxt.as_u32() }
+    pub fn bytes_in_flight(&self) -> u32 { (self.snd_nxt - self.snd_una) as u32 }
+    pub fn send_buf_len(&self) -> usize { self.send_buf.len() }
+    pub fn bbr_delivered(&self) -> u64 { self.bbr.delivered }
+    pub fn bbr_next_round_delivered(&self) -> u64 { self.bbr.next_round_delivered }
+    pub fn unacked_len(&self) -> usize { self.unacked.len() }
+    pub fn rcv_scale(&self) -> u8 { self.rcv_scale }
+    pub fn snd_scale(&self) -> u8 { self.snd_scale }
 }
 
 // ── L4 dispatch ───────────────────────────────────────────────────────────────
