@@ -744,6 +744,9 @@ impl TcpSocket {
     fn syn_opts(&self) -> [u8; 24] {
         let mss = self.cfg.mss;
         let [t0, t1, t2, t3] = (self.clock.monotonic_ms() as u32).to_be_bytes();
+        // RFC 7323 §3.2: TSecr = 0 on initial SYN (ts_recent is 0);
+        // on SYN-ACK, ts_recent holds peer's TSval from the SYN.
+        let [e0, e1, e2, e3] = self.ts_recent.to_be_bytes();
         // RFC 7323 §2.2: omit WS in SYN-ACK when peer omitted it in SYN.
         let (ws_kind, ws_len, ws_val, ws_pad) = if self.peer_offered_ws {
             (0x03u8, 0x03u8, LOCAL_WS_SHIFT, 0x01u8)    // WS (3) + NOP pad (1)
@@ -756,7 +759,7 @@ impl TcpSocket {
             0x04, 0x02, 0x01, 0x01,                      // SACK-Permitted (2) + 2 NOPs
             0x01, 0x01, 0x08, 0x0a,                      // NOP NOP kind=8 len=10
             t0, t1, t2, t3,                              // TSval = now
-            0x00, 0x00, 0x00, 0x00,                      // TSecr = 0 (per RFC 7323 §3.2)
+            e0, e1, e2, e3,                              // TSecr
         ]
     }
 
