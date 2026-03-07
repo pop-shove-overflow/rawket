@@ -2482,6 +2482,8 @@ impl TcpSocket {
     pub fn unacked_len(&self) -> usize { self.unacked.len() }
     pub fn rcv_scale(&self) -> u8 { self.rcv_scale }
     pub fn snd_scale(&self) -> u8 { self.snd_scale }
+    pub fn ts_recent(&self) -> u32 { self.ts_recent }
+    pub fn last_ack_sent(&self) -> u32 { self.last_ack_sent.as_u32() }
 }
 
 // ── L4 dispatch ───────────────────────────────────────────────────────────────
