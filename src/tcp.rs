@@ -596,6 +596,7 @@ pub struct TcpSocket {
     rack_end_seq:    SeqNum,
     rack_xmit_ms:    u64,
     rack_rtt_ms:     u64,    // RTT of the most recently delivered segment
+    rack_reo_decay_round: u64, // last round at which reo_wnd was decayed
     /// Extra reorder tolerance added to the RACK timer deadline (ms).
     /// Increased on D-SACK detection; decays toward 0 over time.
     rack_reo_wnd_ms: u64,
@@ -691,6 +692,7 @@ impl TcpSocket {
             rack_end_seq:    isn,
             rack_xmit_ms:    0,
             rack_rtt_ms:     0,
+            rack_reo_decay_round: 0,
             rto_deadline:       Deadline::default(),
             tlp_deadline:       Deadline::default(),
             rto_count:          0,
@@ -1683,9 +1685,12 @@ impl TcpSocket {
                             }
                         }
                     }
-                    // Decay rack_reo_wnd_ms on each ACK round (×7/8 per round).
-                    self.rack_reo_wnd_ms =
-                        self.rack_reo_wnd_ms.saturating_sub(self.rack_reo_wnd_ms / 8 + 1);
+                    // Decay rack_reo_wnd_ms once per round (RFC 8985 §7.2).
+                    if self.bbr.round_count > self.rack_reo_decay_round {
+                        self.rack_reo_decay_round = self.bbr.round_count;
+                        self.rack_reo_wnd_ms =
+                            self.rack_reo_wnd_ms.saturating_sub(self.rack_reo_wnd_ms / 8 + 1);
+                    }
                 }
 
                 // ECN: detect CE-marked packets (dscp_ecn low bits == 0b11).
