@@ -308,7 +308,9 @@ struct TxSegment {
     last_sent_ms:     u64,
     retransmits:      u8,
     sacked:           bool,
-    dtime_at_send:    u64,   // bbr.delivered_ms at send time
+    // RFC 9438 §4.1 delivery-rate metadata snapshot at send time
+    delivered_at_send:      u64, // bbr.delivered when this segment was sent
+    delivered_time_at_send: u64, // timestamp when this segment was sent
 }
 
 // ── Out-of-order receive buffer ───────────────────────────────────────────────
@@ -350,7 +352,6 @@ struct BbrState {
     inflight_hi:          u32,
     // Delivery rate tracking
     delivered:            u64,           // total bytes ACKed
-    delivered_ms:         u64,           // timestamp of last delivery
     // Round counting
     round_count:          u64,
     next_round_delivered: u64,
@@ -385,7 +386,6 @@ impl BbrState {
             inflight_lo:          u32::MAX,
             inflight_hi:          u32::MAX,
             delivered:            0,
-            delivered_ms:         0,
             round_count:          0,
             next_round_delivered: 0,
             filled_pipe:          false,
@@ -964,7 +964,14 @@ impl TcpSocket {
     }
 
     /// Update BBR windowed-max bandwidth and cwnd after receiving ACKs.
-    fn bbr_on_ack(&mut self, acked_bytes: u64, rtt_ms: Option<u64>, now: u64) {
+    fn bbr_on_ack(
+        &mut self,
+        acked_bytes: u64,
+        rtt_ms: Option<u64>,
+        now: u64,
+        oldest_delivered: Option<u64>,
+        oldest_delivered_time: Option<u64>,
+    ) {
         if acked_bytes == 0 { return; }
 
         // Deliver accounting
@@ -981,10 +988,13 @@ impl TcpSocket {
             self.bbr.acked_bytes_round = 0;
         }
 
-        // Bandwidth sample: bytes delivered / time since oldest segment was sent.
-        if self.bbr.delivered_ms > 0 {
-            let elapsed_ms = now.saturating_sub(self.bbr.delivered_ms).max(1);
-            let bw_sample  = acked_bytes * 1_000 / elapsed_ms; // bytes/sec
+        // RFC 9438 §4.1 delivery rate: (C.delivered - P.delivered) /
+        // (C.delivered_time - P.delivered_time), where P is the snapshot
+        // from the oldest ACKed segment.
+        if let (Some(p_delivered), Some(p_time)) = (oldest_delivered, oldest_delivered_time) {
+            let interval_ms = now.saturating_sub(p_time).max(1);
+            let bytes_delivered = self.bbr.delivered.saturating_sub(p_delivered);
+            let bw_sample = bytes_delivered * 1_000 / interval_ms; // bytes/sec
             let n_rounds   = (self.cfg.bbr_bw_filter_rounds as usize).clamp(1, 10);
             let idx        = self.bbr.bw_sample_idx;
             self.bbr.bw_samples[idx] = BwSample { round: self.bbr.round_count, bw: bw_sample };
@@ -999,7 +1009,6 @@ impl TcpSocket {
                 .unwrap_or(bw_sample)
                 .max(bw_sample);
         }
-        self.bbr.delivered_ms = now;
 
         // Min RTT filter
         if let Some(rtt) = rtt_ms {
@@ -1156,7 +1165,9 @@ impl TcpSocket {
         let now          = self.clock.monotonic_ms();
         let mut acked    = 0u64;
         let mut rtt_sample: Option<u64> = None;
-        let mut min_dtime: Option<u64>  = None;
+        // RFC 9438 §4.1: track oldest ACKed segment's delivery snapshot
+        let mut oldest_delivered:      Option<u64> = None;
+        let mut oldest_delivered_time: Option<u64> = None;
         let old_snd_una  = self.snd_una;
 
         // Only process if ack advances snd_una
@@ -1175,10 +1186,10 @@ impl TcpSocket {
                 if seg.retransmits == 0 && rtt_sample.is_none() {
                     rtt_sample = Some(now.saturating_sub(seg.first_sent_ms));
                 }
-                if seg.dtime_at_send > 0
-                    && min_dtime.is_none_or(|t| seg.dtime_at_send < t)
-                {
-                    min_dtime = Some(seg.dtime_at_send);
+                // Keep the oldest (earliest-sent) delivery snapshot
+                if oldest_delivered_time.is_none_or(|t| seg.delivered_time_at_send < t) {
+                    oldest_delivered      = Some(seg.delivered_at_send);
+                    oldest_delivered_time = Some(seg.delivered_time_at_send);
                 }
                 // RACK: update rack_end_seq/xmit_ms/rtt from ACKed segment
                 if seq_gt(seg.end_seq, self.rack_end_seq) {
@@ -1247,12 +1258,9 @@ impl TcpSocket {
                 .min(self.cfg.rto_max_ms);
         }
 
-        // 5. BBRv3 bandwidth update
-        // Override delivered_ms if this is the first real delivery
-        if self.bbr.delivered_ms == 0 && acked > 0 {
-            self.bbr.delivered_ms = min_dtime.unwrap_or(now);
-        }
-        self.bbr_on_ack(acked, rtt_sample, now);
+        // 5. BBRv3 bandwidth update (RFC 9438 §4.1 delivery rate)
+        self.bbr_on_ack(acked, rtt_sample, now,
+                        oldest_delivered, oldest_delivered_time);
 
         // 6. RACK loss detection (RFC 8985 §7.2)
         let rack_rtt = if self.rack_rtt_ms > 0 { self.rack_rtt_ms } else { self.srtt_ms.max(1) };
@@ -1387,7 +1395,8 @@ impl TcpSocket {
                 last_sent_ms:     now,
                 retransmits:      0,
                 sacked:           false,
-                dtime_at_send:    self.bbr.delivered_ms,
+                delivered_at_send:      self.bbr.delivered,
+                delivered_time_at_send: now,
             });
             self.snd_nxt = seg_end;
 
@@ -1553,13 +1562,13 @@ impl TcpSocket {
                     self.snd_nxt += 1;
                     // Record SYN-ACK in unacked
                     let now = self.clock.monotonic_ms();
-                    if self.bbr.delivered_ms == 0 { self.bbr.delivered_ms = now; }
                     self.unacked.push(TxSegment {
                         seq: isn, end_seq: isn + 1,
                         flags: TcpFlags::SYN | TcpFlags::ACK, data: vec![],
                         first_sent_ms: now, last_sent_ms: now,
                         retransmits: 0, sacked: false,
-                        dtime_at_send: self.bbr.delivered_ms,
+                        delivered_at_send: self.bbr.delivered,
+                        delivered_time_at_send: now,
                     });
                     if !self.rto_deadline.is_armed() {
                         self.rto_deadline.arm_from_now(self.rto_ms, now);
@@ -1985,13 +1994,13 @@ impl TcpSocket {
         s.send_ctrl_opts(TcpFlags::SYN | TcpFlags::ECE | TcpFlags::CWR, &syn_opts)?;
         s.snd_nxt += 1;
         let now = s.clock.monotonic_ms();
-        if s.bbr.delivered_ms == 0 { s.bbr.delivered_ms = now; }
         s.unacked.push(TxSegment {
             seq: isn, end_seq: isn + 1,
             flags: TcpFlags::SYN, data: vec![],
             first_sent_ms: now, last_sent_ms: now,
             retransmits: 0, sacked: false,
-            dtime_at_send: 0,
+            delivered_at_send: 0,
+            delivered_time_at_send: now,
         });
         s.rto_deadline.arm_from_now(s.rto_ms, now);
         Ok(s)
@@ -2242,7 +2251,8 @@ impl TcpSocket {
             last_sent_ms:  now,
             retransmits:   0,
             sacked:        false,
-            dtime_at_send: self.bbr.delivered_ms,
+            delivered_at_send:      self.bbr.delivered,
+            delivered_time_at_send: now,
         });
         if !self.rto_deadline.is_armed() {
             self.rto_deadline.arm_from_now(self.rto_ms, now);
