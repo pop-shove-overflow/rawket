@@ -982,7 +982,7 @@ impl TcpSocket {
     /// Returns (pacing_gain_x100, cwnd_gain_x100) per spec §5.6.1 gains table.
     fn bbr_gains(&self) -> (ScaledFloat, ScaledFloat) {
         match self.bbr.phase {
-            BbrPhase::Startup      => (ScaledFloat::new(277), ScaledFloat::new(200)),
+            BbrPhase::Startup      => (ScaledFloat::new(289), ScaledFloat::new(200)),
             BbrPhase::Drain        => (ScaledFloat::new(35),  ScaledFloat::new(200)),
             BbrPhase::ProbeBwDown  => (ScaledFloat::new(90),  ScaledFloat::new(200)),
             BbrPhase::ProbeBwCruise=> (ScaledFloat::new(100), ScaledFloat::new(200)),
