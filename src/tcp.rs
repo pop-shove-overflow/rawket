@@ -2000,24 +2000,28 @@ impl TcpSocket {
                     });
                 } else if seq_gt(seg_seq, self.rcv_nxt) {
                     // Out-of-order: buffer and SACK
-                    if self.rx_ooo.len() < self.cfg.rx_ooo_max {
-                        // Check for duplicate
-                        let dup = self.rx_ooo.iter().any(|s| s.seq == seg_seq);
-                        if !dup {
-                            self.rx_ooo_last = Some(seg_seq);
-                            self.rx_ooo.push(RxOooSegment { seq: seg_seq, data: pdu.to_vec() });
-                            // Sort by seq
-                            self.rx_ooo.sort_by(|a, b| {
-                                if seq_lt(a.seq, b.seq) { core::cmp::Ordering::Less }
-                                else if a.seq == b.seq  { core::cmp::Ordering::Equal }
-                                else                    { core::cmp::Ordering::Greater }
-                            });
-                        }
+                    let dup = self.rx_ooo.iter().any(|s| s.seq == seg_seq);
+                    if !dup && self.rx_ooo.len() < self.cfg.rx_ooo_max {
+                        self.rx_ooo_last = Some(seg_seq);
+                        self.rx_ooo.push(RxOooSegment { seq: seg_seq, data: pdu.to_vec() });
+                        // Sort by seq
+                        self.rx_ooo.sort_by(|a, b| {
+                            if seq_lt(a.seq, b.seq) { core::cmp::Ordering::Less }
+                            else if a.seq == b.seq  { core::cmp::Ordering::Equal }
+                            else                    { core::cmp::Ordering::Greater }
+                        });
                     }
-                    // Send ACK with SACK
+                    // Send ACK with SACK (or D-SACK for OOO duplicates per RFC 2883 §3.2)
                     let mut sack_buf = [0u8; 40];
                     let max = self.max_sack_blocks();
-                    let sack_len = if self.sack_ok { self.build_sack_opts(&mut sack_buf, max) } else { 0 };
+                    let sack_len = if self.sack_ok {
+                        if dup && !pdu.is_empty() {
+                            let dsack_right = seg_seq + pdu.len() as u32;
+                            self.build_dsack_opts(&mut sack_buf, seg_seq, dsack_right, max)
+                        } else {
+                            self.build_sack_opts(&mut sack_buf, max)
+                        }
+                    } else { 0 };
                     self.send_ack_with_opts(&sack_buf[..sack_len])?;
                 }
                 // else: seq < rcv_nxt (retransmit of already-received data) → ACK only
