@@ -388,6 +388,22 @@ impl Network<AfPacketSocket> {
     }
 }
 
+impl Uplink<VirtualLink> {
+    /// Wire this uplink's [`VirtualLink`] to an external link, then update
+    /// every attached interface's TX closure to point at `link`'s RX queue.
+    ///
+    /// Used by [`Network::bridge`] to wire uplinks to a [`crate::bridge::Bridge`].
+    #[cfg(feature = "test-internals")]
+    pub fn connect_to_link(&mut self, link: &mut VirtualLink) -> Result<()> {
+        crate::virtual_link::connect(&mut self.sock, link);
+        let tx = self.sock.open_tx()?;
+        for iface in &mut self.interfaces {
+            iface.set_tx(tx.clone());
+        }
+        Ok(())
+    }
+}
+
 impl Network<VirtualLink> {
     /// Create a virtual interface with the given MAC address.
     ///
@@ -438,6 +454,25 @@ impl Network<VirtualLink> {
         }
 
         Ok(())
+    }
+
+    /// Insert a software [`Bridge`](crate::bridge::Bridge) between two
+    /// virtual uplinks, replacing any direct peer-to-peer wire.
+    ///
+    /// After this call frames sent by `a`'s sockets go into the bridge's A
+    /// side, and frames sent by `b`'s sockets go into the bridge's B side.
+    /// Call [`Bridge::deliver_a_to_b`](crate::bridge::Bridge::deliver_a_to_b)
+    /// / [`deliver_b_to_a`](crate::bridge::Bridge::deliver_b_to_a) to
+    /// forward frames through the bridge (with any configured impairments).
+    #[cfg(feature = "test-internals")]
+    pub fn bridge(
+        a: &mut Uplink<VirtualLink>,
+        b: &mut Uplink<VirtualLink>,
+    ) -> Result<crate::bridge::Bridge> {
+        let mut bridge = crate::bridge::Bridge::new();
+        a.connect_to_link(bridge.link_a_mut())?;
+        b.connect_to_link(bridge.link_b_mut())?;
+        Ok(bridge)
     }
 }
 

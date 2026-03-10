@@ -23,6 +23,11 @@ pub mod timers;
 pub mod udp;
 pub mod virtual_link;
 
+#[cfg(feature = "test-internals")]
+pub mod filter;
+#[cfg(feature = "test-internals")]
+pub mod bridge;
+
 pub use network::{Network, NetworkConfig, Uplink};
 pub use af_packet::AfPacketSocket;
 pub use timers::Clock;

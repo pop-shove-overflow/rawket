@@ -24,10 +24,11 @@ default = ["std"]
 std = []
 # Expose internal TcpSocket fields via accessor methods.  Intended for
 # system-test-validator; never enabled in production builds.
-test-internals = []
+test-internals = ["std", "dep:etherparse"]
 
 [dependencies]
 libc = { version = "0.2", default-features = false }
+etherparse = { version = "0.19", optional = true }
 
 [profile.dev]
 panic = "abort"
