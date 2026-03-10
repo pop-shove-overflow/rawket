@@ -39,7 +39,7 @@ use crate::{
         MIN_HDR_LEN as IP_HDR_LEN,
         checksum_add, checksum_finish, pseudo_header_acc,
     },
-    af_packet::{AfPacketSocket, FRAME_SIZE},
+    af_packet::FRAME_SIZE,
     tcp::{self, SeqNum, TcpFlags, TcpHdr, HDR_LEN as TCP_HDR_LEN, TcpSocket},
     timers::{Clock, Deadline, Timers},
 
@@ -465,38 +465,6 @@ impl Interface {
             checksum_validate_tcp: cfg.checksum_validate_tcp,
             checksum_validate_udp: cfg.checksum_validate_udp,
         }
-    }
-
-    /// Resolve `uplink`'s kernel interface index and create an AF_PACKET-backed
-    /// interface with the given MAC.
-    /// `uplink` must be a NUL-terminated byte slice (e.g. `b"eth0\0"`).
-    ///
-    /// No AF_PACKET socket is opened here.  Attach this interface to a shared
-    /// [`AfPacketSocket`] via [`Uplink::attach`](crate::Uplink::attach).
-    pub fn afpacket(uplink: &[u8], mac: MacAddr) -> Result<Self> {
-        let kernel_ifindex = AfPacketSocket::kernel_ifindex(uplink)?;
-        let mut ifname_buf = [0u8; 16];
-        let len = uplink.len().min(16);
-        ifname_buf[..len].copy_from_slice(&uplink[..len]);
-        let clock: Clock = Default::default();
-        Ok(Interface {
-            ifname_buf,
-            mac,
-            ifindex:        IfIndex::alloc(),
-            kernel_ifindex: Some(kernel_ifindex),
-            ip: None,
-            tx_id: 0,
-            tx:      Rc::new(|_| Ok(())),
-            arp:     ArpQueue::new(DEFAULT_ARP_MAX_AGE_MS, clock.clone()),
-            reasm:   Rc::new(RefCell::new(ReassemblyTable::new(
-                DEFAULT_FRAG_MEM_LIMIT, DEFAULT_FRAG_TIMEOUT_MS, clock.clone(),
-            ))),
-            icmp_rl: IcmpRateLimit::new(100),
-            clock,
-            checksum_validate_ip:  false,
-            checksum_validate_tcp: false,
-            checksum_validate_udp: false,
-        })
     }
 
     /// Create a dummy interface that is not backed by a real kernel interface.
