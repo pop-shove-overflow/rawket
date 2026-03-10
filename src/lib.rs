@@ -21,10 +21,12 @@ pub mod af_packet;
 pub mod tcp;
 pub mod timers;
 pub mod udp;
+pub mod virtual_link;
 
 pub use network::{Network, NetworkConfig, Uplink};
 pub use af_packet::AfPacketSocket;
 pub use timers::Clock;
+pub use virtual_link::VirtualLink;
 
 // ── no_std runtime ────────────────────────────────────────────────────────────
 //
