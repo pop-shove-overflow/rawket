@@ -12,12 +12,13 @@ use core::net::Ipv4Addr;
 use crate::{
     arp_cache,
     eth::MacAddr,
-    interface::Interface,
+    interface::{Interface, InterfaceConfig},
     ip::Ipv4Cidr,
     af_packet::{AfPacketSocket, EtherLink, FRAME_SIZE},
     tcp::{TcpConfig, TcpSocket},
     timers::{Clock, Timers},
     udp::UdpSocket,
+    virtual_link::VirtualLink,
     Error, Result,
 };
 use alloc::{boxed::Box, vec::Vec};
@@ -210,59 +211,27 @@ struct EthEntry {
 /// One physical uplink: a shared [`EtherLink`], the L3 [`Interface`]s
 /// multiplexed over it, and the L4 sockets registered on those interfaces.
 pub struct Uplink<L: EtherLink> {
-    sock:                    L,
-    interfaces:              Vec<Interface>,
-    udp_sockets:             Vec<UdpSocket>,
-    tcp_sockets:             Vec<TcpSocket>,
-    standalone_tcp:          Vec<TcpSocket>,
-    arp_cache_max_age_ms:    u64,
-    arp_cache_max_entries:   usize,
-    arp_queue_max_pending:   usize,
-    ip_frag_timeout_ms:      u64,
-    ip_frag_mem_limit:       usize,
-    ip_frag_per_src_max:     usize,
-    icmp_rate_limit_per_sec: u32,
-    checksum_validate_ip:    bool,
-    checksum_validate_tcp:   bool,
-    checksum_validate_udp:   bool,
-    eth_callbacks:           Vec<EthEntry>,
-    next_eth_id:             usize,
-    clock:                   Clock,
+    sock:           L,
+    interfaces:     Vec<Interface>,
+    udp_sockets:    Vec<UdpSocket>,
+    tcp_sockets:    Vec<TcpSocket>,
+    standalone_tcp: Vec<TcpSocket>,
+    eth_callbacks:  Vec<EthEntry>,
+    next_eth_id:    usize,
 }
 
 impl<L: EtherLink> Uplink<L> {
     /// Attach `iface` to this uplink.
     ///
-    /// - Registers the interface's MAC in the socket's BPF filter.
-    /// - Injects the network-wide clock into the interface.
-    /// - Applies [`NetworkConfig::arp_cache_max_age_ms`] to the interface's
-    ///   ARP cache.
-    /// - Installs a recurring ARP cache expiry timer.
+    /// The interface must already be fully configured (via
+    /// [`Interface::with_config`]).  This method
+    /// registers the MAC in the BPF filter, wires the TX closure, and
+    /// installs the recurring ARP-expiry and fragment-purge timers.
     pub fn attach(&mut self, mut iface: Interface, timers: &mut Timers) -> Result<()> {
         self.sock.attach_mac(&iface.mac())?;
-        iface.set_clock(self.clock.clone());
         iface.set_tx(self.sock.open_tx()?);
-        // Apply network-wide ARP settings and install the recurring expiry timer.
-        iface.arp_queue().set_max_age_ms(self.arp_cache_max_age_ms);
-        iface.arp_queue().set_max_entries(self.arp_cache_max_entries);
-        iface.arp_queue().set_max_pending_per_ip(self.arp_queue_max_pending);
         arp_cache::schedule_expiry(iface.arp_queue().clone(), timers);
-        // Apply network-wide fragment-reassembly settings and install the
-        // periodic purge timer.
-        iface.set_frag_config(
-            self.ip_frag_timeout_ms,
-            self.ip_frag_mem_limit,
-            self.ip_frag_per_src_max,
-        );
         iface.schedule_frag_purge(timers);
-        // Apply ICMP rate limit.
-        iface.set_icmp_rate_limit(self.icmp_rate_limit_per_sec);
-        // Apply checksum validation settings.
-        iface.set_checksum_validation(
-            self.checksum_validate_ip,
-            self.checksum_validate_tcp,
-            self.checksum_validate_udp,
-        );
         self.interfaces.push(iface);
         Ok(())
     }
@@ -394,7 +363,81 @@ impl Default for Network<AfPacketSocket> {
 impl Network<AfPacketSocket> {
     /// Create a network runtime with default configuration and the Linux clock.
     pub fn new() -> Self {
-        Self::with_config(NetworkConfig::default(), Clock::default())
+        Self::with_config(NetworkConfig::default(), Default::default())
+    }
+
+    /// One-step interface creation: resolve kernel ifindex, open an
+    /// [`AfPacketSocket`], create a fully-configured [`Interface`], and attach
+    /// it to a new uplink.
+    ///
+    /// Returns the uplink index on success.
+    pub fn add_interface_afpacket(
+        &mut self,
+        ifname: &[u8],
+        mac: MacAddr,
+    ) -> Result<usize> {
+        let kernel_ifindex = AfPacketSocket::kernel_ifindex(ifname)?;
+        let sock = AfPacketSocket::open(kernel_ifindex)?;
+        let iface = Interface::with_config(
+            ifname,
+            mac,
+            Some(kernel_ifindex),
+            self.interface_config(),
+        );
+        self.add_uplink_and_attach(sock, iface)
+    }
+}
+
+impl Network<VirtualLink> {
+    /// Create a virtual interface with the given MAC address.
+    ///
+    /// The link starts disconnected (no peer).  Use
+    /// [`Network::connect_virtual`] to wire two uplinks together after both
+    /// have been created (possibly on different networks with independent
+    /// clocks).
+    ///
+    /// Returns the uplink index on success.
+    pub fn add_interface_virtual(&mut self, mac: MacAddr) -> Result<usize> {
+        let link = VirtualLink::new();
+        let iface = Interface::with_config(
+            b"virt\0",
+            mac,
+            None,
+            self.interface_config(),
+        );
+        self.add_uplink_and_attach(link, iface)
+    }
+
+    /// Wire two virtual uplinks together so that frames sent on one are
+    /// received on the other.
+    ///
+    /// The two uplinks may belong to different [`Network`]s (e.g. with
+    /// independent clocks for deterministic testing).  After this call the TX
+    /// closure on every attached [`Interface`] is rewired to point at the
+    /// peer's RX queue.
+    ///
+    /// ```ignore
+    /// Network::connect_virtual(
+    ///     net_a.uplink_mut(0),
+    ///     net_b.uplink_mut(0),
+    /// )?;
+    /// ```
+    pub fn connect_virtual(
+        a: &mut Uplink<VirtualLink>,
+        b: &mut Uplink<VirtualLink>,
+    ) -> Result<()> {
+        crate::virtual_link::connect(&mut a.sock, &mut b.sock);
+
+        let tx_a = a.sock.open_tx()?;
+        for iface in &mut a.interfaces {
+            iface.set_tx(tx_a.clone());
+        }
+        let tx_b = b.sock.open_tx()?;
+        for iface in &mut b.interfaces {
+            iface.set_tx(tx_b.clone());
+        }
+
+        Ok(())
     }
 }
 
@@ -410,15 +453,10 @@ impl<L: EtherLink> Network<L> {
         }
     }
 
-    /// Register an [`EtherLink`] as an uplink and return a mutable reference
-    /// to the new [`Uplink`] so the caller can immediately attach interfaces.
-    pub fn add_uplink(&mut self, sock: L) -> &mut Uplink<L> {
-        self.uplinks.push(Uplink {
-            sock,
-            interfaces:              Vec::new(),
-            udp_sockets:             Vec::new(),
-            tcp_sockets:             Vec::new(),
-            standalone_tcp:          Vec::new(),
+    /// Bundle the network-wide configuration and clock into an
+    /// [`InterfaceConfig`] for constructing a new [`Interface`].
+    pub(crate) fn interface_config(&self) -> InterfaceConfig {
+        InterfaceConfig {
             arp_cache_max_age_ms:    self.config.arp_cache_max_age_ms,
             arp_cache_max_entries:   self.config.arp_cache_max_entries,
             arp_queue_max_pending:   self.config.arp_queue_max_pending,
@@ -429,9 +467,21 @@ impl<L: EtherLink> Network<L> {
             checksum_validate_ip:    self.config.checksum_validate_ip,
             checksum_validate_tcp:   self.config.checksum_validate_tcp,
             checksum_validate_udp:   self.config.checksum_validate_udp,
-            eth_callbacks:           Vec::new(),
-            next_eth_id:             0,
             clock:                   self.clock.clone(),
+        }
+    }
+
+    /// Register an [`EtherLink`] as an uplink and return a mutable reference
+    /// to the new [`Uplink`] so the caller can immediately attach interfaces.
+    pub fn add_uplink(&mut self, sock: L) -> &mut Uplink<L> {
+        self.uplinks.push(Uplink {
+            sock,
+            interfaces:     Vec::new(),
+            udp_sockets:    Vec::new(),
+            tcp_sockets:    Vec::new(),
+            standalone_tcp: Vec::new(),
+            eth_callbacks:  Vec::new(),
+            next_eth_id:    0,
         });
         self.uplinks.last_mut().unwrap()
     }
@@ -459,6 +509,14 @@ impl<L: EtherLink> Network<L> {
 
     pub fn uplinks_mut(&mut self) -> &mut [Uplink<L>] {
         &mut self.uplinks
+    }
+
+    /// Return a mutable reference to the uplink at `idx`.
+    ///
+    /// # Panics
+    /// Panics if `idx` is out of bounds.
+    pub fn uplink_mut(&mut self, idx: usize) -> &mut Uplink<L> {
+        &mut self.uplinks[idx]
     }
 
     /// Return disjoint mutable references to the uplinks vec and the timers.

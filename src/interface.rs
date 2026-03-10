@@ -39,7 +39,7 @@ use crate::{
         MIN_HDR_LEN as IP_HDR_LEN,
         checksum_add, checksum_finish, pseudo_header_acc,
     },
-    af_packet::{AfPacketSocket, FRAME_SIZE},
+    af_packet::FRAME_SIZE,
     tcp::{self, SeqNum, TcpFlags, TcpHdr, HDR_LEN as TCP_HDR_LEN, TcpSocket},
     timers::{Clock, Deadline, Timers},
 
@@ -47,18 +47,6 @@ use crate::{
     Result,
 };
 
-/// Default ARP cache entry lifetime used when an `Interface` is first created.
-/// Overridden by [`NetworkConfig::arp_cache_max_age_ms`] when the interface is
-/// attached to an [`Uplink`](crate::Uplink).
-const DEFAULT_ARP_MAX_AGE_MS: u64 = 20_000;
-
-/// Default fragment-reassembly timeout (ms). Overridden by
-/// [`NetworkConfig::ip_frag_timeout_ms`].
-const DEFAULT_FRAG_TIMEOUT_MS: u64 = 30_000;
-
-/// Default fragment-reassembly memory limit (bytes). Overridden by
-/// [`NetworkConfig::ip_frag_mem_limit`].
-const DEFAULT_FRAG_MEM_LIMIT: usize = 65_536;
 
 // ── Fragment reassembly ───────────────────────────────────────────────────────
 
@@ -389,7 +377,7 @@ pub struct Interface {
     reasm:      Rc<RefCell<ReassemblyTable>>,
     /// Token-bucket rate limiter for outbound ICMP Unreachable messages.
     icmp_rl:    IcmpRateLimit,
-    /// Time source — injected by [`Uplink::attach`] via [`set_clock`].
+    /// Time source — set at construction via [`with_config`].
     clock:      Clock,
     /// Validate IPv4 header checksum on RX.
     pub(crate) checksum_validate_ip:  bool,
@@ -399,65 +387,74 @@ pub struct Interface {
     pub(crate) checksum_validate_udp: bool,
 }
 
+/// Configuration bundle for [`Interface::with_config`].
+///
+/// Constructed by [`Network::interface_config`](crate::network::Network) to
+/// shuttle the network-wide settings into a new interface without requiring
+/// the caller to destructure [`NetworkConfig`](crate::network::NetworkConfig).
+pub(crate) struct InterfaceConfig {
+    pub arp_cache_max_age_ms:    u64,
+    pub arp_cache_max_entries:   usize,
+    pub arp_queue_max_pending:   usize,
+    pub ip_frag_timeout_ms:      u64,
+    pub ip_frag_mem_limit:       usize,
+    pub ip_frag_per_src_max:     usize,
+    pub icmp_rate_limit_per_sec: u32,
+    pub checksum_validate_ip:    bool,
+    pub checksum_validate_tcp:   bool,
+    pub checksum_validate_udp:   bool,
+    pub clock:                   Clock,
+}
+
 impl Interface {
-    /// Resolve `uplink`'s kernel interface index and create an AF_PACKET-backed
-    /// interface with the given MAC.
-    /// `uplink` must be a NUL-terminated byte slice (e.g. `b"eth0\0"`).
+    /// Create an interface with all configuration applied from the start.
     ///
-    /// No AF_PACKET socket is opened here.  Attach this interface to a shared
-    /// [`AfPacketSocket`] via [`Uplink::attach`](crate::Uplink::attach).
-    pub fn afpacket(uplink: &[u8], mac: MacAddr) -> Result<Self> {
-        let kernel_ifindex = AfPacketSocket::kernel_ifindex(uplink)?;
+    /// `ifname` is a NUL-terminated byte slice (e.g. `b"eth0\0"`).
+    /// `kernel_ifindex` is the Linux kernel interface index (`Some` for real
+    /// interfaces, `None` for dummies).
+    ///
+    /// The returned interface has its ARP cache, fragment reassembly table,
+    /// ICMP rate limiter, and checksum validation flags initialised to the
+    /// values from `cfg`, so [`Uplink::attach`](crate::Uplink::attach) does not
+    /// need to reconfigure them.
+    pub(crate) fn with_config(
+        ifname: &[u8],
+        mac: MacAddr,
+        kernel_ifindex: Option<i32>,
+        cfg: InterfaceConfig,
+    ) -> Self {
         let mut ifname_buf = [0u8; 16];
-        let len = uplink.len().min(16);
-        ifname_buf[..len].copy_from_slice(&uplink[..len]);
-        let clock = Clock::default();
-        Ok(Interface {
+        let len = ifname.len().min(16);
+        ifname_buf[..len].copy_from_slice(&ifname[..len]);
+        let clock = cfg.clock;
+        let arp = ArpQueue::new(cfg.arp_cache_max_age_ms, clock.clone());
+        arp.set_max_entries(cfg.arp_cache_max_entries);
+        arp.set_max_pending_per_ip(cfg.arp_queue_max_pending);
+        let reasm = {
+            let mut rt = ReassemblyTable::new(
+                cfg.ip_frag_mem_limit, cfg.ip_frag_timeout_ms, clock.clone(),
+            );
+            rt.per_src_max = cfg.ip_frag_per_src_max;
+            Rc::new(RefCell::new(rt))
+        };
+        Interface {
             ifname_buf,
             mac,
             ifindex:        IfIndex::alloc(),
-            kernel_ifindex: Some(kernel_ifindex),
-            ip: None,
-            tx_id: 0,
-            tx:      Rc::new(|_| Ok(())),
-            arp:     ArpQueue::new(DEFAULT_ARP_MAX_AGE_MS, clock.clone()),
-            reasm:   Rc::new(RefCell::new(ReassemblyTable::new(
-                DEFAULT_FRAG_MEM_LIMIT, DEFAULT_FRAG_TIMEOUT_MS, clock.clone(),
-            ))),
-            icmp_rl: IcmpRateLimit::new(100),
-            clock,
-            checksum_validate_ip:  false,
-            checksum_validate_tcp: false,
-            checksum_validate_udp: false,
-        })
-    }
-
-    /// Create a dummy interface that is not backed by a real kernel interface.
-    ///
-    /// Useful when the uplink is an [`EtherLink`](crate::af_packet::EtherLink)
-    /// that does not require kernel packet-socket registration (e.g. an
-    /// in-process virtual wire used in tests).
-    pub fn dummy(mac: MacAddr) -> Self {
-        let clock = Clock::default();
-        Interface {
-            ifname_buf:     [0u8; 16],
-            mac,
-            ifindex:        IfIndex::alloc(),
-            kernel_ifindex: None,
+            kernel_ifindex,
             ip:             None,
             tx_id:          0,
             tx:             Rc::new(|_| Ok(())),
-            arp:            ArpQueue::new(DEFAULT_ARP_MAX_AGE_MS, clock.clone()),
-            reasm:          Rc::new(RefCell::new(ReassemblyTable::new(
-                DEFAULT_FRAG_MEM_LIMIT, DEFAULT_FRAG_TIMEOUT_MS, clock.clone(),
-            ))),
-            icmp_rl:        IcmpRateLimit::new(100),
+            arp,
+            reasm,
+            icmp_rl:        IcmpRateLimit::new(cfg.icmp_rate_limit_per_sec),
             clock,
-            checksum_validate_ip:  false,
-            checksum_validate_tcp: false,
-            checksum_validate_udp: false,
+            checksum_validate_ip:  cfg.checksum_validate_ip,
+            checksum_validate_tcp: cfg.checksum_validate_tcp,
+            checksum_validate_udp: cfg.checksum_validate_udp,
         }
     }
+
 }
 
 impl Interface {
@@ -513,17 +510,6 @@ impl Interface {
         Rc::clone(&self.tx)
     }
 
-    /// Inject the network-wide shared clock.
-    ///
-    /// Called by [`Uplink::attach`](crate::Uplink::attach) so that this
-    /// interface and all objects derived from it use the same time source.
-    /// Must be called before any sockets are created from this interface.
-    pub(crate) fn set_clock(&mut self, clock: Clock) {
-        self.clock = clock.clone();
-        self.arp.set_clock(clock.clone());
-        self.reasm.borrow_mut().clock = clock;
-    }
-
     /// Return a reference to the clock driving this interface.
     ///
     /// Socket constructors clone it to propagate the time source.
@@ -554,27 +540,6 @@ impl Interface {
     /// permanent entry that survives expiry.
     pub fn seed_arp(&mut self, ip: Ipv4Addr, mac: MacAddr) {
         self.arp.insert(ip, mac);
-    }
-
-    /// Override the fragment-reassembly settings applied by
-    /// [`Uplink::attach`](crate::Uplink::attach).
-    pub(crate) fn set_frag_config(&mut self, timeout_ms: u64, mem_limit: usize, per_src_max: usize) {
-        let mut t        = self.reasm.borrow_mut();
-        t.timeout_ms     = timeout_ms;
-        t.mem_limit      = mem_limit;
-        t.per_src_max    = per_src_max;
-    }
-
-    /// Set the ICMP Unreachable rate limit (tokens per second; 0 = unlimited).
-    pub(crate) fn set_icmp_rate_limit(&mut self, rate_per_sec: u32) {
-        self.icmp_rl = IcmpRateLimit::new(rate_per_sec);
-    }
-
-    /// Set per-protocol checksum validation flags.
-    pub(crate) fn set_checksum_validation(&mut self, ip: bool, tcp: bool, udp: bool) {
-        self.checksum_validate_ip  = ip;
-        self.checksum_validate_tcp = tcp;
-        self.checksum_validate_udp = udp;
     }
 
     /// Install a 1-second periodic timer that purges timed-out reassembly
