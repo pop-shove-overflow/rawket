@@ -12,7 +12,7 @@ use core::net::Ipv4Addr;
 use crate::{
     arp_cache,
     eth::MacAddr,
-    interface::Interface,
+    interface::{Interface, InterfaceConfig},
     ip::Ipv4Cidr,
     af_packet::{AfPacketSocket, EtherLink, FRAME_SIZE},
     tcp::{TcpConfig, TcpSocket},
@@ -394,7 +394,28 @@ impl Default for Network<AfPacketSocket> {
 impl Network<AfPacketSocket> {
     /// Create a network runtime with default configuration and the Linux clock.
     pub fn new() -> Self {
-        Self::with_config(NetworkConfig::default(), Clock::default())
+        Self::with_config(NetworkConfig::default(), Default::default())
+    }
+
+    /// One-step interface creation: resolve kernel ifindex, open an
+    /// [`AfPacketSocket`], create a fully-configured [`Interface`], and attach
+    /// it to a new uplink.
+    ///
+    /// Returns the uplink index on success.
+    pub fn add_interface_afpacket(
+        &mut self,
+        ifname: &[u8],
+        mac: MacAddr,
+    ) -> Result<usize> {
+        let kernel_ifindex = AfPacketSocket::kernel_ifindex(ifname)?;
+        let sock = AfPacketSocket::open(kernel_ifindex)?;
+        let iface = Interface::with_config(
+            ifname,
+            mac,
+            Some(kernel_ifindex),
+            self.interface_config(),
+        );
+        self.add_uplink_and_attach(sock, iface)
     }
 }
 
@@ -407,6 +428,24 @@ impl<L: EtherLink> Network<L> {
             timers:  Timers::new(clock.clone()),
             routes:  Vec::new(),
             clock,
+        }
+    }
+
+    /// Bundle the network-wide configuration and clock into an
+    /// [`InterfaceConfig`] for constructing a new [`Interface`].
+    pub(crate) fn interface_config(&self) -> InterfaceConfig {
+        InterfaceConfig {
+            arp_cache_max_age_ms:    self.config.arp_cache_max_age_ms,
+            arp_cache_max_entries:   self.config.arp_cache_max_entries,
+            arp_queue_max_pending:   self.config.arp_queue_max_pending,
+            ip_frag_timeout_ms:      self.config.ip_frag_timeout_ms,
+            ip_frag_mem_limit:       self.config.ip_frag_mem_limit,
+            ip_frag_per_src_max:     self.config.ip_frag_per_src_max,
+            icmp_rate_limit_per_sec: self.config.icmp_rate_limit_per_sec,
+            checksum_validate_ip:    self.config.checksum_validate_ip,
+            checksum_validate_tcp:   self.config.checksum_validate_tcp,
+            checksum_validate_udp:   self.config.checksum_validate_udp,
+            clock:                   self.clock.clone(),
         }
     }
 

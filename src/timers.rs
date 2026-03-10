@@ -187,7 +187,7 @@ pub struct Timers {
 }
 
 impl Default for Timers {
-    fn default() -> Self { Self::new(Clock::default()) }
+    fn default() -> Self { Self::new(Default::default()) }
 }
 
 impl Timers {

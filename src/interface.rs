@@ -399,7 +399,74 @@ pub struct Interface {
     pub(crate) checksum_validate_udp: bool,
 }
 
+/// Configuration bundle for [`Interface::with_config`].
+///
+/// Constructed by [`Network::interface_config`](crate::network::Network) to
+/// shuttle the network-wide settings into a new interface without requiring
+/// the caller to destructure [`NetworkConfig`](crate::network::NetworkConfig).
+pub(crate) struct InterfaceConfig {
+    pub arp_cache_max_age_ms:    u64,
+    pub arp_cache_max_entries:   usize,
+    pub arp_queue_max_pending:   usize,
+    pub ip_frag_timeout_ms:      u64,
+    pub ip_frag_mem_limit:       usize,
+    pub ip_frag_per_src_max:     usize,
+    pub icmp_rate_limit_per_sec: u32,
+    pub checksum_validate_ip:    bool,
+    pub checksum_validate_tcp:   bool,
+    pub checksum_validate_udp:   bool,
+    pub clock:                   Clock,
+}
+
 impl Interface {
+    /// Create an interface with all configuration applied from the start.
+    ///
+    /// `ifname` is a NUL-terminated byte slice (e.g. `b"eth0\0"`).
+    /// `kernel_ifindex` is the Linux kernel interface index (`Some` for real
+    /// interfaces, `None` for dummies).
+    ///
+    /// The returned interface has its ARP cache, fragment reassembly table,
+    /// ICMP rate limiter, and checksum validation flags initialised to the
+    /// values from `cfg`, so [`Uplink::attach`](crate::Uplink::attach) does not
+    /// need to reconfigure them.
+    pub(crate) fn with_config(
+        ifname: &[u8],
+        mac: MacAddr,
+        kernel_ifindex: Option<i32>,
+        cfg: InterfaceConfig,
+    ) -> Self {
+        let mut ifname_buf = [0u8; 16];
+        let len = ifname.len().min(16);
+        ifname_buf[..len].copy_from_slice(&ifname[..len]);
+        let clock = cfg.clock;
+        let arp = ArpQueue::new(cfg.arp_cache_max_age_ms, clock.clone());
+        arp.set_max_entries(cfg.arp_cache_max_entries);
+        arp.set_max_pending_per_ip(cfg.arp_queue_max_pending);
+        let reasm = {
+            let mut rt = ReassemblyTable::new(
+                cfg.ip_frag_mem_limit, cfg.ip_frag_timeout_ms, clock.clone(),
+            );
+            rt.per_src_max = cfg.ip_frag_per_src_max;
+            Rc::new(RefCell::new(rt))
+        };
+        Interface {
+            ifname_buf,
+            mac,
+            ifindex:        IfIndex::alloc(),
+            kernel_ifindex,
+            ip:             None,
+            tx_id:          0,
+            tx:             Rc::new(|_| Ok(())),
+            arp,
+            reasm,
+            icmp_rl:        IcmpRateLimit::new(cfg.icmp_rate_limit_per_sec),
+            clock,
+            checksum_validate_ip:  cfg.checksum_validate_ip,
+            checksum_validate_tcp: cfg.checksum_validate_tcp,
+            checksum_validate_udp: cfg.checksum_validate_udp,
+        }
+    }
+
     /// Resolve `uplink`'s kernel interface index and create an AF_PACKET-backed
     /// interface with the given MAC.
     /// `uplink` must be a NUL-terminated byte slice (e.g. `b"eth0\0"`).
@@ -411,7 +478,7 @@ impl Interface {
         let mut ifname_buf = [0u8; 16];
         let len = uplink.len().min(16);
         ifname_buf[..len].copy_from_slice(&uplink[..len]);
-        let clock = Clock::default();
+        let clock: Clock = Default::default();
         Ok(Interface {
             ifname_buf,
             mac,
@@ -438,7 +505,7 @@ impl Interface {
     /// that does not require kernel packet-socket registration (e.g. an
     /// in-process virtual wire used in tests).
     pub fn dummy(mac: MacAddr) -> Self {
-        let clock = Clock::default();
+        let clock: Clock = Default::default();
         Interface {
             ifname_buf:     [0u8; 16],
             mac,
