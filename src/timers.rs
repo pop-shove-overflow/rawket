@@ -7,6 +7,17 @@
 /// directly as the `poll(2)` timeout.
 use alloc::{boxed::Box, vec::Vec};
 
+// ── Wall-clock helper ─────────────────────────────────────────────────────────
+
+/// Return the current CLOCK_MONOTONIC time in milliseconds.
+///
+/// Used by bridge.rs for delay-queue timestamps.
+pub fn now_ms() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000 + ts.tv_nsec as u64 / 1_000_000
+}
+
 // ── Clock (production) ───────────────────────────────────────────────────────
 
 #[cfg(not(feature = "test-internals"))]
