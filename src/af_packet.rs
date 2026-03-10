@@ -66,7 +66,7 @@ struct Tpacket2Hdr {
 ///
 /// Implemented by [`AfPacketSocket`] (production AF_PACKET ring) and by
 /// `VirtualLink` (in-process wire used by the system-test-validator).
-pub trait EtherLink {
+pub(crate) trait EtherLink {
     /// Poll for one received frame. Returns a borrowed slice into an internal
     /// buffer. Caller MUST call [`rx_release`] before the next [`rx_recv`].
     fn rx_recv(&mut self) -> Option<&[u8]>;
@@ -224,6 +224,10 @@ pub struct AfPacketSocket {
 unsafe impl Send for AfPacketSocket {}
 
 impl AfPacketSocket {
+    pub(crate) fn kernel_ifindex(&self) -> i32 {
+        self.kernel_ifindex
+    }
+
     pub fn open(ifindex: i32) -> Result<Self> {
         let fd = unsafe {
             libc::socket(
@@ -317,7 +321,7 @@ impl AfPacketSocket {
     }
 
     /// Look up the kernel interface index for `ifname` (NUL-terminated C string).
-    pub fn kernel_ifindex(ifname: &[u8]) -> Result<i32> {
+    pub fn lookup_kernel_ifindex(ifname: &[u8]) -> Result<i32> {
         let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
         if fd < 0 {
             return Err(Error::last_os());

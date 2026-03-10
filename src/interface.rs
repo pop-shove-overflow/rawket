@@ -9,7 +9,7 @@
 /// [`Uplink::attach`](crate::Uplink::attach).  All sockets created from this
 /// interface clone that `Rc` so they share the same TX path.  In tests the
 /// closure is replaced with a `VirtualLink` callback before attaching.
-use alloc::{rc::Rc, vec, vec::Vec};
+use alloc::{collections::VecDeque, rc::Rc, vec, vec::Vec};
 use core::cell::RefCell;
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -354,6 +354,46 @@ impl ReassemblyTable {
     }
 }
 
+// ── FrameQueue ────────────────────────────────────────────────────────────────
+
+/// A shared, clonable queue of raw Ethernet frames.
+///
+/// Used by bridge-side interfaces to inject frames from outside the AF_PACKET
+/// ring into an [`Interface`]'s RX path.  For real (AF_PACKET) uplinks the
+/// queue is present but never written to — `poll()` drains it as a no-op.
+#[derive(Clone, Default)]
+pub struct FrameQueue(Rc<RefCell<VecDeque<Vec<u8>>>>);
+
+impl FrameQueue {
+    /// Append `frame` to the back of the queue.
+    ///
+    /// Called by bridge code to inject frames into an interface's RX path
+    /// without going through the AF_PACKET ring.
+    pub fn push(&self, frame: &[u8]) {
+        self.0.borrow_mut().push_back(frame.to_vec());
+    }
+
+    /// Remove and return the front frame, or `None` if empty.
+    pub fn pop(&self) -> Option<Vec<u8>> {
+        self.0.borrow_mut().pop_front()
+    }
+
+    /// Return `true` when the queue contains no frames.
+    pub fn is_empty(&self) -> bool {
+        self.0.borrow().is_empty()
+    }
+}
+
+
+// ── EthSocket ─────────────────────────────────────────────────────────────────
+
+/// Entry in the per-interface Ethernet-tap table.
+#[allow(clippy::type_complexity)]
+pub(crate) struct EthSocket {
+    pub(crate) id:       usize,
+    pub(crate) callback: Box<dyn Fn(&[u8])>,
+}
+
 // ── Interface ─────────────────────────────────────────────────────────────────
 
 pub struct Interface {
@@ -385,6 +425,18 @@ pub struct Interface {
     pub(crate) checksum_validate_tcp: bool,
     /// Validate UDP checksum on RX.
     pub(crate) checksum_validate_udp: bool,
+    /// Per-interface Ethernet tap sockets, fired before ARP/IP dispatch.
+    eth_sockets:  Vec<EthSocket>,
+    next_eth_id:    usize,
+    /// UDP sockets registered on this interface for inbound dispatch.
+    pub(crate) udp_sockets:    Vec<UdpSocket>,
+    /// TCP sockets registered on this interface (both passive-accept and connect/listen).
+    pub(crate) tcp_sockets:    Vec<TcpSocket>,
+    /// Inject queue for bridge RX frames.
+    ///
+    /// AF_PACKET uplinks never write to this queue; it is drained by
+    /// [`Interface::poll`] and is a no-op for real interfaces.
+    pub rx_queue:       FrameQueue,
 }
 
 /// Configuration bundle for [`Interface::with_config`].
@@ -452,6 +504,11 @@ impl Interface {
             checksum_validate_ip:  cfg.checksum_validate_ip,
             checksum_validate_tcp: cfg.checksum_validate_tcp,
             checksum_validate_udp: cfg.checksum_validate_udp,
+            eth_sockets:  Vec::new(),
+            next_eth_id:    0,
+            udp_sockets:    Vec::new(),
+            tcp_sockets:    Vec::new(),
+            rx_queue:       FrameQueue::default(),
         }
     }
 
@@ -505,9 +562,93 @@ impl Interface {
         self.tx = tx;
     }
 
-    /// Clone the shared TX closure for use by a socket.
-    pub(crate) fn tx(&self) -> crate::TxFn {
+    /// Return a clone of the TX closure for use as a raw Ethernet TX path.
+    ///
+    /// The caller can invoke the returned closure to transmit arbitrary
+    /// Ethernet frames via this interface's physical uplink.  This is the
+    /// preferred way for `EthSocket` holders to send frames without going
+    /// through the ARP / IP / socket layers.
+    pub fn open_eth_tx(&self) -> crate::TxFn {
         Rc::clone(&self.tx)
+    }
+
+    /// Return an IP-level TX closure for use by sockets that should not build
+    /// Ethernet or IPv4 headers directly.
+    ///
+    /// The returned closure takes `(dst_ip, proto, dscp_ecn, payload)` and:
+    /// 1. Builds a complete Ethernet + IPv4 frame with `src` set to this
+    ///    interface's MAC and IP addresses and the supplied DSCP/ECN byte.
+    /// 2. Runs the frame through the interface-level ARP queue: if the dst MAC
+    ///    is cached it is filled in and the frame is sent immediately; if not,
+    ///    the frame is queued and an ARP Request is broadcast.
+    ///
+    /// The closure captures `Rc` clones of the ARP queue and the raw TX path,
+    /// so it remains valid after the interface is moved.
+    pub(crate) fn open_ip_tx(&self) -> crate::IpTxFn {
+        use crate::{
+            arp_cache::{self, PushResult},
+            eth::{EthHdr, EtherType, HDR_LEN as ETH_HDR_LEN},
+            ip::{IpProto, Ipv4Hdr, MIN_HDR_LEN as IP_HDR_LEN},
+        };
+        use core::cell::Cell;
+
+        let arp     = self.arp.clone();
+        let tx      = Rc::clone(&self.tx);
+        let src_ip  = self.ip.map(|c| c.addr()).unwrap_or(core::net::Ipv4Addr::UNSPECIFIED);
+        let src_mac = self.mac;
+        let tx_id   = Rc::new(Cell::new(0u16));
+
+        Rc::new(move |dst_ip: core::net::Ipv4Addr, proto: IpProto, dscp_ecn: u8, payload: &[u8]| -> crate::Result<()> {
+            let frame_len = ETH_HDR_LEN + IP_HDR_LEN + payload.len();
+            let mut frame = alloc::vec![0u8; frame_len];
+
+            EthHdr { dst: crate::eth::MacAddr::ZERO, src: src_mac, ethertype: EtherType::IPV4 }
+                .emit(&mut frame[..ETH_HDR_LEN])?;
+
+            let id = tx_id.get().wrapping_add(1);
+            tx_id.set(id);
+            Ipv4Hdr {
+                ihl:        5,
+                dscp_ecn,
+                total_len:  (IP_HDR_LEN + payload.len()) as u16,
+                id,
+                flags_frag: 0x4000, // DF=1
+                ttl:        64,
+                proto,
+                src:        src_ip,
+                dst:        dst_ip,
+            }
+            .emit(&mut frame[ETH_HDR_LEN..])?;
+
+            frame[ETH_HDR_LEN + IP_HDR_LEN..].copy_from_slice(payload);
+
+            match arp.push_frame(dst_ip, frame) {
+                PushResult::Sent(f) => tx(&f),
+                PushResult::Queued  => Ok(()),
+                PushResult::FirstForIp => {
+                    arp_cache::send_request(src_mac, src_ip, dst_ip, |f| tx(f))
+                }
+            }
+        })
+    }
+
+    /// Register a callback invoked for every received Ethernet frame on this
+    /// interface (tap, not intercept).  Callbacks fire **before** ARP/IP
+    /// dispatch so they see every frame, including those that will also be
+    /// processed by the IP stack.
+    ///
+    /// Returns an opaque ID for use with [`remove_eth_socket`].
+    pub fn add_eth_socket(&mut self, cb: impl Fn(&[u8]) + 'static) -> usize {
+        let id = self.next_eth_id;
+        self.next_eth_id += 1;
+        self.eth_sockets.push(EthSocket { id, callback: Box::new(cb) });
+        id
+    }
+
+    /// Remove the Ethernet tap socket registered with the given `id`.  No-op
+    /// if the ID is not present.
+    pub fn remove_eth_socket(&mut self, id: usize) {
+        self.eth_sockets.retain(|e| e.id != id);
     }
 
     /// Return a reference to the clock driving this interface.
@@ -548,6 +689,55 @@ impl Interface {
         schedule_frag_purge_inner(Rc::clone(&self.reasm), timers);
     }
 
+    // ── Socket registration ──────────────────────────────────────────────────
+
+    /// Register a UDP socket for inbound dispatch on this interface.
+    pub fn add_udp_socket(&mut self, sock: UdpSocket) {
+        self.udp_sockets.push(sock);
+    }
+
+    /// Deregister the UDP socket with `src_port`.
+    pub(crate) fn remove_udp_socket(&mut self, src_port: u16) {
+        self.udp_sockets.retain(|s| s.src_port() != src_port);
+    }
+
+    /// Register a TCP socket on this interface (passive-accept or connect/listen).
+    pub fn add_tcp_socket(&mut self, sock: TcpSocket) {
+        self.tcp_sockets.push(sock);
+    }
+
+    /// Return a slice of TCP sockets on this interface.
+    pub fn tcp_sockets(&self) -> &[TcpSocket] {
+        &self.tcp_sockets
+    }
+
+    /// Return a mutable slice of TCP sockets on this interface.
+    pub fn tcp_sockets_mut(&mut self) -> &mut [TcpSocket] {
+        &mut self.tcp_sockets
+    }
+
+    /// Deregister the TCP socket with `src_port`.
+    pub(crate) fn remove_tcp_socket(&mut self, src_port: u16) {
+        self.tcp_sockets.retain(|s| s.src_port() != src_port);
+    }
+
+    /// Drive one cycle of interface processing:
+    ///
+    /// 1. Drain the `rx_queue` (populated by bridge/virtual-link inject;
+    ///    always empty for real AF_PACKET interfaces).
+    /// 2. Drive TCP timer callbacks (RTO, TLP, keep-alive, TimeWait) for
+    ///    every standalone TCP socket registered on this interface.
+    pub fn poll(&mut self) {
+        // Drain bridge inject queue (no-op for AF_PACKET interfaces).
+        while let Some(frame) = self.rx_queue.pop() {
+            self.receive(&frame).ok();
+        }
+        // Drive TCP timers.
+        for sock in &mut self.tcp_sockets {
+            let _ = sock.poll();
+        }
+    }
+
     // ── L3 receive handler ───────────────────────────────────────────────────
 
     /// Process one inbound Ethernet frame at Layer 3.
@@ -569,11 +759,14 @@ impl Interface {
     /// - Any other proto → ICMP Type 3 Code 2.
     pub fn receive(
         &mut self,
-        raw:            &[u8],
-        udp_sockets:    &mut [UdpSocket],
-        tcp_sockets:    &mut [TcpSocket],
-        standalone_tcp: &mut [TcpSocket],
+        raw: &[u8],
     ) -> Result<()> {
+        // Fire per-interface Ethernet tap sockets BEFORE any ARP/IP handling,
+        // so raw-frame taps (e.g. DHCP) see every frame addressed to us.
+        for entry in &self.eth_sockets {
+            (entry.callback)(raw);
+        }
+
         let cidr = match self.ip {
             Some(c) => c,
             None => return Ok(()),
@@ -631,12 +824,12 @@ impl Interface {
                 if ip.is_fragment() {
                     let maybe_frame = self.reasm.borrow_mut().insert(eth, ip, ip_buf);
                     if let Some(frame) = maybe_frame {
-                        self.dispatch_ipv4(&frame, udp_sockets, tcp_sockets, standalone_tcp)?;
+                        self.dispatch_ipv4(&frame)?;
                     }
                     return Ok(());
                 }
 
-                self.dispatch_ipv4(raw, udp_sockets, tcp_sockets, standalone_tcp)?;
+                self.dispatch_ipv4(raw)?;
             }
             _ => {} // unknown EtherType — silently ignore
         }
@@ -650,13 +843,7 @@ impl Interface {
     /// to the appropriate L4 handler.
     ///
     /// `raw` must be a valid Ethernet+IPv4 frame.
-    fn dispatch_ipv4(
-        &mut self,
-        raw:            &[u8],
-        udp_sockets:    &mut [UdpSocket],
-        tcp_sockets:    &mut [TcpSocket],
-        standalone_tcp: &mut [TcpSocket],
-    ) -> Result<()> {
+    fn dispatch_ipv4(&mut self, raw: &[u8]) -> Result<()> {
         let eth    = EthHdr::parse(raw)?;
         let ip_buf = eth.payload(raw);
         // IP checksum was already validated in receive(); skip here.
@@ -666,6 +853,16 @@ impl Interface {
         let own_ip = self.ip.map(|c| c.addr()).unwrap_or(Ipv4Addr::UNSPECIFIED);
         if is_martian_src(ip.src, own_ip) {
             return Ok(());
+        }
+
+        // Opportunistically seed the ARP cache from the sender's Ethernet
+        // source address.  This ensures that reply frames (e.g. TCP SYN-ACK)
+        // can be sent immediately without a separate ARP exchange, which is
+        // important for passive TCP accepts where no prior ARP may have been
+        // seen.  We only do this for unicast Ethernet sources to avoid
+        // poisoning the cache from broadcast frames.
+        if !eth.src.is_broadcast() && eth.src != MacAddr::ZERO {
+            self.arp.insert(ip.src, eth.src);
         }
 
         match ip.proto {
@@ -694,13 +891,10 @@ impl Interface {
                                 let new_mss = next_hop_mtu.saturating_sub(
                                     IP_HDR_LEN as u16 + TCP_HDR_LEN as u16,
                                 );
-                                for s in tcp_sockets.iter_mut()
-                                    .chain(standalone_tcp.iter_mut())
-                                {
-                                    if s.matches_flow(
-                                        SocketAddrV4::new(orig_ip.src, orig_src_port),
-                                        SocketAddrV4::new(orig_ip.dst, orig_dst_port),
-                                    ) {
+                                let orig_src = SocketAddrV4::new(orig_ip.src, orig_src_port);
+                                let orig_dst = SocketAddrV4::new(orig_ip.dst, orig_dst_port);
+                                for s in self.tcp_sockets.iter_mut() {
+                                    if s.matches_flow(orig_src, orig_dst) {
                                         s.update_pmtu(new_mss);
                                     }
                                 }
@@ -710,7 +904,14 @@ impl Interface {
                     _ => {}
                 }
             }
-            IpProto::UDP  => { udp::dispatch(self, raw, udp_sockets)?; }
+            IpProto::UDP  => {
+                // Temporarily move the socket vec out so we can call
+                // dispatch with `&mut self` for ICMP TX while still iterating
+                // the sockets.  The vec is restored immediately after.
+                let mut socks = core::mem::take(&mut self.udp_sockets);
+                udp::dispatch(self, raw, &mut socks)?;
+                self.udp_sockets = socks;
+            }
             IpProto::TCP  => {
                 let tcp_buf = ip.payload(ip_buf);
                 if self.checksum_validate_tcp {
@@ -723,14 +924,24 @@ impl Interface {
                 }
                 if tcp_buf.len() >= 4 {
                     let dst_port = u16::from_be_bytes([tcp_buf[2], tcp_buf[3]]);
-                    for s in standalone_tcp.iter_mut() {
+                    // Check tcp_sockets for an exact-match socket (active/passive).
+                    let mut socks = core::mem::take(&mut self.tcp_sockets);
+                    let found = socks.iter_mut().any(|s| {
                         if s.src_port() == dst_port {
                             let _ = s.process_segment(raw);
-                            return Ok(());
+                            true
+                        } else {
+                            false
                         }
+                    });
+                    self.tcp_sockets = socks;
+                    if found {
+                        return Ok(());
                     }
                 }
-                tcp::dispatch(self, raw, tcp_sockets)?;
+                let mut socks = core::mem::take(&mut self.tcp_sockets);
+                tcp::dispatch(self, raw, &mut socks)?;
+                self.tcp_sockets = socks;
             }
             _ => {
                 let _ = self.send_icmp_unreachable(raw, 2);
@@ -766,8 +977,6 @@ impl Interface {
     /// The reply preserves the original `id`, `seq`, and payload verbatim.
     /// Requests whose reply would exceed [`FRAME_SIZE`] are silently dropped.
     fn send_icmp_echo_reply(&mut self, raw: &[u8]) -> Result<()> {
-        let cidr = self.ip.unwrap(); // guaranteed Some by callers
-
         let eth      = EthHdr::parse(raw)?;
         let ip_buf   = eth.payload(raw);
         let ip       = Ipv4Hdr::parse(ip_buf)?;
@@ -776,37 +985,18 @@ impl Interface {
             Ok(IcmpMessage::EchoRequest { id, seq }) => (id, seq),
             _ => return Ok(()),
         };
-        let payload = &icmp_buf[ICMP_HDR_LEN..];
+        let echo_payload = &icmp_buf[ICMP_HDR_LEN..];
 
-        let frame_len = ETH_HDR_LEN + IP_HDR_LEN + ICMP_HDR_LEN + payload.len();
-        if frame_len > FRAME_SIZE {
+        let icmp_len = ICMP_HDR_LEN + echo_payload.len();
+        if ETH_HDR_LEN + IP_HDR_LEN + icmp_len > FRAME_SIZE {
             return Ok(());
         }
 
-        let mut buf = [0u8; FRAME_SIZE];
-        let frame   = &mut buf[..frame_len];
+        let mut icmp_buf = alloc::vec![0u8; icmp_len];
+        IcmpMessage::EchoReply { id, seq }.emit(&mut icmp_buf, echo_payload)?;
+        icmp_buf[ICMP_HDR_LEN..].copy_from_slice(echo_payload);
 
-        EthHdr { dst: eth.src, src: self.mac, ethertype: EtherType::IPV4 }.emit(frame)?;
-
-        self.tx_id = self.tx_id.wrapping_add(1);
-        Ipv4Hdr {
-            ihl:       5,
-            dscp_ecn:  0,
-            total_len: (IP_HDR_LEN + ICMP_HDR_LEN + payload.len()) as u16,
-            id:        self.tx_id,
-            flags_frag: 0,
-            ttl:       64,
-            proto:     IpProto::ICMP,
-            src:       cidr.addr(),
-            dst:       ip.src,
-        }
-        .emit(&mut frame[ETH_HDR_LEN..])?;
-
-        let icmp_off = ETH_HDR_LEN + IP_HDR_LEN;
-        IcmpMessage::EchoReply { id, seq }.emit(&mut frame[icmp_off..], payload)?;
-        frame[icmp_off + ICMP_HDR_LEN..].copy_from_slice(payload);
-
-        (self.tx)(frame)
+        self.send_ip(ip.src, IpProto::ICMP, &icmp_buf)
     }
 
     /// Send ICMP Destination Unreachable (Type 3, `code`).
@@ -823,7 +1013,6 @@ impl Interface {
         if !self.icmp_rl.allow(now) {
             return Ok(());
         }
-        let cidr = self.ip.unwrap(); // guaranteed Some by callers
 
         let eth    = EthHdr::parse(raw)?;
         let ip_buf = eth.payload(raw);
@@ -840,35 +1029,13 @@ impl Interface {
             .copy_from_slice(&after_hdr[..suffix_len]);
         let icmp_payload = &icmp_payload_buf[..icmp_payload_len];
 
-        let total_ip_len = (IP_HDR_LEN + ICMP_HDR_LEN + icmp_payload_len) as u16;
-        let frame_len    = ETH_HDR_LEN + IP_HDR_LEN + ICMP_HDR_LEN + icmp_payload_len;
-
-        let mut buf   = [0u8; FRAME_SIZE];
-        let frame     = &mut buf[..frame_len];
-
-        EthHdr { dst: eth.src, src: self.mac, ethertype: EtherType::IPV4 }.emit(frame)?;
-
-        self.tx_id = self.tx_id.wrapping_add(1);
-        Ipv4Hdr {
-            ihl: 5,
-            dscp_ecn: 0,
-            total_len: total_ip_len,
-            id: self.tx_id,
-            flags_frag: 0,
-            ttl: 64,
-            proto: IpProto::ICMP,
-            src: cidr.addr(),
-            dst: ip.src,
-        }
-        .emit(&mut frame[ETH_HDR_LEN..])?;
-
-        let icmp_off = ETH_HDR_LEN + IP_HDR_LEN;
+        let icmp_len = ICMP_HDR_LEN + icmp_payload_len;
+        let mut icmp_buf = alloc::vec![0u8; icmp_len];
         IcmpMessage::DestUnreach { code, next_hop_mtu: 0 }
-            .emit(&mut frame[icmp_off..], icmp_payload)?;
-        frame[icmp_off + ICMP_HDR_LEN..icmp_off + ICMP_HDR_LEN + icmp_payload_len]
-            .copy_from_slice(icmp_payload);
+            .emit(&mut icmp_buf, icmp_payload)?;
+        icmp_buf[ICMP_HDR_LEN..].copy_from_slice(icmp_payload);
 
-        (self.tx)(frame)
+        self.send_ip(ip.src, IpProto::ICMP, &icmp_buf)
     }
 
     /// Send a TCP RST in response to an unexpected inbound segment.
@@ -877,35 +1044,15 @@ impl Interface {
     /// - Otherwise → RST|ACK with `seq = 0, ack = seg.seq + seg_len`
     ///   (RFC 793 §3.4).
     pub(crate) fn send_tcp_rst(&mut self, raw: &[u8]) -> Result<()> {
-        let cidr = self.ip.unwrap();
+        let src_ip = self.ip.unwrap().addr();
 
-        let eth    = EthHdr::parse(raw)?;
-        let ip_buf = eth.payload(raw);
-        let ip     = Ipv4Hdr::parse(ip_buf)?;
+        let eth     = EthHdr::parse(raw)?;
+        let ip_buf  = eth.payload(raw);
+        let ip      = Ipv4Hdr::parse(ip_buf)?;
         let tcp_buf = ip.payload(ip_buf);
-        let seg    = TcpHdr::parse(tcp_buf)?;
+        let seg     = TcpHdr::parse(tcp_buf)?;
+        let dst_ip  = ip.src;
 
-        let frame_len = ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
-        let mut buf   = [0u8; FRAME_SIZE];
-        let frame     = &mut buf[..frame_len];
-
-        EthHdr { dst: eth.src, src: self.mac, ethertype: EtherType::IPV4 }.emit(frame)?;
-
-        self.tx_id = self.tx_id.wrapping_add(1);
-        Ipv4Hdr {
-            ihl: 5,
-            dscp_ecn: 0,
-            total_len: (IP_HDR_LEN + TCP_HDR_LEN) as u16,
-            id: self.tx_id,
-            flags_frag: 0,
-            ttl: 64,
-            proto: IpProto::TCP,
-            src: cidr.addr(),
-            dst: ip.src,
-        }
-        .emit(&mut frame[ETH_HDR_LEN..])?;
-
-        let tcp_off = ETH_HDR_LEN + IP_HDR_LEN;
         let (seq, ack_num, flags) = if seg.has_flag(TcpFlags::ACK) {
             (seg.ack, SeqNum::new(0), TcpFlags::RST)
         } else {
@@ -916,6 +1063,8 @@ impl Interface {
             let seg_len       = payload_len + syn_fin;
             (SeqNum::new(0), seg.seq + seg_len.max(1), TcpFlags::RST | TcpFlags::ACK)
         };
+
+        let mut tcp_seg = [0u8; TCP_HDR_LEN];
         TcpHdr {
             src_port:    seg.dst_port,
             dst_port:    seg.src_port,
@@ -927,9 +1076,77 @@ impl Interface {
             checksum:    0,
             urgent:      0,
         }
-        .emit(&mut frame[tcp_off..], &cidr.addr(), &ip.src, &[])?;
+        .emit(&mut tcp_seg, &src_ip, &dst_ip, &[])?;
 
-        (self.tx)(frame)
+        self.send_ip(dst_ip, IpProto::TCP, &tcp_seg)
+    }
+
+    /// Build and transmit a complete Ethernet+IPv4 frame carrying `payload`
+    /// as an upper-layer L4/L3 body.
+    ///
+    /// # ARP resolution
+    ///
+    /// - **MAC cached** → frame is transmitted immediately via `self.tx`.
+    /// - **ARP miss (first frame for this IP)** → the frame is queued in the
+    ///   interface-level ARP pending queue and an ARP Request is broadcast.
+    ///   The frame will be delivered once an ARP Reply arrives and
+    ///   [`Interface::receive`] calls [`ArpQueue::drain_for`].
+    /// - **ARP miss (already queued)** → frame is appended to the queue
+    ///   (up to the per-IP limit) and `Ok(())` is returned.
+    ///
+    /// In all cases `Ok(())` is returned on success; only hard TX errors
+    /// propagate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidInput`] if this interface has no IP
+    /// address configured yet.
+    pub fn send_ip(
+        &mut self,
+        dst_ip:  Ipv4Addr,
+        proto:   IpProto,
+        payload: &[u8],
+    ) -> Result<()> {
+        use crate::arp_cache::{self, PushResult};
+
+        let src_ip = match self.ip {
+            Some(cidr) => cidr.addr(),
+            None       => return Err(crate::Error::InvalidInput),
+        };
+        let src_mac = self.mac;
+
+        // Build a complete Ethernet+IP frame with a zeroed dst MAC.  The
+        // ArpQueue will fill bytes [0..6] when the MAC is (or becomes) known.
+        let frame_len = ETH_HDR_LEN + IP_HDR_LEN + payload.len();
+        let mut frame = alloc::vec![0u8; frame_len];
+
+        EthHdr { dst: MacAddr::ZERO, src: src_mac, ethertype: EtherType::IPV4 }
+            .emit(&mut frame[..ETH_HDR_LEN])?;
+
+        self.tx_id = self.tx_id.wrapping_add(1);
+        Ipv4Hdr {
+            ihl:        5,
+            dscp_ecn:   0,
+            total_len:  (IP_HDR_LEN + payload.len()) as u16,
+            id:         self.tx_id,
+            flags_frag: 0,
+            ttl:        64,
+            proto,
+            src:        src_ip,
+            dst:        dst_ip,
+        }
+        .emit(&mut frame[ETH_HDR_LEN..])?;
+
+        frame[ETH_HDR_LEN + IP_HDR_LEN..].copy_from_slice(payload);
+
+        match self.arp.push_frame(dst_ip, frame) {
+            PushResult::Sent(f) => (self.tx)(&f),
+            PushResult::Queued  => Ok(()),
+            PushResult::FirstForIp => {
+                let tx = Rc::clone(&self.tx);
+                arp_cache::send_request(src_mac, src_ip, dst_ip, |f| tx(f))
+            }
+        }
     }
 }
 
@@ -967,4 +1184,254 @@ fn schedule_frag_purge_inner(
         reasm.borrow_mut().purge();
         schedule_frag_purge_inner(reasm, timers);
     });
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::{rc::Rc, vec::Vec};
+    use core::cell::RefCell;
+    use core::net::Ipv4Addr;
+    use crate::{
+        eth::{MacAddr, EtherType, HDR_LEN as ETH_HDR_LEN},
+        ip::{IpProto, MIN_HDR_LEN as IP_HDR_LEN},
+        timers::Clock,
+    };
+
+    fn test_cfg() -> InterfaceConfig {
+        InterfaceConfig {
+            arp_cache_max_age_ms:    20_000,
+            arp_cache_max_entries:   256,
+            arp_queue_max_pending:   4,
+            ip_frag_timeout_ms:      30_000,
+            ip_frag_mem_limit:       65_536,
+            ip_frag_per_src_max:     4,
+            icmp_rate_limit_per_sec: 100,
+            checksum_validate_ip:    false,
+            checksum_validate_tcp:   false,
+            checksum_validate_udp:   false,
+            clock:                   Clock::default(),
+        }
+    }
+
+    fn make_iface_with_ip() -> (Interface, Rc<RefCell<Vec<Vec<u8>>>>) {
+        let mut iface = Interface::with_config(
+            b"\0",
+            MacAddr::new(0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff),
+            None,
+            test_cfg(),
+        );
+        iface.assign_ip(crate::ip::Ipv4Cidr::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            24,
+        ).unwrap());
+        let captured: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let cap = Rc::clone(&captured);
+        iface.set_tx(Rc::new(move |frame: &[u8]| {
+            cap.borrow_mut().push(frame.to_vec());
+            Ok(())
+        }));
+        (iface, captured)
+    }
+
+    #[test]
+    fn send_ip_no_ip_configured_returns_invalid_input() {
+        let mut iface = Interface::with_config(
+            b"\0",
+            MacAddr::new(0x11, 0x22, 0x33, 0x44, 0x55, 0x66),
+            None,
+            test_cfg(),
+        );
+        // No IP assigned — send_ip must fail with InvalidInput.
+        let err = iface.send_ip(
+            Ipv4Addr::new(10, 0, 0, 2),
+            IpProto::UDP,
+            b"hello",
+        ).unwrap_err();
+        assert_eq!(err, crate::Error::InvalidInput);
+    }
+
+    #[test]
+    fn send_ip_arp_hit_transmits_frame_immediately() {
+        let (mut iface, captured) = make_iface_with_ip();
+        let dst_ip  = Ipv4Addr::new(10, 0, 0, 2);
+        let dst_mac = MacAddr::new(0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc);
+
+        // Pre-seed ARP so the lookup hits immediately.
+        iface.seed_arp(dst_ip, dst_mac);
+
+        let payload = b"test-payload";
+        iface.send_ip(dst_ip, IpProto::UDP, payload).unwrap();
+
+        let frames = captured.borrow();
+        assert_eq!(frames.len(), 1, "exactly one frame should be transmitted");
+
+        let frame = &frames[0];
+        assert_eq!(frame.len(), ETH_HDR_LEN + IP_HDR_LEN + payload.len());
+
+        // Check Ethernet header.
+        let eth = EthHdr::parse(frame).unwrap();
+        assert_eq!(eth.dst, dst_mac);
+        assert_eq!(eth.src, MacAddr::new(0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff));
+        assert_eq!(eth.ethertype, EtherType::IPV4);
+
+        // Check IPv4 header.
+        let ip_buf = eth.payload(frame);
+        let ip = crate::ip::Ipv4Hdr::parse_no_checksum(ip_buf).unwrap();
+        assert_eq!(ip.src, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(ip.dst, dst_ip);
+        assert_eq!(ip.proto, IpProto::UDP);
+        assert_eq!(ip.ttl, 64);
+        assert_eq!(ip.total_len as usize, IP_HDR_LEN + payload.len());
+
+        // Check payload.
+        let ip_payload = ip.payload(ip_buf);
+        assert_eq!(ip_payload, payload);
+    }
+
+    #[test]
+    fn send_ip_arp_miss_queues_frame_and_sends_arp_request() {
+        let (mut iface, captured) = make_iface_with_ip();
+        let dst_ip = Ipv4Addr::new(10, 0, 0, 3);
+
+        let payload = b"queued";
+        // First call: ARP miss, no existing queue entry → FirstForIp.
+        iface.send_ip(dst_ip, IpProto::UDP, payload).unwrap();
+
+        let frames = captured.borrow();
+        // One ARP Request should have been broadcast.
+        assert_eq!(frames.len(), 1, "expected one ARP request frame");
+
+        let frame = &frames[0];
+        let eth = EthHdr::parse(frame).unwrap();
+        assert_eq!(eth.ethertype, EtherType::ARP);
+        assert_eq!(eth.dst, MacAddr::BROADCAST);
+    }
+
+    #[test]
+    fn send_ip_arp_miss_second_frame_queued_no_extra_arp() {
+        let (mut iface, captured) = make_iface_with_ip();
+        let dst_ip = Ipv4Addr::new(10, 0, 0, 4);
+
+        // First call triggers ARP request.
+        iface.send_ip(dst_ip, IpProto::UDP, b"first").unwrap();
+        // Second call for same IP is queued silently.
+        iface.send_ip(dst_ip, IpProto::UDP, b"second").unwrap();
+
+        let frames = captured.borrow();
+        // Still only one ARP request — no duplicate broadcast.
+        assert_eq!(frames.len(), 1, "only one ARP request expected");
+    }
+
+    // ── Helper: build a minimal ARP Request Ethernet frame ───────────────────
+
+    fn build_arp_request(
+        src_mac: MacAddr,
+        src_ip:  Ipv4Addr,
+        dst_mac: MacAddr,
+        dst_ip:  Ipv4Addr,
+    ) -> Vec<u8> {
+        use crate::arp::{ArpHdr, ArpOp, HDR_LEN as ARP_HDR_LEN};
+        let mut frame = vec![0u8; ETH_HDR_LEN + ARP_HDR_LEN];
+        EthHdr { dst: dst_mac, src: src_mac, ethertype: EtherType::ARP }
+            .emit(&mut frame[..ETH_HDR_LEN])
+            .unwrap();
+        ArpHdr { oper: ArpOp::REQUEST, sha: src_mac, spa: src_ip, tha: dst_mac, tpa: dst_ip }
+            .emit(&mut frame[ETH_HDR_LEN..])
+            .unwrap();
+        frame
+    }
+
+    // ── eth_socket tests ─────────────────────────────────────────────────────
+
+    /// An eth_socket registered on an interface fires when `receive()` is
+    /// called, and fires **before** ARP/IP processing (the ARP reply appears in
+    /// the captured TX list only *after* the callback has already recorded the
+    /// raw inbound frame).
+    #[test]
+    fn eth_callback_fires_before_arp_ip_dispatch() {
+        let (mut iface, tx_captured) = make_iface_with_ip();
+
+        let iface_mac = MacAddr::new(0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff);
+        let iface_ip  = Ipv4Addr::new(10, 0, 0, 1);
+        let peer_mac  = MacAddr::new(0x11, 0x22, 0x33, 0x44, 0x55, 0x66);
+        let peer_ip   = Ipv4Addr::new(10, 0, 0, 2);
+
+        // Track every raw frame handed to the eth callback.
+        let cb_frames: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+        let cb_cap = Rc::clone(&cb_frames);
+        // Track how many TX frames existed at the moment the callback fired.
+        let tx_len_at_cb: Rc<RefCell<Option<usize>>> = Rc::new(RefCell::new(None));
+        let tx_cap_ref   = Rc::clone(&tx_captured);
+        let tx_len_ref   = Rc::clone(&tx_len_at_cb);
+
+        iface.add_eth_socket(move |frame| {
+            cb_cap.borrow_mut().push(frame.to_vec());
+            // Record how many TX frames existed when the callback was called.
+            // If eth_socket fires BEFORE ARP dispatch, the ARP reply
+            // will NOT yet be in tx_captured at this point.
+            *tx_len_ref.borrow_mut() = Some(tx_cap_ref.borrow().len());
+        });
+
+        let arp_req = build_arp_request(peer_mac, peer_ip, iface_mac, iface_ip);
+        iface.receive(&arp_req).unwrap();
+
+        // The callback must have been called exactly once.
+        assert_eq!(cb_frames.borrow().len(), 1, "callback must fire once");
+
+        // The frame delivered to the callback is the raw inbound ARP request.
+        assert_eq!(cb_frames.borrow()[0], arp_req);
+
+        // At the moment the callback fired, no TX frame had been emitted yet
+        // (eth_socket fires before ARP-reply TX).
+        assert_eq!(
+            *tx_len_at_cb.borrow(),
+            Some(0),
+            "eth_socket fired AFTER ARP reply was sent — order is wrong"
+        );
+
+        // After receive() returns, the ARP reply should have been transmitted.
+        assert_eq!(tx_captured.borrow().len(), 1, "ARP reply must be sent");
+    }
+
+    /// Removing a callback prevents it from firing on subsequent receives.
+    #[test]
+    fn eth_callback_remove_stops_delivery() {
+        let (mut iface, _tx) = make_iface_with_ip();
+        let iface_mac = MacAddr::new(0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff);
+        let iface_ip  = Ipv4Addr::new(10, 0, 0, 1);
+        let peer_mac  = MacAddr::new(0x11, 0x22, 0x33, 0x44, 0x55, 0x66);
+        let peer_ip   = Ipv4Addr::new(10, 0, 0, 2);
+
+        let count: Rc<RefCell<u32>> = Rc::new(RefCell::new(0));
+        let c = Rc::clone(&count);
+        let id = iface.add_eth_socket(move |_| { *c.borrow_mut() += 1; });
+
+        let arp_req = build_arp_request(peer_mac, peer_ip, iface_mac, iface_ip);
+        iface.receive(&arp_req).unwrap();
+        assert_eq!(*count.borrow(), 1);
+
+        // Remove the socket, then receive another frame — count must stay 1.
+        iface.remove_eth_socket(id);
+        iface.receive(&arp_req).unwrap();
+        assert_eq!(*count.borrow(), 1, "eth_socket must not fire after removal");
+    }
+
+    /// `open_eth_tx()` returns a closure that sends frames through the
+    /// interface's TX path.
+    #[test]
+    fn open_eth_tx_sends_via_interface_tx() {
+        let (iface, tx_captured) = make_iface_with_ip();
+
+        let tx = iface.open_eth_tx();
+
+        // Build a minimal dummy frame (6 zeros dst MAC + whatever).
+        let raw = vec![0u8; 14];
+        tx(&raw).unwrap();
+
+        assert_eq!(tx_captured.borrow().len(), 1, "frame should appear in TX");
+        assert_eq!(tx_captured.borrow()[0], raw);
+    }
 }

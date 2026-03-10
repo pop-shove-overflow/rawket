@@ -7,7 +7,6 @@ use crate::{
     interface::Interface,
     ip::{
         checksum_add, checksum_finish, pseudo_header_acc, IpProto, Ipv4Hdr,
-        MIN_HDR_LEN as IP_HDR_LEN,
     },
     timers::{Clock, Deadline},
 
@@ -33,9 +32,10 @@ impl TcpFlags {
     /// Congestion Window Reduced: sender acknowledges the ECE signal.
     pub const CWR:  Self = Self(0x80);
 
-    #[inline] pub fn has(self, f: Self) -> bool { self.0 & f.0 != 0 }
+    #[inline] pub fn has(self, f: Self) -> bool  { self.0 & f.0 != 0 }
     #[inline] pub fn is_empty(self) -> bool      { self.0 == 0 }
     #[inline] pub fn bits(self) -> u8            { self.0 }
+    #[inline] pub fn from_bits(b: u8) -> Self    { Self(b) }
 }
 
 impl core::ops::BitOr for TcpFlags {
@@ -569,19 +569,15 @@ fn random_u32() -> u32 {
 // ── TcpSocket ─────────────────────────────────────────────────────────────────
 
 pub struct TcpSocket {
-    tx:          crate::TxFn,
+    tx:          crate::IpTxFn,
     clock:       Clock,
-    src_mac:     MacAddr,
-    dst_mac:     MacAddr,
     src:         SocketAddrV4,
     dst:         SocketAddrV4,
-    nexthop_ip:  Ipv4Addr,
     pub state:   State,
     snd_nxt:     SeqNum,
     snd_una:     SeqNum,
     rcv_nxt:     SeqNum,
     last_ack_sent: SeqNum, // RFC 7323 §4.3: for ts_recent update gating
-    tx_id:       u16,
     on_recv:     for<'a> fn(TcpPacket<'a>),
     on_error:    fn(TcpError),
 
@@ -669,11 +665,9 @@ pub struct TcpSocket {
 }
 
 impl TcpSocket {
-    #[allow(clippy::too_many_arguments)]
     fn new_raw(
-        tx:        crate::TxFn,
+        tx:        crate::IpTxFn,
         clock:     Clock,
-        src_mac:   MacAddr,
         src:       SocketAddrV4,
         on_recv:   for<'a> fn(TcpPacket<'a>),
         on_error:  fn(TcpError),
@@ -685,17 +679,13 @@ impl TcpSocket {
         TcpSocket {
             tx,
             clock,
-            src_mac,
-            dst_mac:         MacAddr::ZERO,
             src,
             dst:             SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
-            nexthop_ip:      Ipv4Addr::UNSPECIFIED,
             state:           State::Closed,
             snd_nxt:         isn,
             snd_una:         isn,
             rcv_nxt:         SeqNum::new(0),
             last_ack_sent:   SeqNum::new(0),
-            tx_id:           0,
             on_recv,
             on_error,
             send_buf:        Vec::new(),
@@ -892,57 +882,44 @@ impl TcpSocket {
         }
 
         let tcp_hdr_len = HDR_LEN + opts.len();
-        let ip_total    = (IP_HDR_LEN + tcp_hdr_len + payload.len()) as u16;
-        let frame_len   = crate::eth::HDR_LEN + IP_HDR_LEN + tcp_hdr_len + payload.len();
-
-        let mut buf   = alloc::vec![0u8; frame_len];
-        let frame     = &mut buf[..];
-
-        EthHdr { dst: self.dst_mac, src: self.src_mac, ethertype: EtherType::IPV4 }.emit(frame)?;
-
-        // ECT(0) = 0x02 marks outgoing data segments as ECN-capable transport.
-        let dscp_ecn = if self.ecn_enabled && !payload.is_empty() { 0x02u8 } else { 0u8 };
-
-        self.tx_id = self.tx_id.wrapping_add(1);
-        Ipv4Hdr {
-            ihl: 5, dscp_ecn, total_len: ip_total,
-            id: self.tx_id, flags_frag: 0x4000, ttl: 64,
-            proto: IpProto::TCP, src: *self.src.ip(), dst: *self.dst.ip(),
-        }.emit(&mut frame[crate::eth::HDR_LEN..])?;
-
-        let tcp_off = crate::eth::HDR_LEN + IP_HDR_LEN;
+        let seg_len     = tcp_hdr_len + payload.len();
         let data_offset = (tcp_hdr_len / 4) as u8;
 
-        frame[tcp_off..tcp_off + 2].copy_from_slice(&self.src.port().to_be_bytes());
-        frame[tcp_off + 2..tcp_off + 4].copy_from_slice(&self.dst.port().to_be_bytes());
-        frame[tcp_off + 4..tcp_off + 8].copy_from_slice(&seq.as_u32().to_be_bytes());
-        frame[tcp_off + 8..tcp_off + 12].copy_from_slice(&self.rcv_nxt.as_u32().to_be_bytes());
-        frame[tcp_off + 12] = data_offset << 4;
-        frame[tcp_off + 13] = flags.0;
+        let mut buf = alloc::vec![0u8; seg_len];
+
+        buf[0..2].copy_from_slice(&self.src.port().to_be_bytes());
+        buf[2..4].copy_from_slice(&self.dst.port().to_be_bytes());
+        buf[4..8].copy_from_slice(&seq.as_u32().to_be_bytes());
+        buf[8..12].copy_from_slice(&self.rcv_nxt.as_u32().to_be_bytes());
+        buf[12] = data_offset << 4;
+        buf[13] = flags.0;
         // Advertise how much receive buffer space we have, scaled by rcv_scale.
         // Cap at u16::MAX; if rcv_scale is 0 (not negotiated) this is bytes-exact.
         let recv_headroom = RECV_BUF_MAX.saturating_sub(self.recv_buf.len() as u32);
         let adv_window    = (recv_headroom >> self.rcv_scale).min(u16::MAX as u32) as u16;
-        frame[tcp_off + 14..tcp_off + 16].copy_from_slice(&adv_window.to_be_bytes());
-        frame[tcp_off + 16..tcp_off + 18].copy_from_slice(&[0, 0]); // checksum placeholder
-        frame[tcp_off + 18..tcp_off + 20].copy_from_slice(&[0, 0]); // urgent
+        buf[14..16].copy_from_slice(&adv_window.to_be_bytes());
+        buf[16..18].copy_from_slice(&[0, 0]); // checksum placeholder
+        buf[18..20].copy_from_slice(&[0, 0]); // urgent
 
         if !opts.is_empty() {
-            frame[tcp_off + HDR_LEN..tcp_off + HDR_LEN + opts.len()].copy_from_slice(opts);
+            buf[HDR_LEN..HDR_LEN + opts.len()].copy_from_slice(opts);
         }
         if !payload.is_empty() {
-            frame[tcp_off + tcp_hdr_len..].copy_from_slice(payload);
+            buf[tcp_hdr_len..].copy_from_slice(payload);
         }
 
         // Compute TCP checksum over header (including options) + payload.
-        let seg_total = (tcp_hdr_len + payload.len()) as u16;
+        let seg_total = seg_len as u16;
         let acc = pseudo_header_acc(self.src.ip(), self.dst.ip(), IpProto::TCP, seg_total);
-        let acc = checksum_add(acc, &frame[tcp_off..tcp_off + tcp_hdr_len + payload.len()]);
+        let acc = checksum_add(acc, &buf[..seg_len]);
         let csum = checksum_finish(acc);
-        frame[tcp_off + 16..tcp_off + 18].copy_from_slice(&csum.to_be_bytes());
+        buf[16..18].copy_from_slice(&csum.to_be_bytes());
 
         if flags.has(TcpFlags::ACK) { self.last_ack_sent = self.rcv_nxt; }
-        (self.tx)(frame)
+
+        // ECT(0) = 0x02 marks outgoing data segments as ECN-capable transport.
+        let dscp_ecn = if self.ecn_enabled && !payload.is_empty() { 0x02u8 } else { 0u8 };
+        (self.tx)(*self.dst.ip(), IpProto::TCP, dscp_ecn, &buf)
     }
 
     /// Convenience: control segment using current snd_nxt/rcv_nxt.
@@ -1713,9 +1690,8 @@ impl TcpSocket {
             // ── LISTEN ──────────────────────────────────────────────────────
             State::Listen => {
                 if seg.has_flag(TcpFlags::SYN) && !seg.has_flag(TcpFlags::ACK) {
-                    self.dst     = SocketAddrV4::new(ip.src, seg.src_port);
-                    self.dst_mac = eth.src;
-                    self.rcv_nxt  = seg.seq + 1;
+                    self.dst    = SocketAddrV4::new(ip.src, seg.src_port);
+                    self.rcv_nxt = seg.seq + 1;
                     // Learn peer MSS; RFC 793 §3.1: assume 536 if absent
                     self.peer_mss = opts.mss.unwrap_or(536);
                     self.sack_ok = opts.sack_permitted;
@@ -2156,18 +2132,19 @@ impl TcpSocket {
         on_error:   fn(TcpError),
         cfg:        TcpConfig,
     ) -> Result<Self> {
-        let dst_mac = iface.arp_queue()
+        // Verify the nexthop is already in the ARP cache; return WouldBlock if
+        // not.  The IpTxFn closure also performs ARP resolution internally, but
+        // connect_now must fail fast here rather than queuing a pending SYN.
+        iface.arp_queue()
             .lookup_and_refresh(nexthop_ip)
             .ok_or(Error::WouldBlock)?;
 
         let mut s = Self::new_raw(
-            iface.tx(), iface.clock().clone(), iface.mac(), src, on_recv, on_error,
+            iface.open_ip_tx(), iface.clock().clone(), src, on_recv, on_error,
             cfg,
         );
-        s.dst        = dst;
-        s.nexthop_ip = nexthop_ip;
-        s.dst_mac    = dst_mac;
-        s.state      = State::SynSent;
+        s.dst   = dst;
+        s.state = State::SynSent;
         let syn_opts = s.syn_opts();
         let isn = s.snd_nxt;
         // Advertise ECN capability in SYN (RFC 3168 §6.1.1).
@@ -2195,7 +2172,7 @@ impl TcpSocket {
         cfg:     TcpConfig,
     ) -> Result<Self> {
         let mut s = Self::new_raw(
-            iface.tx(), iface.clock().clone(), iface.mac(), src, on_recv, on_error,
+            iface.open_ip_tx(), iface.clock().clone(), src, on_recv, on_error,
             cfg,
         );
         s.state = State::Listen;

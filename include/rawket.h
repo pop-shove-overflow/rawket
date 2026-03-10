@@ -201,7 +201,7 @@ typedef struct RawketTcpSocket  RawketTcpSocket;
  */
 RAWKET_NODISCARD RawketNetwork *rawket_network_new(const RawketNetworkConfig *config);
 
-/** Free a network runtime and all uplinks it owns. */
+/** Free a network runtime and all interfaces it owns. */
 void rawket_network_free(RawketNetwork *net);
 
 /**
@@ -315,7 +315,7 @@ RAWKET_NODISCARD int rawket_arp_request(RawketNetwork *net, int intf_idx, uint32
 /* ── Ethernet tap ────────────────────────────────────────────────────────── */
 
 /**
- * Callback invoked for every Ethernet frame received on the uplink.
+ * Callback invoked for every Ethernet frame received on the interface.
  *
  * Called before ARP/IP dispatch (tap, not intercept).
  * `frame` is valid only for the duration of the callback; copy if needed.
@@ -326,7 +326,7 @@ typedef void (*rawket_eth_recv_fn)(const uint8_t *frame, size_t len,
 /**
  * Open an Ethernet tap on `intf_idx`.
  *
- * `cb` is called for every frame received on the uplink before ARP/IP
+ * `cb` is called for every frame received on the interface before ARP/IP
  * dispatch.  Useful for implementing DHCP or other low-level protocols
  * prior to IP address assignment.
  *
@@ -343,7 +343,7 @@ RAWKET_NODISCARD RawketEthSocket *rawket_open_eth_cb(RawketNetwork *net, int int
 void rawket_eth_close(RawketEthSocket *eth);
 
 /**
- * Transmit a raw Ethernet frame via the uplink.
+ * Transmit a raw Ethernet frame via the interface associated with `eth`.
  *
  * MUST NOT be called from within the rawket_eth_recv_fn callback.
  *
@@ -375,7 +375,7 @@ typedef struct {
 typedef void (*rawket_udp_recv_fn)(const RawketUdpPacket *pkt, void *userdata);
 
 /**
- * Open a UDP socket and register it with `uplink_idx` for receive dispatch.
+ * Open a UDP socket and register it with `intf_idx` for receive dispatch.
  *
  * The interface is selected automatically by matching `src_ip` against the
  * IP addresses assigned to interfaces attached to `net`.  Returns NULL with
@@ -384,17 +384,17 @@ typedef void (*rawket_udp_recv_fn)(const RawketUdpPacket *pkt, void *userdata);
  * `on_recv` may be NULL for a send-only socket.  When provided, it is invoked
  * for every datagram received on `src_port` during rawket_network_poll_rx().
  *
- * @param net        Network handle from rawket_network_new()
- * @param uplink_idx Interface index from rawket_network_add_intf()
- * @param src_ip     Source IPv4 address (network byte order)
- * @param src_port   Source UDP port (host byte order)
- * @param on_recv    Optional receive callback (may be NULL)
- * @param recv_ud    Passed unchanged to each on_recv invocation
- * @return           Opaque handle, or NULL on failure (errno set)
+ * @param net       Network handle from rawket_network_new()
+ * @param intf_idx  Interface index from rawket_network_add_intf()
+ * @param src_ip    Source IPv4 address (network byte order)
+ * @param src_port  Source UDP port (host byte order)
+ * @param on_recv   Optional receive callback (may be NULL)
+ * @param recv_ud   Passed unchanged to each on_recv invocation
+ * @return          Opaque handle, or NULL on failure (errno set)
  */
 RAWKET_NODISCARD RawketUdpSocket *rawket_udp_open(
     RawketNetwork     *net,
-    int                uplink_idx,
+    int                intf_idx,
     uint32_t           src_ip,
     uint16_t           src_port,
     rawket_udp_recv_fn on_recv,
@@ -402,18 +402,19 @@ RAWKET_NODISCARD RawketUdpSocket *rawket_udp_open(
 );
 
 /**
- * Deregister the UDP socket from its uplink and free the handle.
+ * Deregister the UDP socket from its interface and free the handle.
  *
  * Do not use the handle after this call.
  */
 void rawket_udp_close(RawketUdpSocket *sock);
 
 /**
- * Create a UDP socket with a receive callback, without registering it.
+ * Create a UDP socket with an optional receive callback and register it with
+ * the interface that owns src_ip.
  *
- * The socket is not yet attached to any uplink; call
- * rawket_network_add_udp_socket() to register it.  After that call the
- * handle is consumed — do not call rawket_udp_close() on it.
+ * Equivalent to rawket_udp_open() but looks up the interface by src_ip
+ * rather than requiring an explicit intf_idx.  The socket is immediately
+ * registered for receive dispatch.  Call rawket_udp_close() to deregister.
  *
  * @param net      Network handle from rawket_network_new()
  * @param src_ip   Source IPv4 address (network byte order)
@@ -429,21 +430,6 @@ RAWKET_NODISCARD RawketUdpSocket *rawket_udp_open_cb(
     rawket_udp_recv_fn on_recv,
     void              *recv_ud
 );
-
-/**
- * Register a UDP socket (from rawket_udp_open_cb()) with an uplink.
- *
- * Transfers ownership of `sock` to the network stack.  The pointer is freed
- * by this call and must not be used afterwards.
- *
- * @param net      Network handle
- * @param intf_idx Interface index from rawket_network_add_intf()
- * @param sock     Handle from rawket_udp_open_cb()
- * @return         0 on success, -1 on error
- */
-RAWKET_NODISCARD int rawket_network_add_udp_socket(RawketNetwork   *net,
-                                                    int              intf_idx,
-                                                    RawketUdpSocket *sock);
 
 /**
  * Send a UDP datagram.
