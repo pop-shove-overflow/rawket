@@ -210,59 +210,27 @@ struct EthEntry {
 /// One physical uplink: a shared [`EtherLink`], the L3 [`Interface`]s
 /// multiplexed over it, and the L4 sockets registered on those interfaces.
 pub struct Uplink<L: EtherLink> {
-    sock:                    L,
-    interfaces:              Vec<Interface>,
-    udp_sockets:             Vec<UdpSocket>,
-    tcp_sockets:             Vec<TcpSocket>,
-    standalone_tcp:          Vec<TcpSocket>,
-    arp_cache_max_age_ms:    u64,
-    arp_cache_max_entries:   usize,
-    arp_queue_max_pending:   usize,
-    ip_frag_timeout_ms:      u64,
-    ip_frag_mem_limit:       usize,
-    ip_frag_per_src_max:     usize,
-    icmp_rate_limit_per_sec: u32,
-    checksum_validate_ip:    bool,
-    checksum_validate_tcp:   bool,
-    checksum_validate_udp:   bool,
-    eth_callbacks:           Vec<EthEntry>,
-    next_eth_id:             usize,
-    clock:                   Clock,
+    sock:           L,
+    interfaces:     Vec<Interface>,
+    udp_sockets:    Vec<UdpSocket>,
+    tcp_sockets:    Vec<TcpSocket>,
+    standalone_tcp: Vec<TcpSocket>,
+    eth_callbacks:  Vec<EthEntry>,
+    next_eth_id:    usize,
 }
 
 impl<L: EtherLink> Uplink<L> {
     /// Attach `iface` to this uplink.
     ///
-    /// - Registers the interface's MAC in the socket's BPF filter.
-    /// - Injects the network-wide clock into the interface.
-    /// - Applies [`NetworkConfig::arp_cache_max_age_ms`] to the interface's
-    ///   ARP cache.
-    /// - Installs a recurring ARP cache expiry timer.
+    /// The interface must already be fully configured (via
+    /// [`Interface::with_config`] or [`Interface::dummy`]).  This method
+    /// registers the MAC in the BPF filter, wires the TX closure, and
+    /// installs the recurring ARP-expiry and fragment-purge timers.
     pub fn attach(&mut self, mut iface: Interface, timers: &mut Timers) -> Result<()> {
         self.sock.attach_mac(&iface.mac())?;
-        iface.set_clock(self.clock.clone());
         iface.set_tx(self.sock.open_tx()?);
-        // Apply network-wide ARP settings and install the recurring expiry timer.
-        iface.arp_queue().set_max_age_ms(self.arp_cache_max_age_ms);
-        iface.arp_queue().set_max_entries(self.arp_cache_max_entries);
-        iface.arp_queue().set_max_pending_per_ip(self.arp_queue_max_pending);
         arp_cache::schedule_expiry(iface.arp_queue().clone(), timers);
-        // Apply network-wide fragment-reassembly settings and install the
-        // periodic purge timer.
-        iface.set_frag_config(
-            self.ip_frag_timeout_ms,
-            self.ip_frag_mem_limit,
-            self.ip_frag_per_src_max,
-        );
         iface.schedule_frag_purge(timers);
-        // Apply ICMP rate limit.
-        iface.set_icmp_rate_limit(self.icmp_rate_limit_per_sec);
-        // Apply checksum validation settings.
-        iface.set_checksum_validation(
-            self.checksum_validate_ip,
-            self.checksum_validate_tcp,
-            self.checksum_validate_udp,
-        );
         self.interfaces.push(iface);
         Ok(())
     }
@@ -454,23 +422,12 @@ impl<L: EtherLink> Network<L> {
     pub fn add_uplink(&mut self, sock: L) -> &mut Uplink<L> {
         self.uplinks.push(Uplink {
             sock,
-            interfaces:              Vec::new(),
-            udp_sockets:             Vec::new(),
-            tcp_sockets:             Vec::new(),
-            standalone_tcp:          Vec::new(),
-            arp_cache_max_age_ms:    self.config.arp_cache_max_age_ms,
-            arp_cache_max_entries:   self.config.arp_cache_max_entries,
-            arp_queue_max_pending:   self.config.arp_queue_max_pending,
-            ip_frag_timeout_ms:      self.config.ip_frag_timeout_ms,
-            ip_frag_mem_limit:       self.config.ip_frag_mem_limit,
-            ip_frag_per_src_max:     self.config.ip_frag_per_src_max,
-            icmp_rate_limit_per_sec: self.config.icmp_rate_limit_per_sec,
-            checksum_validate_ip:    self.config.checksum_validate_ip,
-            checksum_validate_tcp:   self.config.checksum_validate_tcp,
-            checksum_validate_udp:   self.config.checksum_validate_udp,
-            eth_callbacks:           Vec::new(),
-            next_eth_id:             0,
-            clock:                   self.clock.clone(),
+            interfaces:     Vec::new(),
+            udp_sockets:    Vec::new(),
+            tcp_sockets:    Vec::new(),
+            standalone_tcp: Vec::new(),
+            eth_callbacks:  Vec::new(),
+            next_eth_id:    0,
         });
         self.uplinks.last_mut().unwrap()
     }

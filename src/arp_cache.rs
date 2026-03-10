@@ -166,19 +166,8 @@ impl ArpQueue {
         self.pending.borrow_mut().entries.clear();
     }
 
-    pub fn set_max_age_ms(&self, ms: u64) {
-        self.cache.borrow_mut().max_age_ms = ms;
-    }
-
     pub fn max_age_ms(&self) -> u64 {
         self.cache.borrow().max_age_ms
-    }
-
-    /// Replace the clock with `clock`.  Called by
-    /// [`Interface::set_clock`](crate::interface::Interface::set_clock) after
-    /// `Uplink::attach` injects the network-wide shared clock.
-    pub(crate) fn set_clock(&mut self, clock: Clock) {
-        self.clock = clock;
     }
 
     /// Set the maximum number of ARP cache entries.  When the cache is full,
