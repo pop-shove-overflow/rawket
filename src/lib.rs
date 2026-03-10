@@ -21,7 +21,6 @@ pub mod af_packet;
 pub mod tcp;
 pub mod timers;
 pub mod udp;
-pub mod virtual_link;
 
 #[cfg(feature = "test-internals")]
 pub mod filter;
@@ -31,7 +30,7 @@ pub mod bridge;
 pub use network::{Network, NetworkConfig, Uplink};
 pub use af_packet::AfPacketSocket;
 pub use timers::Clock;
-pub use virtual_link::VirtualLink;
+// Note: EtherLink is pub(crate) — not re-exported publicly.
 
 // ── no_std runtime ────────────────────────────────────────────────────────────
 //
