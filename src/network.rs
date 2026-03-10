@@ -215,7 +215,6 @@ pub struct Uplink<L: EtherLink> {
     interfaces:     Vec<Interface>,
     udp_sockets:    Vec<UdpSocket>,
     tcp_sockets:    Vec<TcpSocket>,
-    standalone_tcp: Vec<TcpSocket>,
     eth_callbacks:  Vec<EthEntry>,
     next_eth_id:    usize,
 }
@@ -284,24 +283,6 @@ impl<L: EtherLink> Uplink<L> {
 
     pub fn tcp_sockets_mut(&mut self) -> &mut [TcpSocket] {
         &mut self.tcp_sockets
-    }
-
-    pub fn standalone_tcp(&self) -> &[TcpSocket] {
-        &self.standalone_tcp
-    }
-
-    pub fn standalone_tcp_mut(&mut self) -> &mut [TcpSocket] {
-        &mut self.standalone_tcp
-    }
-
-    /// Add a standalone TCP socket (from rawket_tcp_connect / rawket_tcp_accept).
-    pub fn add_standalone_tcp(&mut self, sock: TcpSocket) {
-        self.standalone_tcp.push(sock);
-    }
-
-    /// Remove the standalone TCP socket with the given source port.
-    pub(crate) fn remove_standalone_tcp(&mut self, src_port: u16) {
-        self.standalone_tcp.retain(|s| s.src_port() != src_port);
     }
 
     /// Remove the UDP socket with the given source port.
@@ -514,7 +495,6 @@ impl<L: EtherLink> Network<L> {
             interfaces:     Vec::new(),
             udp_sockets:    Vec::new(),
             tcp_sockets:    Vec::new(),
-            standalone_tcp: Vec::new(),
             eth_callbacks:  Vec::new(),
             next_eth_id:    0,
         });
@@ -658,7 +638,8 @@ impl<L: EtherLink> Network<L> {
         let tcp_now = timers.clock().monotonic_ms();
         let tcp_ms: Option<u64> = uplinks
             .iter()
-            .flat_map(|u| u.standalone_tcp())
+            .flat_map(|u| u.interfaces())
+            .flat_map(|i| i.tcp_sockets())
             .filter_map(|s| s.next_deadline_ms(tcp_now))
             .min();
 
@@ -707,8 +688,10 @@ impl<L: EtherLink> Network<L> {
             // flush_send_buf() is retried when no incoming frames are expected
             // (e.g. server waiting for the client to read data).
             for uplink in uplinks.iter_mut() {
-                for s in uplink.standalone_tcp_mut() {
-                    let _ = s.poll();
+                for iface in uplink.interfaces_mut() {
+                    for s in iface.tcp_sockets_mut() {
+                        let _ = s.poll();
+                    }
                 }
             }
         }
@@ -760,21 +743,14 @@ fn drain<L: EtherLink>(uplink: &mut Uplink<L>) -> Result<()> {
             }
         }
 
-        let (interfaces, udp_sockets, tcp_sockets, standalone_tcp) = (
-            &mut uplink.interfaces,
-            &mut uplink.udp_sockets,
-            &mut uplink.tcp_sockets,
-            &mut uplink.standalone_tcp,
-        );
-
         if dst_mac == MacAddr::BROADCAST {
-            for iface in interfaces.iter_mut() {
-                iface.receive(raw, udp_sockets, tcp_sockets, standalone_tcp)?;
+            for iface in uplink.interfaces.iter_mut() {
+                iface.receive(raw)?;
             }
         } else {
-            for iface in interfaces.iter_mut() {
+            for iface in uplink.interfaces.iter_mut() {
                 if iface.mac() == dst_mac {
-                    iface.receive(raw, udp_sockets, tcp_sockets, standalone_tcp)?;
+                    iface.receive(raw)?;
                     break;
                 }
             }

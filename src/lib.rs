@@ -43,6 +43,14 @@ pub use virtual_link::VirtualLink;
 /// Shared TX-path closure type used by interfaces and sockets.
 pub(crate) type TxFn = alloc::rc::Rc<dyn Fn(&[u8]) -> Result<()>>;
 
+/// IP-level TX closure type used by sockets that delegate ETH+IP framing to
+/// the interface.  The closure takes `(dst_ip, proto, dscp_ecn, payload)` and
+/// handles Ethernet header construction, IP header construction (with the
+/// supplied DSCP/ECN byte), and ARP resolution.
+pub(crate) type IpTxFn = alloc::rc::Rc<
+    dyn Fn(core::net::Ipv4Addr, crate::ip::IpProto, u8, &[u8]) -> Result<()>
+>;
+
 #[cfg(not(feature = "std"))]
 mod rt {
     use core::alloc::{GlobalAlloc, Layout};

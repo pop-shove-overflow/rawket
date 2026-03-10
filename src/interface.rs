@@ -354,6 +354,15 @@ impl ReassemblyTable {
     }
 }
 
+// ── EthSocket ─────────────────────────────────────────────────────────────────
+
+/// Entry in the per-interface Ethernet-tap table.
+#[allow(clippy::type_complexity)]
+pub(crate) struct EthSocket {
+    pub(crate) id:       usize,
+    pub(crate) callback: Box<dyn Fn(&[u8])>,
+}
+
 // ── Interface ─────────────────────────────────────────────────────────────────
 
 pub struct Interface {
@@ -385,6 +394,13 @@ pub struct Interface {
     pub(crate) checksum_validate_tcp: bool,
     /// Validate UDP checksum on RX.
     pub(crate) checksum_validate_udp: bool,
+    /// Per-interface Ethernet tap sockets, fired before ARP/IP dispatch.
+    eth_sockets:  Vec<EthSocket>,
+    next_eth_id:    usize,
+    /// UDP sockets registered on this interface for inbound dispatch.
+    pub(crate) udp_sockets:    Vec<UdpSocket>,
+    /// TCP sockets registered on this interface (both passive-accept and connect/listen).
+    pub(crate) tcp_sockets:    Vec<TcpSocket>,
 }
 
 /// Configuration bundle for [`Interface::with_config`].
@@ -452,6 +468,10 @@ impl Interface {
             checksum_validate_ip:  cfg.checksum_validate_ip,
             checksum_validate_tcp: cfg.checksum_validate_tcp,
             checksum_validate_udp: cfg.checksum_validate_udp,
+            eth_sockets:  Vec::new(),
+            next_eth_id:    0,
+            udp_sockets:    Vec::new(),
+            tcp_sockets:    Vec::new(),
         }
     }
 
@@ -505,9 +525,74 @@ impl Interface {
         self.tx = tx;
     }
 
-    /// Clone the shared TX closure for use by a socket.
-    pub(crate) fn tx(&self) -> crate::TxFn {
+    /// Return a clone of the TX closure for use as a raw Ethernet TX path.
+    ///
+    /// The caller can invoke the returned closure to transmit arbitrary
+    /// Ethernet frames via this interface's physical uplink.  This is the
+    /// preferred way for `EthSocket` holders to send frames without going
+    /// through the ARP / IP / socket layers.
+    pub fn open_eth_tx(&self) -> crate::TxFn {
         Rc::clone(&self.tx)
+    }
+
+    /// Return an IP-level TX closure for use by sockets that should not build
+    /// Ethernet or IPv4 headers directly.
+    ///
+    /// The returned closure takes `(dst_ip, proto, dscp_ecn, payload)` and:
+    /// 1. Builds a complete Ethernet + IPv4 frame with `src` set to this
+    ///    interface's MAC and IP addresses and the supplied DSCP/ECN byte.
+    /// 2. Runs the frame through the interface-level ARP queue: if the dst MAC
+    ///    is cached it is filled in and the frame is sent immediately; if not,
+    ///    the frame is queued and an ARP Request is broadcast.
+    ///
+    /// The closure captures `Rc` clones of the ARP queue and the raw TX path,
+    /// so it remains valid after the interface is moved.
+    pub(crate) fn open_ip_tx(&self) -> crate::IpTxFn {
+        use crate::{
+            arp_cache::{self, PushResult},
+            eth::{EthHdr, EtherType, HDR_LEN as ETH_HDR_LEN},
+            ip::{IpProto, Ipv4Hdr, MIN_HDR_LEN as IP_HDR_LEN},
+        };
+        use core::cell::Cell;
+
+        let arp     = self.arp.clone();
+        let tx      = Rc::clone(&self.tx);
+        let src_ip  = self.ip.map(|c| c.addr()).unwrap_or(core::net::Ipv4Addr::UNSPECIFIED);
+        let src_mac = self.mac;
+        let tx_id   = Rc::new(Cell::new(0u16));
+
+        Rc::new(move |dst_ip: core::net::Ipv4Addr, proto: IpProto, dscp_ecn: u8, payload: &[u8]| -> crate::Result<()> {
+            let frame_len = ETH_HDR_LEN + IP_HDR_LEN + payload.len();
+            let mut frame = alloc::vec![0u8; frame_len];
+
+            EthHdr { dst: crate::eth::MacAddr::ZERO, src: src_mac, ethertype: EtherType::IPV4 }
+                .emit(&mut frame[..ETH_HDR_LEN])?;
+
+            let id = tx_id.get().wrapping_add(1);
+            tx_id.set(id);
+            Ipv4Hdr {
+                ihl:        5,
+                dscp_ecn,
+                total_len:  (IP_HDR_LEN + payload.len()) as u16,
+                id,
+                flags_frag: 0x4000, // DF=1
+                ttl:        64,
+                proto,
+                src:        src_ip,
+                dst:        dst_ip,
+            }
+            .emit(&mut frame[ETH_HDR_LEN..])?;
+
+            frame[ETH_HDR_LEN + IP_HDR_LEN..].copy_from_slice(payload);
+
+            match arp.push_frame(dst_ip, frame) {
+                PushResult::Sent(f) => tx(&f),
+                PushResult::Queued  => Ok(()),
+                PushResult::FirstForIp => {
+                    arp_cache::send_request(src_mac, src_ip, dst_ip, |f| tx(f))
+                }
+            }
+        })
     }
 
     /// Return a reference to the clock driving this interface.
@@ -548,6 +633,67 @@ impl Interface {
         schedule_frag_purge_inner(Rc::clone(&self.reasm), timers);
     }
 
+    /// Register a callback invoked for every received Ethernet frame on this
+    /// interface (tap, not intercept).  Callbacks fire **before** ARP/IP
+    /// dispatch so they see every frame, including those that will also be
+    /// processed by the IP stack.
+    ///
+    /// Returns an opaque ID for use with [`remove_eth_socket`].
+    pub fn add_eth_socket(&mut self, cb: impl Fn(&[u8]) + 'static) -> usize {
+        let id = self.next_eth_id;
+        self.next_eth_id += 1;
+        self.eth_sockets.push(EthSocket { id, callback: Box::new(cb) });
+        id
+    }
+
+    /// Remove the Ethernet tap socket registered with the given `id`.  No-op
+    /// if the ID is not present.
+    pub fn remove_eth_socket(&mut self, id: usize) {
+        self.eth_sockets.retain(|e| e.id != id);
+    }
+
+    // ── Socket registration ──────────────────────────────────────────────────
+
+    /// Register a UDP socket for inbound dispatch on this interface.
+    pub fn add_udp_socket(&mut self, sock: UdpSocket) {
+        self.udp_sockets.push(sock);
+    }
+
+    /// Deregister the UDP socket with `src_port`.
+    pub(crate) fn remove_udp_socket(&mut self, src_port: u16) {
+        self.udp_sockets.retain(|s| s.src_port() != src_port);
+    }
+
+    /// Register a TCP socket on this interface (passive-accept or connect/listen).
+    pub fn add_tcp_socket(&mut self, sock: TcpSocket) {
+        self.tcp_sockets.push(sock);
+    }
+
+    /// Return a slice of TCP sockets on this interface.
+    pub fn tcp_sockets(&self) -> &[TcpSocket] {
+        &self.tcp_sockets
+    }
+
+    /// Return a mutable slice of TCP sockets on this interface.
+    pub fn tcp_sockets_mut(&mut self) -> &mut [TcpSocket] {
+        &mut self.tcp_sockets
+    }
+
+    /// Deregister the TCP socket with `src_port`.
+    pub(crate) fn remove_tcp_socket(&mut self, src_port: u16) {
+        self.tcp_sockets.retain(|s| s.src_port() != src_port);
+    }
+
+    /// Drive one cycle of interface processing:
+    ///
+    /// Drive TCP timer callbacks (RTO, TLP, keep-alive, TimeWait) for
+    /// every TCP socket registered on this interface.
+    pub fn poll(&mut self) {
+        for sock in &mut self.tcp_sockets {
+            let _ = sock.poll();
+        }
+    }
+
     // ── L3 receive handler ───────────────────────────────────────────────────
 
     /// Process one inbound Ethernet frame at Layer 3.
@@ -569,11 +715,14 @@ impl Interface {
     /// - Any other proto → ICMP Type 3 Code 2.
     pub fn receive(
         &mut self,
-        raw:            &[u8],
-        udp_sockets:    &mut [UdpSocket],
-        tcp_sockets:    &mut [TcpSocket],
-        standalone_tcp: &mut [TcpSocket],
+        raw: &[u8],
     ) -> Result<()> {
+        // Fire per-interface Ethernet tap sockets BEFORE any ARP/IP handling,
+        // so raw-frame taps (e.g. DHCP) see every frame addressed to us.
+        for entry in &self.eth_sockets {
+            (entry.callback)(raw);
+        }
+
         let cidr = match self.ip {
             Some(c) => c,
             None => return Ok(()),
@@ -631,12 +780,12 @@ impl Interface {
                 if ip.is_fragment() {
                     let maybe_frame = self.reasm.borrow_mut().insert(eth, ip, ip_buf);
                     if let Some(frame) = maybe_frame {
-                        self.dispatch_ipv4(&frame, udp_sockets, tcp_sockets, standalone_tcp)?;
+                        self.dispatch_ipv4(&frame)?;
                     }
                     return Ok(());
                 }
 
-                self.dispatch_ipv4(raw, udp_sockets, tcp_sockets, standalone_tcp)?;
+                self.dispatch_ipv4(raw)?;
             }
             _ => {} // unknown EtherType — silently ignore
         }
@@ -650,13 +799,7 @@ impl Interface {
     /// to the appropriate L4 handler.
     ///
     /// `raw` must be a valid Ethernet+IPv4 frame.
-    fn dispatch_ipv4(
-        &mut self,
-        raw:            &[u8],
-        udp_sockets:    &mut [UdpSocket],
-        tcp_sockets:    &mut [TcpSocket],
-        standalone_tcp: &mut [TcpSocket],
-    ) -> Result<()> {
+    fn dispatch_ipv4(&mut self, raw: &[u8]) -> Result<()> {
         let eth    = EthHdr::parse(raw)?;
         let ip_buf = eth.payload(raw);
         // IP checksum was already validated in receive(); skip here.
@@ -694,9 +837,7 @@ impl Interface {
                                 let new_mss = next_hop_mtu.saturating_sub(
                                     IP_HDR_LEN as u16 + TCP_HDR_LEN as u16,
                                 );
-                                for s in tcp_sockets.iter_mut()
-                                    .chain(standalone_tcp.iter_mut())
-                                {
+                                for s in self.tcp_sockets.iter_mut() {
                                     if s.matches_flow(
                                         SocketAddrV4::new(orig_ip.src, orig_src_port),
                                         SocketAddrV4::new(orig_ip.dst, orig_dst_port),
@@ -710,7 +851,14 @@ impl Interface {
                     _ => {}
                 }
             }
-            IpProto::UDP  => { udp::dispatch(self, raw, udp_sockets)?; }
+            IpProto::UDP  => {
+                // Temporarily move the socket vec out so we can call
+                // dispatch with `&mut self` for ICMP TX while still iterating
+                // the sockets.  The vec is restored immediately after.
+                let mut socks = core::mem::take(&mut self.udp_sockets);
+                udp::dispatch(self, raw, &mut socks)?;
+                self.udp_sockets = socks;
+            }
             IpProto::TCP  => {
                 let tcp_buf = ip.payload(ip_buf);
                 if self.checksum_validate_tcp {
@@ -723,14 +871,24 @@ impl Interface {
                 }
                 if tcp_buf.len() >= 4 {
                     let dst_port = u16::from_be_bytes([tcp_buf[2], tcp_buf[3]]);
-                    for s in standalone_tcp.iter_mut() {
+                    // Check tcp_sockets for an exact-match socket (active/passive).
+                    let mut socks = core::mem::take(&mut self.tcp_sockets);
+                    let found = socks.iter_mut().any(|s| {
                         if s.src_port() == dst_port {
                             let _ = s.process_segment(raw);
-                            return Ok(());
+                            true
+                        } else {
+                            false
                         }
+                    });
+                    self.tcp_sockets = socks;
+                    if found {
+                        return Ok(());
                     }
                 }
-                tcp::dispatch(self, raw, tcp_sockets)?;
+                let mut socks = core::mem::take(&mut self.tcp_sockets);
+                tcp::dispatch(self, raw, &mut socks)?;
+                self.tcp_sockets = socks;
             }
             _ => {
                 let _ = self.send_icmp_unreachable(raw, 2);

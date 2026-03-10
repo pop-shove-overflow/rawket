@@ -255,6 +255,14 @@ impl ArpQueue {
     pub fn drop_pending(&self, dst_ip: Ipv4Addr) {
         self.pending.borrow_mut().entries.retain(|e| e.dst_ip != dst_ip);
     }
+
+    /// Return the number of frames currently queued for `dst_ip`.
+    ///
+    /// Used by sockets to detect the transition from 0 → 1 (i.e. `FirstForIp`)
+    /// when using an IP-level TX closure that hides the [`PushResult`] variant.
+    pub(crate) fn pending_count_for(&self, dst_ip: Ipv4Addr) -> usize {
+        self.pending.borrow().entries.iter().filter(|e| e.dst_ip == dst_ip).count()
+    }
 }
 
 // ── ARP request ───────────────────────────────────────────────────────────────

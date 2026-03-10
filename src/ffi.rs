@@ -757,21 +757,23 @@ fn c_tcp_recv_dispatch(pkt: TcpPacket<'_>) {
     }
 }
 
-/// Fire pending error callbacks for all standalone TCP sockets in `net`.
+/// Fire pending error callbacks for all TCP sockets owned by interfaces in `net`.
 /// Called from rawket_network_poll_rx after poll_rx_with_timeout returns.
 fn fire_tcp_errors(net: &mut Network<AfPacketSocket>) {
     unsafe {
         if C_TCP_TABLE_PTR.is_null() { return; }
         for uplink in net.uplinks_mut() {
-            for tcp in uplink.standalone_tcp_mut() {
-                if let Some(err) = tcp.last_error.take() {
-                    let src_port = tcp.src_port();
-                    for entry in &*C_TCP_TABLE_PTR {
-                        if entry.src_port == src_port {
-                            if let Some(cb) = entry.on_error_c {
-                                cb(err, entry.error_ud);
+            for iface in uplink.interfaces_mut() {
+                for tcp in iface.tcp_sockets_mut() {
+                    if let Some(err) = tcp.last_error.take() {
+                        let src_port = tcp.src_port();
+                        for entry in &*C_TCP_TABLE_PTR {
+                            if entry.src_port == src_port {
+                                if let Some(cb) = entry.on_error_c {
+                                    cb(err, entry.error_ud);
+                                }
+                                break;
                             }
-                            break;
                         }
                     }
                 }
@@ -782,7 +784,7 @@ fn fire_tcp_errors(net: &mut Network<AfPacketSocket>) {
 
 // ── TCP ───────────────────────────────────────────────────────────────────────
 
-/// Lightweight handle to a standalone [`TcpSocket`] stored in the uplink.
+/// Lightweight handle to a [`TcpSocket`] owned by an [`Interface`].
 pub struct RawketTcpSocket {
     net:      *mut RawketNetwork,
     intf_idx: usize,
@@ -844,7 +846,9 @@ pub unsafe extern "C" fn rawket_tcp_connect(
             Err(e) => { set_errno(e); return ptr::null_mut(); }
         }
     };
-    unsafe { &mut (*net).0 }.uplinks_mut()[intf_idx].add_standalone_tcp(sock);
+    if let Some(iface) = unsafe { &mut (*net).0 }.uplinks_mut()[intf_idx].interfaces_mut().first_mut() {
+        iface.add_tcp_socket(sock);
+    }
     c_tcp_table().push(TcpCbEntry {
         src_port,
         on_recv_c:  on_recv,
@@ -892,7 +896,9 @@ pub unsafe extern "C" fn rawket_tcp_listen(
             Err(e) => { set_errno(e); return ptr::null_mut(); }
         }
     };
-    unsafe { &mut (*net).0 }.uplinks_mut()[uplink_idx].add_standalone_tcp(sock);
+    if let Some(iface) = unsafe { &mut (*net).0 }.uplinks_mut()[uplink_idx].interfaces_mut().first_mut() {
+        iface.add_tcp_socket(sock);
+    }
     // Register callbacks in the table.
     c_tcp_table().push(TcpCbEntry {
         src_port,
@@ -912,7 +918,9 @@ pub unsafe extern "C" fn rawket_tcp_close(sock: *mut RawketTcpSocket) {
     if !s.net.is_null() {
         let net = unsafe { &mut (*s.net).0 };
         if s.intf_idx < net.uplinks().len() {
-            net.uplinks_mut()[s.intf_idx].remove_standalone_tcp(s.src_port);
+            if let Some(iface) = net.uplinks_mut()[s.intf_idx].interfaces_mut().first_mut() {
+                iface.remove_tcp_socket(s.src_port);
+            }
         }
     }
     // Remove from the C callback table.
@@ -936,8 +944,11 @@ pub unsafe extern "C" fn rawket_tcp_state(sock: *const RawketTcpSocket) -> c_int
         if s.net.is_null() { return State::Closed; }
         let net = unsafe { &(*s.net).0 };
         if s.intf_idx >= net.uplinks().len() { return State::Closed; }
-        let standalone = net.uplinks()[s.intf_idx].standalone_tcp();
-        standalone.iter()
+        let iface = match net.uplinks()[s.intf_idx].interfaces().first() {
+            Some(i) => i,
+            None    => return State::Closed,
+        };
+        iface.tcp_sockets().iter()
             .find(|t| t.src_port() == s.src_port)
             .map_or(State::Closed, |t| t.state)
     }
@@ -959,8 +970,9 @@ pub unsafe extern "C" fn rawket_tcp_send(
     if s.net.is_null() { set_errno_raw(libc::ENOTCONN); return -1; }
     let net = unsafe { &mut (*s.net).0 };
     if s.intf_idx >= net.uplinks().len() { set_errno_raw(libc::ENOENT); return -1; }
-    let standalone = net.uplinks_mut()[s.intf_idx].standalone_tcp_mut();
-    match standalone.iter_mut().find(|t| t.src_port() == s.src_port) {
+    match net.uplinks_mut()[s.intf_idx].interfaces_mut().first_mut()
+        .and_then(|i| i.tcp_sockets_mut().iter_mut().find(|t| t.src_port() == s.src_port))
+    {
         None => { set_errno_raw(libc::ENOTCONN); -1 }
         Some(t) => match t.send(data) {
             Ok(()) => 0,
@@ -985,8 +997,9 @@ pub unsafe extern "C" fn rawket_tcp_recv(
     if s.net.is_null() { return 0; }
     let net = unsafe { &mut (*s.net).0 };
     if s.intf_idx >= net.uplinks().len() { return 0; }
-    let standalone = net.uplinks_mut()[s.intf_idx].standalone_tcp_mut();
-    match standalone.iter_mut().find(|t| t.src_port() == s.src_port) {
+    match net.uplinks_mut()[s.intf_idx].interfaces_mut().first_mut()
+        .and_then(|i| i.tcp_sockets_mut().iter_mut().find(|t| t.src_port() == s.src_port))
+    {
         None => 0,
         Some(t) => match t.recv(buf_slice) {
             Some(n) => n as c_int,
@@ -1006,8 +1019,9 @@ pub unsafe extern "C" fn rawket_tcp_shutdown(sock: *mut RawketTcpSocket) -> c_in
     if s.net.is_null() { return 0; }
     let net = unsafe { &mut (*s.net).0 };
     if s.intf_idx >= net.uplinks().len() { return 0; }
-    let standalone = net.uplinks_mut()[s.intf_idx].standalone_tcp_mut();
-    match standalone.iter_mut().find(|t| t.src_port() == s.src_port) {
+    match net.uplinks_mut()[s.intf_idx].interfaces_mut().first_mut()
+        .and_then(|i| i.tcp_sockets_mut().iter_mut().find(|t| t.src_port() == s.src_port))
+    {
         None => 0,
         Some(t) => match t.close() {
             Ok(()) => 0,
@@ -1033,7 +1047,7 @@ pub unsafe extern "C" fn rawket_network_poll_rx(
         Ok(()) => {}
         Err(e) => { set_errno(e); return -1; }
     }
-    // Fire pending error callbacks for all standalone TCP sockets.
+    // Fire pending error callbacks for all interface TCP sockets.
     fire_tcp_errors(unsafe { &mut (*net).0 });
     0
 }
