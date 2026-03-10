@@ -50,9 +50,12 @@ use core::cell::Cell;
 
 #[cfg(feature = "test-internals")]
 struct ClockInner {
-    offset_ms:        Cell<i64>,
+    /// Offset applied to raw CLOCK_MONOTONIC/CLOCK_REALTIME reads, in nanoseconds.
+    offset_ns:        Cell<i64>,
     paused:           Cell<bool>,
+    /// Frozen apparent time in nanoseconds (set on pause).
     frozen_monotonic: Cell<u64>,
+    /// Frozen apparent wall-clock time in nanoseconds (set on pause).
     frozen_wall:      Cell<u64>,
 }
 
@@ -67,7 +70,7 @@ impl Default for Clock {
     fn default() -> Self {
         Clock {
             inner: Rc::new(ClockInner {
-                offset_ms:        Cell::new(0),
+                offset_ns:        Cell::new(0),
                 paused:           Cell::new(false),
                 frozen_monotonic: Cell::new(0),
                 frozen_wall:      Cell::new(0),
@@ -78,50 +81,70 @@ impl Default for Clock {
 
 #[cfg(feature = "test-internals")]
 impl Clock {
-    fn raw_monotonic_ms() -> u64 {
+    fn raw_monotonic_ns() -> u64 {
         let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-        ts.tv_sec as u64 * 1_000 + ts.tv_nsec as u64 / 1_000_000
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
     }
 
-    fn raw_wall_clock_ms() -> u64 {
+    fn raw_wall_clock_ns() -> u64 {
         let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
-        ts.tv_sec as u64 * 1_000 + ts.tv_nsec as u64 / 1_000_000
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
     }
 
-    pub fn monotonic_ms(&self) -> u64 {
+    /// Returns the apparent monotonic time in nanoseconds.
+    fn monotonic_ns(&self) -> u64 {
         if self.inner.paused.get() {
             self.inner.frozen_monotonic.get()
         } else {
-            let raw = Self::raw_monotonic_ms();
-            (raw as i64 + self.inner.offset_ms.get()) as u64
+            let raw = Self::raw_monotonic_ns();
+            (raw as i64 + self.inner.offset_ns.get()) as u64
         }
     }
 
-    pub fn wall_clock_ms(&self) -> u64 {
+    /// Returns the apparent wall-clock time in nanoseconds.
+    fn wall_clock_ns(&self) -> u64 {
         if self.inner.paused.get() {
             self.inner.frozen_wall.get()
         } else {
-            let raw = Self::raw_wall_clock_ms();
-            (raw as i64 + self.inner.offset_ms.get()) as u64
+            let raw = Self::raw_wall_clock_ns();
+            (raw as i64 + self.inner.offset_ns.get()) as u64
         }
     }
 
-    /// Advance apparent time by `ms` milliseconds.
+    pub fn monotonic_ms(&self) -> u64 {
+        self.monotonic_ns() / 1_000_000
+    }
+
+    pub fn wall_clock_ms(&self) -> u64 {
+        self.wall_clock_ns() / 1_000_000
+    }
+
+    /// Advance apparent time by `ns` nanoseconds.
     ///
     /// If paused, adjusts the frozen values directly; otherwise adjusts the
     /// offset applied to `clock_gettime` results.
-    pub fn advance(&self, ms: i64) {
+    pub fn advance_ns(&self, ns: i64) {
         if self.inner.paused.get() {
             let m = self.inner.frozen_monotonic.get();
             let w = self.inner.frozen_wall.get();
-            self.inner.frozen_monotonic.set((m as i64 + ms) as u64);
-            self.inner.frozen_wall.set((w as i64 + ms) as u64);
+            self.inner.frozen_monotonic.set((m as i64 + ns) as u64);
+            self.inner.frozen_wall.set((w as i64 + ns) as u64);
         } else {
-            let off = self.inner.offset_ms.get();
-            self.inner.offset_ms.set(off + ms);
+            let off = self.inner.offset_ns.get();
+            self.inner.offset_ns.set(off + ns);
         }
+    }
+
+    /// Advance apparent time by `us` microseconds (`us * 1_000` nanoseconds).
+    pub fn advance_us(&self, us: i64) {
+        self.advance_ns(us * 1_000);
+    }
+
+    /// Advance apparent time by `ms` milliseconds (`ms * 1_000_000` nanoseconds).
+    pub fn advance_ms(&self, ms: i64) {
+        self.advance_ns(ms * 1_000_000);
     }
 
     /// Freeze time: subsequent calls to `monotonic_ms` / `wall_clock_ms`
@@ -129,8 +152,8 @@ impl Clock {
     /// is called.
     pub fn pause(&self) {
         if !self.inner.paused.get() {
-            self.inner.frozen_monotonic.set(self.monotonic_ms());
-            self.inner.frozen_wall.set(self.wall_clock_ms());
+            self.inner.frozen_monotonic.set(self.monotonic_ns());
+            self.inner.frozen_wall.set(self.wall_clock_ns());
             self.inner.paused.set(true);
         }
     }
@@ -142,8 +165,8 @@ impl Clock {
     pub fn resume(&self) {
         if self.inner.paused.get() {
             let frozen_m = self.inner.frozen_monotonic.get();
-            let raw_m = Self::raw_monotonic_ms();
-            self.inner.offset_ms.set(frozen_m as i64 - raw_m as i64);
+            let raw_m = Self::raw_monotonic_ns();
+            self.inner.offset_ns.set(frozen_m as i64 - raw_m as i64);
             self.inner.paused.set(false);
         }
     }
