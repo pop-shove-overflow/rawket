@@ -1,9 +1,8 @@
 /// Top-level network runtime.
 ///
 /// A [`Network`] owns a set of [`Uplink`]s — one per physical interface
-/// (ifindex).  Each [`Uplink`] pairs one shared [`EtherLink`] with the
-/// [`Interface`]s (Layer-3 virtual NICs) that are multiplexed over it, plus
-/// the [`UdpSocket`]s and [`TcpSocket`]s registered on those interfaces.
+/// (ifindex) — and a flat [`Vec`] of [`Interface`]s.  Each [`Uplink`] records
+/// which interface indices it drives via `iface_indices`.
 ///
 /// [`Network::poll_rx`] is the single entry point for inbound traffic: it
 /// updates the timer system, blocks in `poll(2)` for the appropriate
@@ -14,14 +13,12 @@ use crate::{
     eth::MacAddr,
     interface::{Interface, InterfaceConfig},
     ip::Ipv4Cidr,
-    af_packet::{AfPacketSocket, EtherLink, FRAME_SIZE},
-    tcp::{TcpConfig, TcpSocket},
+    af_packet::{AfPacketSocket, EtherLink},
+    tcp::TcpConfig,
     timers::{Clock, Timers},
-    udp::UdpSocket,
-    virtual_link::VirtualLink,
     Error, Result,
 };
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 
 // ── NetworkConfig ─────────────────────────────────────────────────────────────
 
@@ -191,7 +188,7 @@ pub(crate) struct Route {
 /// Result of a successful [`Network::route_get`] lookup.
 #[derive(Clone, Copy)]
 pub(crate) struct RouteResult {
-    /// Index into `Network::uplinks` — the egress uplink.
+    /// Index into `Network::interfaces` — the egress interface.
     pub intf_idx:   usize,
     /// Source address assigned to the egress interface.
     pub src_ip:     Ipv4Addr,
@@ -199,114 +196,89 @@ pub(crate) struct RouteResult {
     pub nexthop_ip: Ipv4Addr,
 }
 
-// ── Uplink ────────────────────────────────────────────────────────────────────
+// ── AnyLink ───────────────────────────────────────────────────────────────────
 
-/// Entry in the per-uplink Ethernet-tap table.
-#[allow(clippy::type_complexity)]
-struct EthEntry {
-    id:       usize,
-    callback: Box<dyn Fn(&[u8])>,
+/// Type-erased Ethernet link.
+///
+/// Currently wraps only real AF_PACKET sockets.  Virtual/bridge-based
+/// interfaces are created without an uplink and receive frames via
+/// [`Interface::rx_queue`](crate::interface::Interface::rx_queue) instead.
+pub(crate) enum AnyLink {
+    AfPacket(AfPacketSocket),
 }
 
-/// One physical uplink: a shared [`EtherLink`], the L3 [`Interface`]s
-/// multiplexed over it, and the L4 sockets registered on those interfaces.
-pub struct Uplink<L: EtherLink> {
-    sock:           L,
-    interfaces:     Vec<Interface>,
-    udp_sockets:    Vec<UdpSocket>,
-    tcp_sockets:    Vec<TcpSocket>,
-    eth_callbacks:  Vec<EthEntry>,
-    next_eth_id:    usize,
-}
-
-impl<L: EtherLink> Uplink<L> {
-    /// Attach `iface` to this uplink.
-    ///
-    /// The interface must already be fully configured (via
-    /// [`Interface::with_config`]).  This method
-    /// registers the MAC in the BPF filter, wires the TX closure, and
-    /// installs the recurring ARP-expiry and fragment-purge timers.
-    pub fn attach(&mut self, mut iface: Interface, timers: &mut Timers) -> Result<()> {
-        self.sock.attach_mac(&iface.mac())?;
-        iface.set_tx(self.sock.open_tx()?);
-        arp_cache::schedule_expiry(iface.arp_queue().clone(), timers);
-        iface.schedule_frag_purge(timers);
-        self.interfaces.push(iface);
-        Ok(())
+impl AnyLink {
+    pub(crate) fn kernel_ifindex(&self) -> i32 {
+        match self {
+            AnyLink::AfPacket(s) => s.kernel_ifindex(),
+        }
     }
+}
 
-    /// Remove the interface with the given MAC and unregister it from the
-    /// BPF filter.  Returns the interface if found, `None` otherwise.
-    ///
-    /// Marks the interface's ARP queue as dead, which stops the
-    /// self-rescheduling expiry timer and drops all queued outbound frames.
-    pub fn detach(&mut self, mac: &MacAddr) -> Result<Option<Interface>> {
-        if let Some(idx) = self.interfaces.iter().position(|i| &i.mac() == mac) {
-            let iface = self.interfaces.remove(idx);
-            iface.arp_queue().mark_dead();
-            self.sock.detach_mac(mac)?;
-            Ok(Some(iface))
-        } else {
-            Ok(None)
+impl EtherLink for AnyLink {
+    fn rx_recv(&mut self) -> Option<&[u8]> {
+        match self {
+            AnyLink::AfPacket(s) => s.rx_recv(),
         }
     }
 
-    /// Register a UDP socket for callback-based delivery via [`Network::poll_rx`].
-    pub fn add_udp_socket(&mut self, sock: UdpSocket) {
-        self.udp_sockets.push(sock);
+    fn rx_release(&mut self) {
+        match self {
+            AnyLink::AfPacket(s) => s.rx_release(),
+        }
     }
 
-    /// Register a TCP socket for callback-based delivery via [`Network::poll_rx`].
-    pub fn add_tcp_socket(&mut self, sock: TcpSocket) {
-        self.tcp_sockets.push(sock);
+    fn tx_send(&mut self, frame: &[u8]) -> Result<()> {
+        match self {
+            AnyLink::AfPacket(s) => s.tx_send(frame),
+        }
     }
 
-    pub fn interfaces(&self) -> &[Interface] {
-        &self.interfaces
+    fn open_tx(&self) -> Result<crate::TxFn> {
+        match self {
+            AnyLink::AfPacket(s) => s.open_tx(),
+        }
     }
 
-    pub fn interfaces_mut(&mut self) -> &mut [Interface] {
-        &mut self.interfaces
+    fn fd(&self) -> libc::c_int {
+        match self {
+            AnyLink::AfPacket(s) => s.fd(),
+        }
     }
 
-    pub fn udp_sockets(&self) -> &[UdpSocket] {
-        &self.udp_sockets
+    fn attach_mac(&mut self, mac: &MacAddr) -> Result<()> {
+        match self {
+            AnyLink::AfPacket(s) => s.attach_mac(mac),
+        }
     }
 
-    pub fn udp_sockets_mut(&mut self) -> &mut [UdpSocket] {
-        &mut self.udp_sockets
+    fn detach_mac(&mut self, mac: &MacAddr) -> Result<()> {
+        match self {
+            AnyLink::AfPacket(s) => s.detach_mac(mac),
+        }
     }
+}
 
-    pub fn tcp_sockets(&self) -> &[TcpSocket] {
-        &self.tcp_sockets
-    }
+// ── Uplink ────────────────────────────────────────────────────────────────────
 
-    pub fn tcp_sockets_mut(&mut self) -> &mut [TcpSocket] {
-        &mut self.tcp_sockets
-    }
+/// One physical uplink: a concrete [`AnyLink`] and the indices of the
+/// [`Interface`]s (stored in [`Network::interfaces`]) multiplexed over it.
+///
+/// # Layer boundary
+///
+/// `Uplink` is the L1/L2 physical boundary.  It delivers raw Ethernet frames
+/// to [`Interface`]s but does **not** parse frame content itself — no EtherType
+/// inspection, no header stripping.  All L2/L3 parsing is delegated to
+/// [`Interface::receive`], which is the authoritative L2/L3 entry point.
+pub struct Uplink {
+    pub(crate) sock:         AnyLink,
+    pub(crate) iface_indices: Vec<usize>,
+}
 
-    /// Remove the UDP socket with the given source port.
-    pub(crate) fn remove_udp_socket(&mut self, src_port: u16) {
-        self.udp_sockets.retain(|s| s.src_port() != src_port);
-    }
-
-    pub(crate) fn socket_mut(&mut self) -> &mut L {
-        &mut self.sock
-    }
-
-    /// Register a callback invoked for every received Ethernet frame (tap,
-    /// not intercept).  Returns an opaque ID for use with
-    /// [`remove_eth_callback`].
-    pub(crate) fn add_eth_callback(&mut self, cb: impl Fn(&[u8]) + 'static) -> usize {
-        let id = self.next_eth_id;
-        self.next_eth_id += 1;
-        self.eth_callbacks.push(EthEntry { id, callback: Box::new(cb) });
-        id
-    }
-
-    /// Remove the callback registered with the given `id`.
-    pub(crate) fn remove_eth_callback(&mut self, id: usize) {
-        self.eth_callbacks.retain(|e| e.id != id);
+impl Uplink {
+    /// Return the OS file descriptor for this uplink (for use with `poll(2)`).
+    pub(crate) fn fd(&self) -> libc::c_int {
+        self.sock.fd()
     }
 
     /// Transmit a raw Ethernet frame via this uplink's TX ring.
@@ -314,159 +286,131 @@ impl<L: EtherLink> Uplink<L> {
         self.sock.tx_send(frame)
     }
 
-    /// Replace the MAC on the first attached interface, updating the BPF
-    /// filter accordingly.
-    pub(crate) fn set_iface_mac(&mut self, new_mac: MacAddr) -> Result<()> {
-        let iface = self.interfaces.first_mut().ok_or(Error::InvalidInput)?;
-        let old   = iface.mac();
-        self.sock.detach_mac(&old)?;
-        iface.set_mac(new_mac);
-        self.sock.attach_mac(&new_mac)?;
-        Ok(())
+    /// Return the next received Ethernet frame, or None if the ring is empty.
+    /// Caller must process the frame before calling again (single-frame contract).
+    pub(crate) fn recv_next(&mut self) -> Option<Vec<u8>> {
+        let frame = self.sock.rx_recv()?;
+        let data = frame.to_vec();
+        self.sock.rx_release();
+        Some(data)
+    }
+
+}
+
+// ── InterfaceBuilder ─────────────────────────────────────────────────────────
+
+/// Fluent builder returned by [`Network::add_interface`].
+pub struct InterfaceBuilder<'a> {
+    network: &'a mut Network,
+    mac:     MacAddr,
+}
+
+impl<'a> InterfaceBuilder<'a> {
+    /// Attach to a live AF_PACKET socket on the named kernel interface.
+    ///
+    /// Resolves the kernel ifindex for `ifname`; if an existing [`Uplink`]
+    /// already owns that ifindex the new interface shares its socket (enabling
+    /// multiple MACs on one AF_PACKET fd).  Otherwise a new socket is opened
+    /// and a new `Uplink` is created.
+    ///
+    /// Returns the interface index (`iface_idx`).
+    pub fn bind_afpacket(self, ifname: &[u8]) -> Result<usize> {
+        let kernel_ifindex = AfPacketSocket::lookup_kernel_ifindex(ifname)?;
+
+        // Find an existing uplink for this ifindex, or open a new socket.
+        let uplink_idx = if let Some(idx) = self.network.uplinks
+            .iter()
+            .position(|u| u.sock.kernel_ifindex() == kernel_ifindex)
+        {
+            idx
+        } else {
+            let sock = AfPacketSocket::open(kernel_ifindex)?;
+            self.network.add_uplink_raw(AnyLink::AfPacket(sock))
+        };
+
+        let iface = Interface::with_config(
+            ifname,
+            self.mac,
+            Some(kernel_ifindex),
+            self.network.interface_config(),
+        );
+        self.network.attach_to_uplink(uplink_idx, iface)
+    }
+
+    /// Create an unbound interface (no AF_PACKET socket, no uplink).
+    ///
+    /// The interface receives frames only via its
+    /// [`rx_queue`](Interface::rx_queue) — suitable for bridge-based test
+    /// setups and simulation.  Returns the interface index (`iface_idx`).
+    pub fn finish(self) -> usize {
+        let iface = Interface::with_config(
+            b"",
+            self.mac,
+            None,
+            self.network.interface_config(),
+        );
+        let iface_idx = self.network.interfaces.len();
+        let timers = &mut self.network.timers;
+        arp_cache::schedule_expiry(iface.arp_queue().clone(), timers);
+        iface.schedule_frag_purge(timers);
+        self.network.interfaces.push(iface);
+        iface_idx
     }
 }
 
 // ── Network ───────────────────────────────────────────────────────────────────
 
-/// Top-level network runtime — owns all uplinks and drives inbound traffic.
-pub struct Network<L: EtherLink> {
-    uplinks: Vec<Uplink<L>>,
-    config:  NetworkConfig,
-    timers:  Timers,
-    routes:  Vec<Route>,
-    clock:   Clock,
+/// Top-level network runtime — owns all uplinks, interfaces, and drives
+/// inbound traffic.
+///
+/// `Network` is concrete (non-generic).  Physical links are abstracted via
+/// [`AnyLink`] inside each [`Uplink`].
+pub struct Network {
+    pub(crate) uplinks:    Vec<Uplink>,
+    pub(crate) interfaces: Vec<Interface>,
+    config:                NetworkConfig,
+    timers:                Timers,
+    routes:                Vec<Route>,
+    clock:                 Clock,
 }
 
-impl Default for Network<AfPacketSocket> {
+impl Default for Network {
     fn default() -> Self { Self::new() }
 }
 
-impl Network<AfPacketSocket> {
+impl Network {
     /// Create a network runtime with default configuration and the Linux clock.
     pub fn new() -> Self {
         Self::with_config(NetworkConfig::default(), Default::default())
     }
 
-    /// One-step interface creation: resolve kernel ifindex, open an
-    /// [`AfPacketSocket`], create a fully-configured [`Interface`], and attach
-    /// it to a new uplink.
-    ///
-    /// Returns the uplink index on success.
-    pub fn add_interface_afpacket(
-        &mut self,
-        ifname: &[u8],
-        mac: MacAddr,
-    ) -> Result<usize> {
-        let kernel_ifindex = AfPacketSocket::kernel_ifindex(ifname)?;
-        let sock = AfPacketSocket::open(kernel_ifindex)?;
-        let iface = Interface::with_config(
-            ifname,
-            mac,
-            Some(kernel_ifindex),
-            self.interface_config(),
-        );
-        self.add_uplink_and_attach(sock, iface)
-    }
-}
-
-impl Uplink<VirtualLink> {
-    /// Wire this uplink's [`VirtualLink`] to an external link, then update
-    /// every attached interface's TX closure to point at `link`'s RX queue.
-    ///
-    /// Used by [`Network::bridge`] to wire uplinks to a [`crate::bridge::Bridge`].
-    #[cfg(feature = "test-internals")]
-    pub fn connect_to_link(&mut self, link: &mut VirtualLink) -> Result<()> {
-        crate::virtual_link::connect(&mut self.sock, link);
-        let tx = self.sock.open_tx()?;
-        for iface in &mut self.interfaces {
-            iface.set_tx(tx.clone());
-        }
-        Ok(())
-    }
-}
-
-impl Network<VirtualLink> {
-    /// Create a virtual interface with the given MAC address.
-    ///
-    /// The link starts disconnected (no peer).  Use
-    /// [`Network::connect_virtual`] to wire two uplinks together after both
-    /// have been created (possibly on different networks with independent
-    /// clocks).
-    ///
-    /// Returns the uplink index on success.
-    pub fn add_interface_virtual(&mut self, mac: MacAddr) -> Result<usize> {
-        let link = VirtualLink::new();
-        let iface = Interface::with_config(
-            b"virt\0",
-            mac,
-            None,
-            self.interface_config(),
-        );
-        self.add_uplink_and_attach(link, iface)
-    }
-
-    /// Wire two virtual uplinks together so that frames sent on one are
-    /// received on the other.
-    ///
-    /// The two uplinks may belong to different [`Network`]s (e.g. with
-    /// independent clocks for deterministic testing).  After this call the TX
-    /// closure on every attached [`Interface`] is rewired to point at the
-    /// peer's RX queue.
-    ///
-    /// ```ignore
-    /// Network::connect_virtual(
-    ///     net_a.uplink_mut(0),
-    ///     net_b.uplink_mut(0),
-    /// )?;
-    /// ```
-    pub fn connect_virtual(
-        a: &mut Uplink<VirtualLink>,
-        b: &mut Uplink<VirtualLink>,
-    ) -> Result<()> {
-        crate::virtual_link::connect(&mut a.sock, &mut b.sock);
-
-        let tx_a = a.sock.open_tx()?;
-        for iface in &mut a.interfaces {
-            iface.set_tx(tx_a.clone());
-        }
-        let tx_b = b.sock.open_tx()?;
-        for iface in &mut b.interfaces {
-            iface.set_tx(tx_b.clone());
-        }
-
-        Ok(())
-    }
-
-    /// Insert a software [`Bridge`](crate::bridge::Bridge) between two
-    /// virtual uplinks, replacing any direct peer-to-peer wire.
-    ///
-    /// After this call frames sent by `a`'s sockets go into the bridge's A
-    /// side, and frames sent by `b`'s sockets go into the bridge's B side.
-    /// Call [`Bridge::deliver_a_to_b`](crate::bridge::Bridge::deliver_a_to_b)
-    /// / [`deliver_b_to_a`](crate::bridge::Bridge::deliver_b_to_a) to
-    /// forward frames through the bridge (with any configured impairments).
-    #[cfg(feature = "test-internals")]
-    pub fn bridge(
-        a: &mut Uplink<VirtualLink>,
-        b: &mut Uplink<VirtualLink>,
-    ) -> Result<crate::bridge::Bridge> {
-        let mut bridge = crate::bridge::Bridge::new();
-        a.connect_to_link(bridge.link_a_mut())?;
-        b.connect_to_link(bridge.link_b_mut())?;
-        Ok(bridge)
-    }
-}
-
-impl<L: EtherLink> Network<L> {
     /// Create a network runtime with the given configuration and clock.
     pub fn with_config(config: NetworkConfig, clock: Clock) -> Self {
         Network {
-            uplinks: Vec::new(),
+            uplinks:    Vec::new(),
+            interfaces: Vec::new(),
             config,
             timers:  Timers::new(clock.clone()),
             routes:  Vec::new(),
             clock,
         }
+    }
+
+    /// Begin adding a new interface with the given MAC address.
+    ///
+    /// Returns an [`InterfaceBuilder`] — call `.bind_afpacket(ifname)` to
+    /// attach to a live AF_PACKET socket, or `.finish()` to create an unbound
+    /// interface (useful for bridge-based test setups).
+    pub fn add_interface(&mut self, mac: MacAddr) -> InterfaceBuilder<'_> {
+        InterfaceBuilder { network: self, mac }
+    }
+
+    /// Return a mutable reference to the interface at `idx`.
+    ///
+    /// # Panics
+    /// Panics if `idx` is out of bounds.
+    pub fn iface_mut(&mut self, idx: usize) -> &mut Interface {
+        &mut self.interfaces[idx]
     }
 
     /// Bundle the network-wide configuration and clock into an
@@ -487,63 +431,128 @@ impl<L: EtherLink> Network<L> {
         }
     }
 
-    /// Register an [`EtherLink`] as an uplink and return a mutable reference
-    /// to the new [`Uplink`] so the caller can immediately attach interfaces.
-    pub fn add_uplink(&mut self, sock: L) -> &mut Uplink<L> {
+    /// Register an [`AnyLink`] as a new uplink.
+    ///
+    /// Returns the uplink index.
+    fn add_uplink_raw(&mut self, sock: AnyLink) -> usize {
         self.uplinks.push(Uplink {
             sock,
-            interfaces:     Vec::new(),
-            udp_sockets:    Vec::new(),
-            tcp_sockets:    Vec::new(),
-            eth_callbacks:  Vec::new(),
-            next_eth_id:    0,
+            iface_indices: Vec::new(),
         });
-        self.uplinks.last_mut().unwrap()
+        self.uplinks.len() - 1
     }
 
-    /// Add an uplink and immediately attach one interface to it.
+    /// Wire an [`Interface`] to an existing uplink at `uplink_idx`.
     ///
-    /// This is the standard one-step setup for callers that have exactly one
-    /// [`Interface`] per [`EtherLink`].  It is equivalent to calling
-    /// [`add_uplink`](Self::add_uplink) followed by [`Uplink::attach`], but
-    /// without requiring the caller to obtain a `&mut Timers` handle (which
-    /// is internal to `Network`).
+    /// Registers the MAC with the BPF filter, sets the TX closure, starts
+    /// ARP and fragment-purge timers.  Returns the `iface_idx`.
+    fn attach_to_uplink(&mut self, uplink_idx: usize, iface: Interface) -> Result<usize> {
+        let iface_idx = self.interfaces.len();
+
+        let timers = &mut self.timers;
+        let uplink = &mut self.uplinks[uplink_idx];
+
+        uplink.sock.attach_mac(&iface.mac())?;
+        let mut iface = iface;
+        iface.set_tx(uplink.sock.open_tx()?);
+        arp_cache::schedule_expiry(iface.arp_queue().clone(), timers);
+        iface.schedule_frag_purge(timers);
+        uplink.iface_indices.push(iface_idx);
+
+        self.interfaces.push(iface);
+        Ok(iface_idx)
+    }
+
+    /// Detach and remove the interface with the given MAC from `uplink_idx`.
     ///
-    /// Returns the index of the newly created uplink.
-    pub fn add_uplink_and_attach(&mut self, sock: L, iface: Interface) -> Result<usize> {
-        self.add_uplink(sock);
-        let idx = self.uplinks.len() - 1;
-        let (uplinks, timers) = self.uplinks_and_timers_mut();
-        uplinks[idx].attach(iface, timers)?;
-        Ok(idx)
+    /// Marks the interface's ARP queue as dead, stopping all self-rescheduling
+    /// timers, and removes the MAC from the BPF filter.
+    /// Returns the removed [`Interface`] if found, `None` otherwise.
+    pub fn detach_interface(&mut self, uplink_idx: usize, mac: &MacAddr) -> Result<Option<Interface>> {
+        let uplink = match self.uplinks.get_mut(uplink_idx) {
+            Some(u) => u,
+            None    => return Ok(None),
+        };
+
+        // Find the interface index inside this uplink.
+        let pos = uplink.iface_indices.iter().position(|&idx| {
+            self.interfaces.get(idx).is_some_and(|i| &i.mac() == mac)
+        });
+        let Some(pos) = pos else { return Ok(None) };
+        let iface_idx = uplink.iface_indices.remove(pos);
+
+        // Mark ARP dead and detach BPF.
+        self.interfaces[iface_idx].arp_queue().mark_dead();
+        uplink.sock.detach_mac(mac)?;
+
+        // Swap-remove from interfaces vec. Update any iface_indices that
+        // pointed at the last element (which moves to iface_idx after swap).
+        let last_idx = self.interfaces.len() - 1;
+        let removed = if iface_idx == last_idx {
+            self.interfaces.remove(iface_idx)
+        } else {
+            // Find uplink that owns last_idx and update its reference.
+            for u in &mut self.uplinks {
+                for idx_ref in &mut u.iface_indices {
+                    if *idx_ref == last_idx {
+                        *idx_ref = iface_idx;
+                    }
+                }
+            }
+            self.interfaces.swap_remove(iface_idx)
+        };
+
+        Ok(Some(removed))
     }
 
-    pub fn uplinks(&self) -> &[Uplink<L>] {
-        &self.uplinks
+    /// Return a reference to the interface at `idx`, or `None` if out of bounds.
+    pub fn iface(&self, idx: usize) -> Option<&Interface> {
+        self.interfaces.get(idx)
     }
 
-    pub fn uplinks_mut(&mut self) -> &mut [Uplink<L>] {
+    pub(crate) fn uplinks_mut(&mut self) -> &mut [Uplink] {
         &mut self.uplinks
+    }
+
+    pub(crate) fn interfaces(&self) -> &[Interface] {
+        &self.interfaces
+    }
+
+    pub(crate) fn interfaces_mut(&mut self) -> &mut [Interface] {
+        &mut self.interfaces
+    }
+
+    /// Return the uplink index that owns interface `iface_idx`, or `None`.
+    pub(crate) fn uplink_for_iface(&self, iface_idx: usize) -> Option<usize> {
+        self.uplinks.iter().position(|u| u.iface_indices.contains(&iface_idx))
     }
 
     /// Return a mutable reference to the uplink at `idx`.
     ///
     /// # Panics
     /// Panics if `idx` is out of bounds.
-    pub fn uplink_mut(&mut self, idx: usize) -> &mut Uplink<L> {
+    pub fn uplink_mut(&mut self, idx: usize) -> &mut Uplink {
         &mut self.uplinks[idx]
     }
 
-    /// Return disjoint mutable references to the uplinks vec and the timers.
-    ///
-    /// Used by [`rawket_network_add_intf`](crate::ffi) to call
-    /// [`Uplink::attach`] (which needs `&mut Timers`) without triggering a
-    /// double-borrow of `Network`.
-    pub(crate) fn uplinks_and_timers_mut(&mut self) -> (&mut Vec<Uplink<L>>, &mut Timers) {
-        (&mut self.uplinks, &mut self.timers)
+    /// Replace the MAC on the first attached interface of uplink `uplink_idx`,
+    /// updating the BPF filter accordingly.
+    /// Change the MAC address on interface `iface_idx`, updating the BPF
+    /// filter on the backing uplink (if any).
+    pub(crate) fn set_iface_mac(&mut self, iface_idx: usize, new_mac: MacAddr) -> Result<()> {
+        let iface = self.interfaces.get_mut(iface_idx).ok_or(Error::InvalidInput)?;
+        let old = iface.mac();
+        iface.set_mac(new_mac);
+
+        // Update BPF filter on the uplink that carries this interface, if any.
+        if let Some(uplink_idx) = self.uplink_for_iface(iface_idx) {
+            self.uplinks[uplink_idx].sock.detach_mac(&old)?;
+            self.uplinks[uplink_idx].sock.attach_mac(&new_mac)?;
+        }
+        Ok(())
     }
 
-    /// Find the uplink index and interface assigned `src_ip`, and return the
+    /// Find the interface index and interface assigned `src_ip`, and return the
     /// network-derived [`TcpConfig`] alongside it.
     ///
     /// Returns `None` if no attached interface has that IP.
@@ -552,11 +561,9 @@ impl<L: EtherLink> Network<L> {
         src_ip: Ipv4Addr,
     ) -> Option<(usize, &Interface, TcpConfig)> {
         let cfg = self.config.tcp_config();
-        for (idx, uplink) in self.uplinks.iter().enumerate() {
-            for iface in &uplink.interfaces {
-                if iface.ip().is_some_and(|c| c.addr() == src_ip) {
-                    return Some((idx, iface, cfg));
-                }
+        for (idx, iface) in self.interfaces.iter().enumerate() {
+            if iface.ip().is_some_and(|c| c.addr() == src_ip) {
+                return Some((idx, iface, cfg));
             }
         }
         None
@@ -593,16 +600,14 @@ impl<L: EtherLink> Network<L> {
         let nexthop_ip = route.nexthop.unwrap_or(dst_ip);
 
         // Find the egress interface: the one whose subnet contains nexthop_ip.
-        for (idx, uplink) in self.uplinks.iter().enumerate() {
-            for iface in &uplink.interfaces {
-                if let Some(cidr) = iface.ip() {
-                    if cidr.contains(nexthop_ip) {
-                        return Some(RouteResult {
-                            intf_idx: idx,
-                            src_ip: cidr.addr(),
-                            nexthop_ip,
-                        });
-                    }
+        for (idx, iface) in self.interfaces.iter().enumerate() {
+            if let Some(cidr) = iface.ip() {
+                if cidr.contains(nexthop_ip) {
+                    return Some(RouteResult {
+                        intf_idx: idx,
+                        src_ip: cidr.addr(),
+                        nexthop_ip,
+                    });
                 }
             }
         }
@@ -628,18 +633,15 @@ impl<L: EtherLink> Network<L> {
         &mut self,
         max_timeout_ms: Option<u64>,
     ) -> Result<()> {
-        let (uplinks, timers) = (&mut self.uplinks, &mut self.timers);
-
         // First update: fire already-expired timers, get next deadline.
-        let timer_ms = timers.update();
+        let timer_ms = self.timers.update();
 
         // Fold TCP socket deadlines into the timeout so we wake up in time
         // to fire RTO / TLP / keep-alive / persist even when no RX arrives.
-        let tcp_now = timers.clock().monotonic_ms();
-        let tcp_ms: Option<u64> = uplinks
+        let tcp_now = self.timers.clock().monotonic_ms();
+        let tcp_ms: Option<u64> = self.interfaces
             .iter()
-            .flat_map(|u| u.interfaces())
-            .flat_map(|i| i.tcp_sockets())
+            .flat_map(|i| i.tcp_sockets.iter())
             .filter_map(|s| s.next_deadline_ms(tcp_now))
             .min();
 
@@ -655,11 +657,11 @@ impl<L: EtherLink> Network<L> {
             (None,    None)    => -1,
         };
 
-        if !uplinks.is_empty() {
-            let mut pollfds: Vec<libc::pollfd> = uplinks
+        if !self.uplinks.is_empty() {
+            let mut pollfds: Vec<libc::pollfd> = self.uplinks
                 .iter()
                 .map(|u| libc::pollfd {
-                    fd: u.sock.fd(),
+                    fd: u.fd(),
                     events: libc::POLLIN,
                     revents: 0,
                 })
@@ -677,80 +679,76 @@ impl<L: EtherLink> Network<L> {
             }
 
             if rc > 0 {
-                for (uplink, pfd) in uplinks.iter_mut().zip(pollfds.iter()) {
+                for (u_idx, pfd) in pollfds.iter().enumerate() {
                     if pfd.revents & libc::POLLIN != 0 {
-                        drain(uplink)?;
+                        drain(u_idx, &mut self.uplinks, &mut self.interfaces)?;
                     }
                 }
             }
-
-            // Drive TCP polling unconditionally — even on timeout — so that
-            // flush_send_buf() is retried when no incoming frames are expected
-            // (e.g. server waiting for the client to read data).
-            for uplink in uplinks.iter_mut() {
-                for iface in uplink.interfaces_mut() {
-                    for s in iface.tcp_sockets_mut() {
-                        let _ = s.poll();
-                    }
+        } else if !self.interfaces.is_empty() {
+            // No AF_PACKET uplinks — bridge-based or virtual interfaces.
+            // Sleep for the requested timeout so callers can gate on time.
+            if timeout_ms >= 0 {
+                let ms = timeout_ms as u64;
+                if ms > 0 {
+                    unsafe { libc::usleep((ms * 1_000) as libc::c_uint) };
                 }
             }
         }
 
+        // Drive all interfaces — drains their rx_queue (bridge inject)
+        // and fires TCP timer callbacks (RTO, TLP, keep-alive, TimeWait).
+        for iface in &mut self.interfaces {
+            iface.poll();
+        }
+
         // Second update: fire any timers that expired during the wait.
-        timers.update();
+        self.timers.update();
 
         Ok(())
     }
 }
 
-// ── Internal drain helper ─────────────────────────────────────────────────────
+// ── Internal helpers ──────────────────────────────────────────────────────────
 
-/// Drain all available frames from `uplink` and dispatch each to its
+/// Drain all available frames from `uplinks[u_idx]` and dispatch each to the
 /// matching [`Interface`] receive handler.
-fn drain<L: EtherLink>(uplink: &mut Uplink<L>) -> Result<()> {
-    // Allocate once; 65536-byte frame buffer is too large for a per-iteration
-    // stack array, and GRO frames fill most of it so zeroing would dominate.
-    let mut frame_buf = alloc::vec![0u8; FRAME_SIZE];
+///
+/// # Layer boundary
+///
+/// This function is the seam between L1/L2 and L3:
+///
+/// - **[`Uplink`]** is the physical layer.  It delivers raw Ethernet frames
+///   as opaque byte slices without interpreting content.
+/// - **`drain`** performs the single L2 demux needed to route the frame to the
+///   correct [`Interface`]: it reads only the 6-byte Ethernet destination MAC
+///   from the front of the frame to match against registered interface MACs.
+/// - **[`Interface::receive`]** owns all L2/L3 parsing.
+fn drain(
+    u_idx:      usize,
+    uplinks:    &mut [Uplink],
+    interfaces: &mut [Interface],
+) -> Result<()> {
     loop {
-        let frame_len = {
-            let raw = match uplink.sock.rx_recv() {
-                Some(r) => r,
-                None => {
-                    return Ok(());
-                }
-            };
-            let len = raw.len().min(frame_buf.len());
-            frame_buf[..len].copy_from_slice(&raw[..len]);
-            len
+        let raw = match uplinks[u_idx].recv_next() {
+            Some(r) => r,
+            None    => return Ok(()),
         };
-        uplink.sock.rx_release();
 
-        if frame_len < 6 {
+        if raw.len() < 6 {
             continue;
         }
-        let raw = &frame_buf[..frame_len];
 
         let dst_mac = MacAddr::from(<[u8; 6]>::try_from(&raw[0..6]).unwrap());
 
-        // Deliver to eth tap callbacks for frames addressed to this uplink's
-        // interface MAC(s) or Ethernet broadcast.  Frames for other MACs
-        // (promiscuous traffic) are not delivered to the tap.
-        let tap_match = dst_mac == MacAddr::BROADCAST
-            || uplink.interfaces.iter().any(|i| i.mac() == dst_mac);
-        if tap_match {
-            for entry in &uplink.eth_callbacks {
-                (entry.callback)(raw);
-            }
-        }
-
         if dst_mac == MacAddr::BROADCAST {
-            for iface in uplink.interfaces.iter_mut() {
-                iface.receive(raw)?;
+            for &iface_idx in &uplinks[u_idx].iface_indices {
+                interfaces[iface_idx].receive(&raw)?;
             }
         } else {
-            for iface in uplink.interfaces.iter_mut() {
-                if iface.mac() == dst_mac {
-                    iface.receive(raw)?;
+            for &iface_idx in &uplinks[u_idx].iface_indices {
+                if interfaces[iface_idx].mac() == dst_mac {
+                    interfaces[iface_idx].receive(&raw)?;
                     break;
                 }
             }
