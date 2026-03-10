@@ -224,7 +224,7 @@ impl<L: EtherLink> Uplink<L> {
     /// Attach `iface` to this uplink.
     ///
     /// The interface must already be fully configured (via
-    /// [`Interface::with_config`] or [`Interface::dummy`]).  This method
+    /// [`Interface::with_config`]).  This method
     /// registers the MAC in the BPF filter, wires the TX closure, and
     /// installs the recurring ARP-expiry and fragment-purge timers.
     pub fn attach(&mut self, mut iface: Interface, timers: &mut Timers) -> Result<()> {

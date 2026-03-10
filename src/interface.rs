@@ -47,18 +47,6 @@ use crate::{
     Result,
 };
 
-/// Default ARP cache entry lifetime used when an `Interface` is first created.
-/// Overridden by [`NetworkConfig::arp_cache_max_age_ms`] when the interface is
-/// attached to an [`Uplink`](crate::Uplink).
-const DEFAULT_ARP_MAX_AGE_MS: u64 = 20_000;
-
-/// Default fragment-reassembly timeout (ms). Overridden by
-/// [`NetworkConfig::ip_frag_timeout_ms`].
-const DEFAULT_FRAG_TIMEOUT_MS: u64 = 30_000;
-
-/// Default fragment-reassembly memory limit (bytes). Overridden by
-/// [`NetworkConfig::ip_frag_mem_limit`].
-const DEFAULT_FRAG_MEM_LIMIT: usize = 65_536;
 
 // ── Fragment reassembly ───────────────────────────────────────────────────────
 
@@ -389,7 +377,7 @@ pub struct Interface {
     reasm:      Rc<RefCell<ReassemblyTable>>,
     /// Token-bucket rate limiter for outbound ICMP Unreachable messages.
     icmp_rl:    IcmpRateLimit,
-    /// Time source — set at construction via [`with_config`] or [`dummy`].
+    /// Time source — set at construction via [`with_config`].
     clock:      Clock,
     /// Validate IPv4 header checksum on RX.
     pub(crate) checksum_validate_ip:  bool,
@@ -467,32 +455,6 @@ impl Interface {
         }
     }
 
-    /// Create a dummy interface that is not backed by a real kernel interface.
-    ///
-    /// Useful when the uplink is an [`EtherLink`](crate::af_packet::EtherLink)
-    /// that does not require kernel packet-socket registration (e.g. an
-    /// in-process virtual wire used in tests).
-    pub fn dummy(mac: MacAddr) -> Self {
-        let clock: Clock = Default::default();
-        Interface {
-            ifname_buf:     [0u8; 16],
-            mac,
-            ifindex:        IfIndex::alloc(),
-            kernel_ifindex: None,
-            ip:             None,
-            tx_id:          0,
-            tx:             Rc::new(|_| Ok(())),
-            arp:            ArpQueue::new(DEFAULT_ARP_MAX_AGE_MS, clock.clone()),
-            reasm:          Rc::new(RefCell::new(ReassemblyTable::new(
-                DEFAULT_FRAG_MEM_LIMIT, DEFAULT_FRAG_TIMEOUT_MS, clock.clone(),
-            ))),
-            icmp_rl:        IcmpRateLimit::new(100),
-            clock,
-            checksum_validate_ip:  false,
-            checksum_validate_tcp: false,
-            checksum_validate_udp: false,
-        }
-    }
 }
 
 impl Interface {
