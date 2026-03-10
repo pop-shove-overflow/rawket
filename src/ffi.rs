@@ -12,7 +12,6 @@ use core::net::{Ipv4Addr, SocketAddrV4};
 use crate::{
     arp_cache,
     eth::MacAddr,
-    interface::Interface,
     ip::Ipv4Cidr,
     network::{Network, NetworkConfig},
     af_packet::{AfPacketSocket, EtherLink},
@@ -228,26 +227,10 @@ pub unsafe extern "C" fn rawket_network_add_intf(
         Err(_) => { set_errno_raw(libc::EINVAL); return -1; }
     };
 
-    let kernel_ifindex = match AfPacketSocket::kernel_ifindex(name_bytes) {
-        Ok(i)  => i,
-        Err(e) => { set_errno(e); return -1; }
-    };
-    let sock = match AfPacketSocket::open(kernel_ifindex) {
-        Ok(s)  => s,
-        Err(e) => { set_errno(e); return -1; }
-    };
-    let iface = match Interface::afpacket(name_bytes, mac_arr) {
-        Ok(i)  => i,
-        Err(e) => { set_errno(e); return -1; }
-    };
-
     let net_inner = unsafe { &mut (*net).0 };
-    let idx = net_inner.uplinks().len();
-    net_inner.add_uplink(sock);
-    let (uplinks, timers) = net_inner.uplinks_and_timers_mut();
-    match uplinks[idx].attach(iface, timers) {
-        Ok(()) => idx as c_int,
-        Err(e) => { set_errno(e); -1 }
+    match net_inner.add_interface_afpacket(name_bytes, mac_arr) {
+        Ok(idx) => idx as c_int,
+        Err(e)  => { set_errno(e); -1 }
     }
 }
 
