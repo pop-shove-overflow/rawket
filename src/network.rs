@@ -18,6 +18,7 @@ use crate::{
     tcp::{TcpConfig, TcpSocket},
     timers::{Clock, Timers},
     udp::UdpSocket,
+    virtual_link::VirtualLink,
     Error, Result,
 };
 use alloc::{boxed::Box, vec::Vec};
@@ -387,6 +388,59 @@ impl Network<AfPacketSocket> {
     }
 }
 
+impl Network<VirtualLink> {
+    /// Create a virtual interface with the given MAC address.
+    ///
+    /// The link starts disconnected (no peer).  Use
+    /// [`Network::connect_virtual`] to wire two uplinks together after both
+    /// have been created (possibly on different networks with independent
+    /// clocks).
+    ///
+    /// Returns the uplink index on success.
+    pub fn add_interface_virtual(&mut self, mac: MacAddr) -> Result<usize> {
+        let link = VirtualLink::new();
+        let iface = Interface::with_config(
+            b"virt\0",
+            mac,
+            None,
+            self.interface_config(),
+        );
+        self.add_uplink_and_attach(link, iface)
+    }
+
+    /// Wire two virtual uplinks together so that frames sent on one are
+    /// received on the other.
+    ///
+    /// The two uplinks may belong to different [`Network`]s (e.g. with
+    /// independent clocks for deterministic testing).  After this call the TX
+    /// closure on every attached [`Interface`] is rewired to point at the
+    /// peer's RX queue.
+    ///
+    /// ```ignore
+    /// Network::connect_virtual(
+    ///     net_a.uplink_mut(0),
+    ///     net_b.uplink_mut(0),
+    /// )?;
+    /// ```
+    pub fn connect_virtual(
+        a: &mut Uplink<VirtualLink>,
+        b: &mut Uplink<VirtualLink>,
+    ) -> Result<()> {
+        crate::virtual_link::connect(&mut a.sock, &mut b.sock);
+
+        let tx_a = a.sock.open_tx()?;
+        for iface in &mut a.interfaces {
+            iface.set_tx(tx_a.clone());
+        }
+        let tx_b = b.sock.open_tx()?;
+        for iface in &mut b.interfaces {
+            iface.set_tx(tx_b.clone());
+        }
+
+        Ok(())
+    }
+}
+
 impl<L: EtherLink> Network<L> {
     /// Create a network runtime with the given configuration and clock.
     pub fn with_config(config: NetworkConfig, clock: Clock) -> Self {
@@ -455,6 +509,14 @@ impl<L: EtherLink> Network<L> {
 
     pub fn uplinks_mut(&mut self) -> &mut [Uplink<L>] {
         &mut self.uplinks
+    }
+
+    /// Return a mutable reference to the uplink at `idx`.
+    ///
+    /// # Panics
+    /// Panics if `idx` is out of bounds.
+    pub fn uplink_mut(&mut self, idx: usize) -> &mut Uplink<L> {
+        &mut self.uplinks[idx]
     }
 
     /// Return disjoint mutable references to the uplinks vec and the timers.
