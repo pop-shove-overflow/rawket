@@ -875,6 +875,14 @@ pub struct CapturedFrame {
     pub ts_ns:   u64,
 }
 
+impl CapturedFrame {
+    /// Returns `true` if the frame was dropped by the impairment pipeline
+    /// and never forwarded to an egress port.
+    pub fn is_dropped(&self) -> bool {
+        self.egress.is_none()
+    }
+}
+
 // ── PortDirection ─────────────────────────────────────────────────────────────
 
 struct PortDirection {
