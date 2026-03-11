@@ -1,2 +1,3 @@
 # Build output
 /target/
+/tools/system-test-validator/target/

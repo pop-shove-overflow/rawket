@@ -40,7 +40,13 @@ pub use timers::Clock;
 // and must not be redefined here.
 
 /// Shared TX-path closure type used by interfaces and sockets.
+#[cfg(not(feature = "test-internals"))]
 pub(crate) type TxFn = alloc::rc::Rc<dyn Fn(&[u8]) -> Result<()>>;
+
+/// Exposed publicly under `test-internals` so test harnesses can inject
+/// virtual wire TX closures via [`interface::Interface::set_tx`].
+#[cfg(feature = "test-internals")]
+pub type TxFn = alloc::rc::Rc<dyn Fn(&[u8]) -> Result<()>>;
 
 /// IP-level TX closure type used by sockets that delegate ETH+IP framing to
 /// the interface.  The closure takes `(dst_ip, proto, dscp_ecn, payload)` and

@@ -557,8 +557,18 @@ impl Interface {
     /// Set the TX closure used by this interface and all sockets cloned from it.
     ///
     /// Called by [`Uplink::attach`](crate::Uplink::attach) in production and
-    /// by the test harness to inject a `VirtualLink` TX path.
+    /// by the test harness to inject a virtual-wire TX path.
+    #[cfg(not(feature = "test-internals"))]
     pub(crate) fn set_tx(&mut self, tx: crate::TxFn) {
+        self.tx = tx;
+    }
+
+    /// Set the TX closure used by this interface and all sockets cloned from it.
+    ///
+    /// Exposed publicly under `test-internals` so test harnesses can wire
+    /// virtual interfaces without going through [`Uplink::attach`].
+    #[cfg(feature = "test-internals")]
+    pub fn set_tx(&mut self, tx: crate::TxFn) {
         self.tx = tx;
     }
 

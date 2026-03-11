@@ -1223,6 +1223,46 @@ impl Bridge {
         forward_frame(&mut inner, port, data, 0, false);
     }
 
+    /// Forward a frame through the bridge.  The source MAC (bytes 6..12)
+    /// determines the ingress port via FDB lookup; the frame then follows
+    /// the full bridge path (ingress impairments, FDB dst lookup, egress
+    /// impairments, and delay queue).
+    pub fn forward(&self, frame: &[u8]) {
+        let mut inner = self.inner.borrow_mut();
+        let src_mac: [u8; 6] = match frame.get(6..12).and_then(|b| b.try_into().ok()) {
+            Some(m) => m,
+            None => return,
+        };
+        let port = match inner.fdb.get(&src_mac) {
+            Some(&p) => p,
+            None => return,
+        };
+        let Some((data, dups)) = inner.ports[port].profile_in.process(frame) else {
+            inner.captured.push(CapturedFrame { ingress: port, egress: None, data: frame.to_vec(), ts_ns: 0 });
+            return;
+        };
+        for dup in dups {
+            forward_frame(&mut inner, port, dup, 0, true);
+        }
+        forward_frame(&mut inner, port, data, 0, true);
+    }
+
+    /// Deliver a frame directly to the port whose MAC matches the
+    /// destination MAC (bytes 0..6).  Bypasses all impairments and delay —
+    /// the frame is immediately available in the port's rx_queue.
+    pub fn ingress(&self, frame: &[u8]) {
+        let inner = self.inner.borrow();
+        let dst_mac: [u8; 6] = match frame.get(0..6).and_then(|b| b.try_into().ok()) {
+            Some(m) => m,
+            None => return,
+        };
+        let port = match inner.fdb.get(&dst_mac) {
+            Some(&p) => p,
+            None => return,
+        };
+        inner.ports[port].egress.push(frame);
+    }
+
     /// Drain and return all captured frames.
     pub fn drain_captured(&mut self) -> Vec<CapturedFrame> {
         core::mem::take(&mut self.inner.borrow_mut().captured)
@@ -1314,6 +1354,11 @@ impl Bridge {
     }
 
     /// Clear the MAC forwarding database.
+    /// Pre-seed the FDB with a static MAC → port mapping.
+    pub fn learn(&self, mac: [u8; 6], port: usize) {
+        self.inner.borrow_mut().fdb.insert(mac, port);
+    }
+
     pub fn flush_fdb(&self) {
         self.inner.borrow_mut().fdb.clear();
     }

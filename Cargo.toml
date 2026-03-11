@@ -30,6 +30,11 @@ test-internals = ["std", "dep:etherparse"]
 libc = { version = "0.2", default-features = false }
 etherparse = { version = "0.19", optional = true }
 
+[[test]]
+name = "system"
+path = "tests/system/mod.rs"
+required-features = ["test-internals"]
+
 [profile.dev]
 panic = "abort"
 opt-level = 0
