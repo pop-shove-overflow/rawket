@@ -302,10 +302,23 @@ impl Uplink {
 /// Fluent builder returned by [`Network::add_interface`].
 pub struct InterfaceBuilder<'a> {
     network: &'a mut Network,
-    mac:     MacAddr,
+    /// Explicit MAC; `None` means generate a random locally-administered address.
+    mac:     Option<MacAddr>,
 }
 
 impl<'a> InterfaceBuilder<'a> {
+    /// Override the MAC address.  If not called, a random locally-administered
+    /// unicast address is generated at [`finish`](Self::finish) /
+    /// [`bind_afpacket`](Self::bind_afpacket) time.
+    pub fn mac(mut self, mac: MacAddr) -> Self {
+        self.mac = Some(mac);
+        self
+    }
+
+    fn resolve_mac(&self) -> MacAddr {
+        self.mac.unwrap_or_else(random_mac)
+    }
+
     /// Attach to a live AF_PACKET socket on the named kernel interface.
     ///
     /// Resolves the kernel ifindex for `ifname`; if an existing [`Uplink`]
@@ -328,9 +341,10 @@ impl<'a> InterfaceBuilder<'a> {
             self.network.add_uplink_raw(AnyLink::AfPacket(sock))
         };
 
+        let mac = self.resolve_mac();
         let iface = Interface::with_config(
             ifname,
-            self.mac,
+            mac,
             Some(kernel_ifindex),
             self.network.interface_config(),
         );
@@ -343,9 +357,10 @@ impl<'a> InterfaceBuilder<'a> {
     /// [`rx_queue`](Interface::rx_queue) — suitable for bridge-based test
     /// setups and simulation.  Returns the interface index (`iface_idx`).
     pub fn finish(self) -> usize {
+        let mac = self.resolve_mac();
         let iface = Interface::with_config(
             b"",
-            self.mac,
+            mac,
             None,
             self.network.interface_config(),
         );
@@ -356,6 +371,22 @@ impl<'a> InterfaceBuilder<'a> {
         self.network.interfaces.push(iface);
         iface_idx
     }
+}
+
+/// Generate a random locally-administered unicast MAC address using
+/// `/dev/urandom`.  Falls back to a fixed address if the read fails.
+fn random_mac() -> MacAddr {
+    let mut bytes = [0u8; 6];
+    let fd = unsafe {
+        libc::open(c"/dev/urandom".as_ptr(), libc::O_RDONLY)
+    };
+    if fd >= 0 {
+        unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), 6) };
+        unsafe { libc::close(fd) };
+    }
+    // Locally administered, unicast: set bit 1 of first octet, clear bit 0.
+    bytes[0] = (bytes[0] | 0x02) & 0xFE;
+    MacAddr::from(bytes)
 }
 
 // ── Network ───────────────────────────────────────────────────────────────────
@@ -384,11 +415,17 @@ impl Default for Network {
 impl Network {
     /// Create a network runtime with default configuration and the Linux clock.
     pub fn new() -> Self {
-        Self::with_config(NetworkConfig::default(), Default::default())
+        Self::with_config(NetworkConfig::default())
     }
 
-    /// Create a network runtime with the given configuration and clock.
-    pub fn with_config(config: NetworkConfig, clock: Clock) -> Self {
+    /// Create a network runtime with the given configuration.
+    ///
+    /// The clock is created internally.  In production it tracks real wall
+    /// time; in test builds (`feature = "test-internals"`) the clock can be
+    /// controlled via [`clock_ref`](Self::clock_ref) and the `clock_*` family
+    /// of methods.
+    pub fn with_config(config: NetworkConfig) -> Self {
+        let clock = Clock::new();
         Network {
             uplinks:         Vec::new(),
             interfaces:      Vec::new(),
@@ -472,13 +509,15 @@ impl Network {
         self.clock.monotonic_ms()
     }
 
-    /// Begin adding a new interface with the given MAC address.
+    /// Begin adding a new interface.
     ///
-    /// Returns an [`InterfaceBuilder`] — call `.bind_afpacket(ifname)` to
-    /// attach to a live AF_PACKET socket or `.finish()` to create an unbound
-    /// interface (useful for bridge-based test setups).
-    pub fn add_interface(&mut self, mac: MacAddr) -> InterfaceBuilder<'_> {
-        InterfaceBuilder { network: self, mac }
+    /// Returns an [`InterfaceBuilder`] — call `.mac(addr)` to set a specific
+    /// MAC (otherwise a random locally-administered address is generated), then
+    /// `.bind_afpacket(ifname)` to attach to a live AF_PACKET socket or
+    /// `.finish()` to create an unbound interface (useful for bridge-based test
+    /// setups).
+    pub fn add_interface(&mut self) -> InterfaceBuilder<'_> {
+        InterfaceBuilder { network: self, mac: None }
     }
 
     /// Return a mutable reference to the interface at `idx`.

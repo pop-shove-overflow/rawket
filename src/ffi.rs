@@ -190,7 +190,7 @@ pub unsafe extern "C" fn rawket_network_new(
     } else {
         NetworkConfig::from(unsafe { core::ptr::read(config) })
     };
-    Box::into_raw(Box::new(RawketNetwork(Network::with_config(rust_config, Default::default()))))
+    Box::into_raw(Box::new(RawketNetwork(Network::with_config(rust_config))))
 }
 
 #[no_mangle]
@@ -228,7 +228,7 @@ pub unsafe extern "C" fn rawket_network_add_intf(
     };
 
     let net_inner = unsafe { &mut (*net).0 };
-    match net_inner.add_interface(mac_arr).bind_afpacket(name_bytes) {
+    match net_inner.add_interface().mac(mac_arr).bind_afpacket(name_bytes) {
         Ok(iface_idx) => iface_idx as c_int,
         Err(e) => { set_errno(e); -1 }
     }
