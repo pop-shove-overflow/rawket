@@ -304,8 +304,8 @@ struct TxSegment {
     end_seq:          SeqNum,   // seq + len (SYN/FIN count +1)
     flags:            TcpFlags,
     data:             Vec<u8>,
-    first_sent_ms:    u64,
-    last_sent_ms:     u64,
+    first_sent_ns:    u64,
+    last_sent_ns:     u64,
     retransmits:      u8,
     sacked:           bool,
     // RFC 9438 §4.1 delivery-rate metadata snapshot at send time
@@ -350,8 +350,8 @@ struct BbrState {
     bw_latest:            u64,           // max delivery rate this round
     inflight_latest:      u64,           // max delivered bytes this round
     // RTT
-    min_rtt_ms:           u64,
-    min_rtt_stamp_ms:     u64,
+    min_rtt_ns:           u64,
+    min_rtt_stamp_ns:     u64,
     // Congestion window
     cwnd:                 u32,
     inflight_shortterm:   u32,           // short-term lower bound (spec: BBR.inflight_shortterm)
@@ -370,11 +370,11 @@ struct BbrState {
     full_bw_at_round:     u64,
     full_bw_cnt:          u8,
     // PROBE_BW cycling
-    cycle_stamp_ms:       u64,
+    cycle_stamp_ns:       u64,
     // PROBE_RTT
-    probe_rtt_done_ms:    u64,           // 0 = not in PROBE_RTT
+    probe_rtt_done_ns:    u64,           // 0 = not in PROBE_RTT
     prior_cwnd:           u32,
-    last_probe_rtt_ms:    u64,
+    last_probe_rtt_ns:    u64,
     // Per-round loss tracking (for Startup exit only)
     loss_bytes_round:     u64,
     acked_bytes_round:    u64,
@@ -393,8 +393,8 @@ impl BbrState {
             bw_sample_idx:        0,
             bw_latest:            0,
             inflight_latest:      0,
-            min_rtt_ms:           u64::MAX,
-            min_rtt_stamp_ms:     0,
+            min_rtt_ns:           u64::MAX,
+            min_rtt_stamp_ns:     0,
             cwnd:                 init_cwnd,
             inflight_shortterm:   u32::MAX,
             inflight_longterm:    u32::MAX,
@@ -407,10 +407,10 @@ impl BbrState {
             filled_pipe:          false,
             full_bw_at_round:     0,
             full_bw_cnt:          0,
-            cycle_stamp_ms:       0,
-            probe_rtt_done_ms:    0,
+            cycle_stamp_ns:       0,
+            probe_rtt_done_ns:    0,
             prior_cwnd:           init_cwnd,
-            last_probe_rtt_ms:    0,
+            last_probe_rtt_ns:    0,
             loss_bytes_round:     0,
             acked_bytes_round:    0,
             loss_events_in_round: 0,
@@ -602,18 +602,18 @@ pub struct TcpSocket {
     rx_ooo_last: Option<SeqNum>, // most recently received OOO seq (for SACK ordering)
 
     // RTT / RTO (RFC 6298)
-    srtt_ms:     u64,   // 0 = no sample yet
-    rttvar_ms:   u64,
-    rto_ms:      u64,
+    srtt_ns:     u64,   // 0 = no sample yet
+    rttvar_ns:   u64,
+    rto_ns:      u64,
 
     // RACK (RFC 8985 §7.2)
     rack_end_seq:    SeqNum,
-    rack_xmit_ms:    u64,
-    rack_rtt_ms:     u64,    // RTT of the most recently delivered segment
+    rack_xmit_ns:    u64,
+    rack_rtt_ns:     u64,    // RTT of the most recently delivered segment
     rack_reo_decay_round: u64, // last round at which reo_wnd was decayed
-    /// Extra reorder tolerance added to the RACK timer deadline (ms).
+    /// Extra reorder tolerance added to the RACK timer deadline (ns).
     /// Increased on D-SACK detection; decays toward 0 over time.
-    rack_reo_wnd_ms: u64,
+    rack_reo_wnd_ns: u64,
 
     // Deadlines (disarmed = Deadline::default())
     // Note: rto_deadline is reused as the TIME_WAIT linger timer when state == TimeWait.
@@ -626,7 +626,7 @@ pub struct TcpSocket {
 
     // Challenge ACK rate limit (RFC 5961 §5)
     challenge_ack_count:    u8,
-    challenge_ack_epoch_ms: u64,
+    challenge_ack_epoch_ns: u64,
 
     // TCP Timestamps (RFC 7323)
     ts_enabled:      bool,   // both sides negotiated timestamps
@@ -642,7 +642,7 @@ pub struct TcpSocket {
     fin_pending:    bool,   // close() called with data in send_buf; piggyback FIN
 
     // Keep-alive
-    last_recv_ms:       u64,   // last time we received data or ACK progress
+    last_recv_ns:       u64,   // last time we received data or ACK progress
     keepalive_deadline: Deadline,
     keepalive_probes:   u8,    // probes sent since last activity
 
@@ -651,7 +651,7 @@ pub struct TcpSocket {
 
     // Zero-window persist
     persist_deadline: Deadline,
-    persist_backoff_ms: u64,   // current persist interval (doubles each probe)
+    persist_backoff_ns: u64,   // current persist interval in ns (doubles each probe)
 
     // Software pacing
     pacing_next: Deadline,
@@ -674,7 +674,7 @@ impl TcpSocket {
         cfg:       TcpConfig,
     ) -> Self {
         let isn   = SeqNum::new(random_u32());
-        let rto   = cfg.rto_min_ms;
+        let rto   = cfg.rto_min_ms * 1_000_000;
         let bbr   = BbrState::new(&cfg);
         TcpSocket {
             tx,
@@ -698,20 +698,20 @@ impl TcpSocket {
             recv_buf:        Vec::new(),
             rx_ooo:          Vec::new(),
             rx_ooo_last:     None,
-            srtt_ms:         0,
-            rttvar_ms:       0,
-            rto_ms:          rto,
+            srtt_ns:         0,
+            rttvar_ns:       0,
+            rto_ns:          rto,
             rack_end_seq:    isn,
-            rack_xmit_ms:    0,
-            rack_rtt_ms:     0,
+            rack_xmit_ns:    0,
+            rack_rtt_ns:     0,
             rack_reo_decay_round: 0,
             rto_deadline:       Deadline::default(),
             tlp_deadline:       Deadline::default(),
             rto_count:          0,
             dupack_count:       0,
             challenge_ack_count:    0,
-            challenge_ack_epoch_ms: 0,
-            rack_reo_wnd_ms:    0,
+            challenge_ack_epoch_ns: 0,
+            rack_reo_wnd_ns:    0,
             ts_enabled:         false,
             ts_recent:          0,
             peer_offered_ws:    true,   // default true for client SYN; set from SYN in Listen
@@ -719,12 +719,12 @@ impl TcpSocket {
             ecn_ce_pending:     false,
             ecn_cwr_needed:     false,
             fin_pending:        false,
-            last_recv_ms:       0,
+            last_recv_ns:       0,
             keepalive_deadline: Deadline::default(),
             keepalive_probes:   0,
             bbr,
             persist_deadline:   Deadline::default(),
-            persist_backoff_ms: 0,
+            persist_backoff_ns: 0,
             pacing_next:        Deadline::default(),
             cfg,
             last_error:      None,
@@ -850,11 +850,11 @@ impl TcpSocket {
     /// TLP deadline: RFC 8985 §7.4.
     /// FlightSize > 1 → max(2*SRTT, 1.5*SRTT + WCDelAckT).
     /// FlightSize == 1 → 2*SRTT.
-    fn tlp_deadline_ms(&self) -> u64 {
-        const WC_DEL_ACK_T: u64 = 25; // ms, per RFC 8985 §7.4.1
-        let two_srtt = 2 * self.srtt_ms;
+    fn tlp_deadline_ns(&self) -> u64 {
+        const WC_DEL_ACK_NS: u64 = 25_000_000; // 25 ms in ns, per RFC 8985 §7.4.1
+        let two_srtt = 2 * self.srtt_ns;
         if self.unacked.len() > 1 {
-            two_srtt.max(3 * self.srtt_ms / 2 + WC_DEL_ACK_T)
+            two_srtt.max(3 * self.srtt_ns / 2 + WC_DEL_ACK_NS)
         } else {
             two_srtt
         }
@@ -936,11 +936,11 @@ impl TcpSocket {
     /// Challenge ACK with per-second rate limit (RFC 5961 §5).
     fn send_challenge_ack(&mut self) {
         const CHALLENGE_ACK_LIMIT: u8 = 10;
-        const CHALLENGE_ACK_WINDOW_MS: u64 = 1000;
-        let now = self.clock.monotonic_ms();
-        if now.wrapping_sub(self.challenge_ack_epoch_ms) >= CHALLENGE_ACK_WINDOW_MS {
+        const CHALLENGE_ACK_WINDOW_NS: u64 = 1_000_000_000;
+        let now = self.clock.monotonic_ns();
+        if now.wrapping_sub(self.challenge_ack_epoch_ns) >= CHALLENGE_ACK_WINDOW_NS {
             self.challenge_ack_count = 0;
-            self.challenge_ack_epoch_ms = now;
+            self.challenge_ack_epoch_ns = now;
         }
         if self.challenge_ack_count < CHALLENGE_ACK_LIMIT {
             let _ = self.send_ctrl(TcpFlags::ACK);
@@ -982,11 +982,11 @@ impl TcpSocket {
         pacing_gain.apply(effective_bw)
     }
 
-    /// Milliseconds between MSS-sized sends at current pacing rate.
-    fn pacing_interval_ms(&self) -> u64 {
+    /// Nanoseconds between MSS-sized sends at current pacing rate.
+    fn pacing_interval_ns(&self) -> u64 {
         let rate = self.pacing_rate_bps();
         if rate == 0 { return 0; } // 0 = send immediately
-        self.cfg.mss as u64 * 1_000 / rate
+        self.cfg.mss as u64 * 8 * 1_000_000_000 / rate
     }
 
     /// Spec §5.5: BBRIsProbingBW() — true for phases that are probing bandwidth.
@@ -1001,7 +1001,7 @@ impl TcpSocket {
         &mut self,
         acked_bytes: u64,
         delivery_rate: u64,
-        rtt_ms: Option<u64>,
+        rtt_ns: Option<u64>,
         now: u64,
     ) {
         if acked_bytes == 0 { return; }
@@ -1061,17 +1061,17 @@ impl TcpSocket {
         }
 
         // Min RTT filter
-        if let Some(rtt) = rtt_ms {
-            if rtt < self.bbr.min_rtt_ms {
-                self.bbr.min_rtt_ms       = rtt;
-                self.bbr.min_rtt_stamp_ms = now;
+        if let Some(rtt) = rtt_ns {
+            if rtt < self.bbr.min_rtt_ns {
+                self.bbr.min_rtt_ns       = rtt;
+                self.bbr.min_rtt_stamp_ns = now;
             }
         }
 
         // Update cwnd
         let (_, cwnd_gain) = self.bbr_gains();
-        let bdp = if self.bbr.min_rtt_ms < u64::MAX {
-            self.bbr.max_bw * self.bbr.min_rtt_ms / 1_000 // bytes
+        let bdp = if self.bbr.min_rtt_ns < u64::MAX {
+            self.bbr.max_bw * self.bbr.min_rtt_ns / 1_000_000_000 // bytes
         } else {
             self.cfg.mss as u64 * self.cfg.initial_cwnd_pkts as u64
         };
@@ -1089,9 +1089,8 @@ impl TcpSocket {
         // If the stale pacing deadline is farther in the future than one new
         // pacing interval, disarm it.  The next flush_send_buf call will send
         // a segment immediately and then re-arm with the correct interval.
-        if let Some(remaining) = self.pacing_next.remaining_ms(now) {
-            let new_interval = self.pacing_interval_ms();
-            if remaining > new_interval {
+        if let Some(remaining_ns) = self.pacing_next.remaining_ns(now) {
+            if remaining_ns > self.pacing_interval_ns() {
                 self.pacing_next.disarm();
             }
         }
@@ -1216,7 +1215,7 @@ impl TcpSocket {
                 if self.bbr_check_probe_rtt(now) { return; }
                 // Time to probe? After min_rtt interval, transition to REFILL
                 if self.bbr.round_count > 0
-                    && now.saturating_sub(self.bbr.cycle_stamp_ms) >= self.srtt_ms.max(1) * 4
+                    && now.saturating_sub(self.bbr.cycle_stamp_ns) >= self.srtt_ns.max(1) * 4
                 {
                     self.bbr_enter_probe_bw_refill();
                 }
@@ -1224,7 +1223,7 @@ impl TcpSocket {
             BbrPhase::ProbeBwRefill => {
                 // After one round of REFILL, start UP
                 if self.bbr.round_count > 0
-                    && now.saturating_sub(self.bbr.cycle_stamp_ms) >= self.srtt_ms.max(1)
+                    && now.saturating_sub(self.bbr.cycle_stamp_ns) >= self.srtt_ns.max(1)
                 {
                     self.bbr_enter_probe_bw_up(now);
                 }
@@ -1232,14 +1231,14 @@ impl TcpSocket {
             BbrPhase::ProbeBwUp => {
                 // Stay UP for one round then go DOWN
                 if self.bbr.round_count > 0
-                    && now.saturating_sub(self.bbr.cycle_stamp_ms) >= self.srtt_ms.max(1)
+                    && now.saturating_sub(self.bbr.cycle_stamp_ns) >= self.srtt_ns.max(1)
                 {
                     self.bbr_enter_probe_bw_down(now);
                 }
             }
             BbrPhase::ProbeRtt => {
-                if self.bbr.probe_rtt_done_ms > 0 && now >= self.bbr.probe_rtt_done_ms {
-                    self.bbr.probe_rtt_done_ms = 0;
+                if self.bbr.probe_rtt_done_ns > 0 && now >= self.bbr.probe_rtt_done_ns {
+                    self.bbr.probe_rtt_done_ns = 0;
                     self.bbr.cwnd              = self.bbr.prior_cwnd;
                     // Spec: BBRResetShortTermModel at ProbeRTT exit
                     self.bbr_reset_short_term_model();
@@ -1251,8 +1250,8 @@ impl TcpSocket {
 
     /// BDP estimate in bytes.
     fn bbr_bdp(&self) -> u64 {
-        if self.bbr.min_rtt_ms < u64::MAX && self.bbr.max_bw > 0 {
-            self.bbr.max_bw * self.bbr.min_rtt_ms / 1_000
+        if self.bbr.min_rtt_ns < u64::MAX && self.bbr.max_bw > 0 {
+            self.bbr.max_bw * self.bbr.min_rtt_ns / 1_000_000_000
         } else { 0 }
     }
 
@@ -1260,7 +1259,7 @@ impl TcpSocket {
     fn bbr_enter_probe_bw_down(&mut self, now: u64) {
         self.bbr_reset_congestion_signals();
         self.bbr.phase           = BbrPhase::ProbeBwDown;
-        self.bbr.cycle_stamp_ms  = now;
+        self.bbr.cycle_stamp_ns  = now;
     }
 
     /// Enter ProbeBW_REFILL: reset short-term model.
@@ -1272,20 +1271,22 @@ impl TcpSocket {
     /// Enter ProbeBW_UP: probe for more bandwidth.
     fn bbr_enter_probe_bw_up(&mut self, now: u64) {
         self.bbr.phase           = BbrPhase::ProbeBwUp;
-        self.bbr.cycle_stamp_ms  = now;
+        self.bbr.cycle_stamp_ns  = now;
     }
 
     /// Check if it's time to enter ProbeRTT. Returns true if we transitioned.
     fn bbr_check_probe_rtt(&mut self, now: u64) -> bool {
-        if self.cfg.bbr_probe_rtt_interval_ms > 0
-            && now.saturating_sub(self.bbr.min_rtt_stamp_ms) > self.cfg.bbr_probe_rtt_interval_ms
-            && self.bbr.probe_rtt_done_ms == 0
+        // Convert ms config values to ns for comparison with ns timestamps.
+        let probe_rtt_interval_ns = self.cfg.bbr_probe_rtt_interval_ms * 1_000_000;
+        if probe_rtt_interval_ns > 0
+            && now.saturating_sub(self.bbr.min_rtt_stamp_ns) > probe_rtt_interval_ns
+            && self.bbr.probe_rtt_done_ns == 0
         {
             self.bbr.prior_cwnd        = self.bbr.cwnd;
             self.bbr.cwnd              = 4 * self.cfg.mss as u32;
-            self.bbr.probe_rtt_done_ms = now + self.cfg.bbr_probe_rtt_duration_ms;
+            self.bbr.probe_rtt_done_ns = now + self.cfg.bbr_probe_rtt_duration_ms * 1_000_000;
             self.bbr.phase             = BbrPhase::ProbeRtt;
-            self.bbr.last_probe_rtt_ms = now;
+            self.bbr.last_probe_rtt_ns = now;
             return true;
         }
         false
@@ -1307,7 +1308,7 @@ impl TcpSocket {
     // ── Core ACK processing ──────────────────────────────────────────────────
 
     fn on_ack(&mut self, new_ack: SeqNum, opts: &ParsedOpts) {
-        let now          = self.clock.monotonic_ms();
+        let now          = self.clock.monotonic_ns();
         let mut acked    = 0u64;
         let mut rtt_sample: Option<u64> = None;
         // RFC 9438 §4.1: track oldest ACKed segment's delivery snapshot
@@ -1329,18 +1330,18 @@ impl TcpSocket {
                 acked += bytes;
                 // Karn's: RTT only from non-retransmitted segments
                 if seg.retransmits == 0 && rtt_sample.is_none() {
-                    rtt_sample = Some(now.saturating_sub(seg.first_sent_ms));
+                    rtt_sample = Some(now.saturating_sub(seg.first_sent_ns));
                 }
                 // Keep the oldest (earliest-sent) delivery snapshot
                 if oldest_delivered_time.is_none_or(|t| seg.delivered_time_at_send < t) {
                     oldest_delivered      = Some(seg.delivered_at_send);
                     oldest_delivered_time = Some(seg.delivered_time_at_send);
                 }
-                // RACK: update rack_end_seq/xmit_ms/rtt from ACKed segment
+                // RACK: update rack_end_seq/xmit_ns/rtt from ACKed segment
                 if seq_gt(seg.end_seq, self.rack_end_seq) {
                     self.rack_end_seq  = seg.end_seq;
-                    self.rack_xmit_ms  = seg.last_sent_ms;
-                    self.rack_rtt_ms   = now.saturating_sub(seg.last_sent_ms).max(1);
+                    self.rack_xmit_ns  = seg.last_sent_ns;
+                    self.rack_rtt_ns   = now.saturating_sub(seg.last_sent_ns).max(1);
                 }
                 self.unacked.remove(i);
             } else {
@@ -1358,8 +1359,8 @@ impl TcpSocket {
                         // Also update RACK from SACK
                         if seq_gt(seg.end_seq, self.rack_end_seq) {
                             self.rack_end_seq = seg.end_seq;
-                            self.rack_xmit_ms = seg.last_sent_ms;
-                            self.rack_rtt_ms  = now.saturating_sub(seg.last_sent_ms).max(1);
+                            self.rack_xmit_ns = seg.last_sent_ns;
+                            self.rack_rtt_ns  = now.saturating_sub(seg.last_sent_ns).max(1);
                         }
                     }
                 }
@@ -1371,36 +1372,38 @@ impl TcpSocket {
         let _ = old_snd_una;
 
         // Keep-alive: reset probe state on any ACK progress
-        self.last_recv_ms     = now;
+        self.last_recv_ns     = now;
         self.keepalive_probes = 0;
         if self.cfg.keepalive_idle_ms > 0 {
-            self.keepalive_deadline.arm_from_now(self.cfg.keepalive_idle_ms, now);
+            self.keepalive_deadline.arm_from_now_ms(self.cfg.keepalive_idle_ms, now);
         }
 
         // TS-based RTT (RFC 7323 §4.3): override Karn's sample — TS is Karn-immune
+        // TSval ticks are in ms per RFC 7323; convert the ms RTT to ns.
         if self.ts_enabled {
             if let Some(ecr) = opts.ts_ecr {
                 if ecr != 0 {
-                    let ts_rtt = (self.clock.monotonic_ms() as u32).wrapping_sub(ecr) as u64;
-                    rtt_sample = Some(ts_rtt);
+                    let ts_rtt_ms = (self.clock.monotonic_ms() as u32).wrapping_sub(ecr) as u64;
+                    rtt_sample = Some(ts_rtt_ms * 1_000_000);
                 }
             }
         }
 
-        // 4. RFC 6298 RTT/RTO update
+        // 4. RFC 6298 RTT/RTO update (all values in ns)
         if let Some(rtt) = rtt_sample {
-            if self.srtt_ms == 0 {
-                self.srtt_ms   = rtt;
-                self.rttvar_ms = rtt / 2;
+            if self.srtt_ns == 0 {
+                self.srtt_ns   = rtt;
+                self.rttvar_ns = rtt / 2;
             } else {
-                let diff       = rtt.abs_diff(self.srtt_ms);
-                self.rttvar_ms = self.rttvar_ms - self.rttvar_ms / 4 + diff / 4;
-                self.srtt_ms   = self.srtt_ms   - self.srtt_ms   / 8 + rtt / 8;
+                let diff       = rtt.abs_diff(self.srtt_ns);
+                self.rttvar_ns = self.rttvar_ns - self.rttvar_ns / 4 + diff / 4;
+                self.srtt_ns   = self.srtt_ns   - self.srtt_ns   / 8 + rtt / 8;
             }
             // RFC 6298 §2: RTO = SRTT + max(G, 4*RTTVAR) where G=1ms clock granularity.
-            self.rto_ms = (self.srtt_ms + (4 * self.rttvar_ms).max(1))
-                .max(self.cfg.rto_min_ms)
-                .min(self.cfg.rto_max_ms);
+            // All in ns: G = 1_000_000 ns = 1 ms.
+            self.rto_ns = (self.srtt_ns + (4 * self.rttvar_ns).max(1_000_000))
+                .max(self.cfg.rto_min_ms * 1_000_000)
+                .min(self.cfg.rto_max_ms * 1_000_000);
         }
 
         // 5. BBRv3 bandwidth update (RFC 9438 §4.1 delivery rate)
@@ -1408,22 +1411,22 @@ impl TcpSocket {
         // C.delivered (after this ACK) - P.delivered / (now - P.delivered_time)
         let delivery_rate = if let (Some(p_delivered), Some(p_time)) =
             (oldest_delivered, oldest_delivered_time) {
-            let interval_ms = now.saturating_sub(p_time).max(1);
+            let interval_ns = now.saturating_sub(p_time).max(1);
             let c_delivered = self.bbr.delivered + acked;
-            c_delivered.saturating_sub(p_delivered) * 1_000 / interval_ms
+            c_delivered.saturating_sub(p_delivered) * 1_000_000_000 / interval_ns
         } else { 0 };
         self.bbr_on_ack(acked, delivery_rate, rtt_sample, now);
 
         // 6. RACK loss detection (RFC 8985 §7.2)
-        let rack_rtt = if self.rack_rtt_ms > 0 { self.rack_rtt_ms } else { self.srtt_ms.max(1) };
-        let min_rtt  = if self.bbr.min_rtt_ms < u64::MAX { self.bbr.min_rtt_ms } else { rack_rtt };
-        let reorder_window = (min_rtt / 4).max(1) + self.rack_reo_wnd_ms;
+        let rack_rtt = if self.rack_rtt_ns > 0 { self.rack_rtt_ns } else { self.srtt_ns.max(1) };
+        let min_rtt  = if self.bbr.min_rtt_ns < u64::MAX { self.bbr.min_rtt_ns } else { rack_rtt };
+        let reorder_window = (min_rtt / 4).max(1) + self.rack_reo_wnd_ns;
         // Collect segments to retransmit to avoid borrow conflict
         let mut retx: Vec<(SeqNum, TcpFlags, Vec<u8>)> = Vec::new();
         for seg in &self.unacked {
             if !seg.sacked
                 && seq_le(seg.end_seq, self.rack_end_seq)
-                && now >= seg.last_sent_ms + rack_rtt + reorder_window
+                && now >= seg.last_sent_ns + rack_rtt + reorder_window
             {
                 retx.push((seg.seq, seg.flags, seg.data.clone()));
             }
@@ -1433,7 +1436,7 @@ impl TcpSocket {
             for s in &mut self.unacked {
                 if s.seq == seq {
                     s.retransmits += 1;
-                    s.last_sent_ms = now;
+                    s.last_sent_ns = now;
                 }
             }
             let syn_fin_bytes = if !(flags & (TcpFlags::SYN | TcpFlags::FIN)).is_empty() { 1 } else { 0 };
@@ -1460,11 +1463,11 @@ impl TcpSocket {
             self.rto_count = 0;
         } else {
             // Reset RTO (fresh ACK progress)
-            self.rto_deadline.arm_from_now(self.rto_ms, now);
+            self.rto_deadline.arm_from_now_ns(self.rto_ns, now);
             self.rto_count = 0;
             // Arm TLP if not set
-            if !self.tlp_deadline.is_armed() && self.srtt_ms > 0 {
-                self.tlp_deadline.arm_from_now(self.tlp_deadline_ms(), now);
+            if !self.tlp_deadline.is_armed() && self.srtt_ns > 0 {
+                self.tlp_deadline.arm_from_now_ns(self.tlp_deadline_ns(), now);
             }
         }
     }
@@ -1472,7 +1475,7 @@ impl TcpSocket {
     // ── Send buffer drain ────────────────────────────────────────────────────
 
     fn flush_send_buf(&mut self) {
-        let now = self.clock.monotonic_ms();
+        let now = self.clock.monotonic_ns();
         loop {
             if self.state != State::Established && self.state != State::CloseWait { break; }
             if self.send_buf.is_empty()         { break; }
@@ -1488,8 +1491,8 @@ impl TcpSocket {
             if peer_wnd == 0 || seq_ge(self.snd_nxt, wnd_limit) {
                 // Arm persist timer when blocked by zero window
                 if !self.persist_deadline.is_armed() && !self.send_buf.is_empty() {
-                    self.persist_backoff_ms = self.rto_ms;
-                    self.persist_deadline.arm_from_now(self.persist_backoff_ms, now);
+                    self.persist_backoff_ns = self.rto_ns;
+                    self.persist_deadline.arm_from_now_ns(self.persist_backoff_ns, now);
                 }
                 break;
             }
@@ -1542,8 +1545,8 @@ impl TcpSocket {
                 end_seq:          seg_end,
                 flags,
                 data:             chunk,
-                first_sent_ms:    now,
-                last_sent_ms:     now,
+                first_sent_ns:    now,
+                last_sent_ns:     now,
                 retransmits:      0,
                 sacked:           false,
                 delivered_at_send:      self.bbr.delivered,
@@ -1560,20 +1563,20 @@ impl TcpSocket {
             }
 
             // Pacing
-            let interval = self.pacing_interval_ms();
-            if interval > 0 { self.pacing_next.arm_from_now(interval, now); } else { self.pacing_next.disarm(); }
+            let interval = self.pacing_interval_ns();
+            if interval > 0 { self.pacing_next.arm_from_now_ns(interval, now); } else { self.pacing_next.disarm(); }
 
             // Arm/re-arm TLP (RFC 8985 §7.4): deadline depends on
             // FlightSize, so re-compute each time a new segment is sent.
-            if self.srtt_ms > 0 {
-                self.tlp_deadline.arm_from_now(self.tlp_deadline_ms(), now);
+            if self.srtt_ns > 0 {
+                self.tlp_deadline.arm_from_now_ns(self.tlp_deadline_ns(), now);
             } else if !self.tlp_deadline.is_armed() {
-                self.tlp_deadline.arm_from_now(10, now); // fallback 10 ms
+                self.tlp_deadline.arm_from_now_ms(10, now); // fallback 10 ms
             }
 
             // Arm RTO
             if !self.rto_deadline.is_armed() {
-                self.rto_deadline.arm_from_now(self.rto_ms, now);
+                self.rto_deadline.arm_from_now_ns(self.rto_ns, now);
             }
         }
     }
@@ -1716,17 +1719,17 @@ impl TcpSocket {
                     self.send_ctrl_opts(TcpFlags::SYN | TcpFlags::ACK | ecn_synack, &syn_opts)?;
                     self.snd_nxt += 1;
                     // Record SYN-ACK in unacked
-                    let now = self.clock.monotonic_ms();
+                    let now = self.clock.monotonic_ns();
                     self.unacked.push(TxSegment {
                         seq: isn, end_seq: isn + 1,
                         flags: TcpFlags::SYN | TcpFlags::ACK, data: vec![],
-                        first_sent_ms: now, last_sent_ms: now,
+                        first_sent_ns: now, last_sent_ns: now,
                         retransmits: 0, sacked: false,
                         delivered_at_send: self.bbr.delivered,
                         delivered_time_at_send: now,
                     });
                     if !self.rto_deadline.is_armed() {
-                        self.rto_deadline.arm_from_now(self.rto_ms, now);
+                        self.rto_deadline.arm_from_now_ns(self.rto_ns, now);
                     }
                     self.state = State::SynReceived;
                 }
@@ -1843,11 +1846,11 @@ impl TcpSocket {
                         self.dupack_count = self.dupack_count.saturating_add(1);
                         if self.dupack_count >= 3 {
                             self.dupack_count = 0;
-                            let now = self.clock.monotonic_ms();
+                            let now = self.clock.monotonic_ns();
                             if let Some(s) = self.unacked.iter().find(|s| !s.sacked) {
                                 let (seq, flags, data) = (s.seq, s.flags, s.data.clone());
                                 for s in &mut self.unacked {
-                                    if s.seq == seq { s.retransmits += 1; s.last_sent_ms = now; }
+                                    if s.seq == seq { s.retransmits += 1; s.last_sent_ns = now; }
                                 }
                                 let syn_arr;
                                 let ts_arr;
@@ -1868,19 +1871,19 @@ impl TcpSocket {
                     if opts.sack_count > 0 {
                         if let Some((left, _)) = opts.sack_blocks[0] {
                             if seq_lt(SeqNum::new(left), self.snd_una) {
-                                let min_rtt = if self.bbr.min_rtt_ms < u64::MAX { self.bbr.min_rtt_ms } else { self.srtt_ms };
+                                let min_rtt = if self.bbr.min_rtt_ns < u64::MAX { self.bbr.min_rtt_ns } else { self.srtt_ns };
                                 let inc = (min_rtt / 4).max(1);
                                 // RFC 8985 §6.2: upper-bound is SRTT, not min_RTT.
-                                self.rack_reo_wnd_ms =
-                                    (self.rack_reo_wnd_ms + inc).min(self.srtt_ms);
+                                self.rack_reo_wnd_ns =
+                                    (self.rack_reo_wnd_ns + inc).min(self.srtt_ns);
                             }
                         }
                     }
-                    // Decay rack_reo_wnd_ms once per round (RFC 8985 §7.2).
+                    // Decay rack_reo_wnd_ns once per round (RFC 8985 §7.2).
                     if self.bbr.round_count > self.rack_reo_decay_round {
                         self.rack_reo_decay_round = self.bbr.round_count;
-                        self.rack_reo_wnd_ms =
-                            self.rack_reo_wnd_ms.saturating_sub(self.rack_reo_wnd_ms / 8 + 1);
+                        self.rack_reo_wnd_ns =
+                            self.rack_reo_wnd_ns.saturating_sub(self.rack_reo_wnd_ns / 8 + 1);
                     }
                 }
 
@@ -1955,11 +1958,11 @@ impl TcpSocket {
                     self.drain_ooo(eth.src, eth.dst, ip.src, ip.dst);
                     // Keep-alive: receiving data resets the idle timer
                     {
-                        let now = self.clock.monotonic_ms();
-                        self.last_recv_ms     = now;
+                        let now = self.clock.monotonic_ns();
+                        self.last_recv_ns     = now;
                         self.keepalive_probes = 0;
                         if self.cfg.keepalive_idle_ms > 0 {
-                            self.keepalive_deadline.arm_from_now(self.cfg.keepalive_idle_ms, now);
+                            self.keepalive_deadline.arm_from_now_ms(self.cfg.keepalive_idle_ms, now);
                         }
                     }
                     // ACK (with SACK if OOO pending)
@@ -2033,9 +2036,9 @@ impl TcpSocket {
                     self.rcv_nxt += 1;
                     let _ = self.send_ctrl(TcpFlags::ACK);
                     if fin_acked {
-                        let now = self.clock.monotonic_ms();
+                        let now = self.clock.monotonic_ns();
                         // Reuse rto_deadline as TIME_WAIT linger timer (field is idle during TimeWait).
-                        self.rto_deadline.arm_from_now(TIME_WAIT_MS, now);
+                        self.rto_deadline.arm_from_now_ms(TIME_WAIT_MS, now);
                         self.state = State::TimeWait;
                     } else {
                         self.state = State::Closing;
@@ -2074,9 +2077,9 @@ impl TcpSocket {
                 if seg.has_flag(TcpFlags::FIN) {
                     self.rcv_nxt += 1;
                     let _ = self.send_ctrl(TcpFlags::ACK);
-                    let now = self.clock.monotonic_ms();
+                    let now = self.clock.monotonic_ns();
                     // Reuse rto_deadline as TIME_WAIT linger timer (field is idle during TimeWait).
-                    self.rto_deadline.arm_from_now(TIME_WAIT_MS, now);
+                    self.rto_deadline.arm_from_now_ms(TIME_WAIT_MS, now);
                     self.state = State::TimeWait;
                 } else if !pdu.is_empty() {
                     let _ = self.send_ctrl(TcpFlags::ACK);
@@ -2086,9 +2089,9 @@ impl TcpSocket {
             // ── CLOSING ─────────────────────────────────────────────────────
             State::Closing => {
                 if seg.has_flag(TcpFlags::ACK) {
-                    let now = self.clock.monotonic_ms();
+                    let now = self.clock.monotonic_ns();
                     // Reuse rto_deadline as TIME_WAIT linger timer (field is idle during TimeWait).
-                    self.rto_deadline.arm_from_now(TIME_WAIT_MS, now);
+                    self.rto_deadline.arm_from_now_ms(TIME_WAIT_MS, now);
                     self.state = State::TimeWait;
                 }
             }
@@ -2150,16 +2153,16 @@ impl TcpSocket {
         // Advertise ECN capability in SYN (RFC 3168 §6.1.1).
         s.send_ctrl_opts(TcpFlags::SYN | TcpFlags::ECE | TcpFlags::CWR, &syn_opts)?;
         s.snd_nxt += 1;
-        let now = s.clock.monotonic_ms();
+        let now = s.clock.monotonic_ns();
         s.unacked.push(TxSegment {
             seq: isn, end_seq: isn + 1,
             flags: TcpFlags::SYN, data: vec![],
-            first_sent_ms: now, last_sent_ms: now,
+            first_sent_ns: now, last_sent_ns: now,
             retransmits: 0, sacked: false,
             delivered_at_send: 0,
             delivered_time_at_send: now,
         });
-        s.rto_deadline.arm_from_now(s.rto_ms, now);
+        s.rto_deadline.arm_from_now_ns(s.rto_ns, now);
         Ok(s)
     }
 
@@ -2199,15 +2202,16 @@ impl TcpSocket {
 
     // ── Public API ───────────────────────────────────────────────────────────
 
-    /// Minimum remaining ms across all armed deadlines; `None` if none pending.
-    /// Used by `Network::poll_rx_with_timeout` to cap the `poll(2)` sleep.
-    pub fn next_deadline_ms(&self, now: u64) -> Option<u64> {
+    /// Minimum remaining ns across all armed deadlines; `None` if none pending.
+    /// Used by `Network::poll_rx_with_timeout` to cap the `ppoll(2)` sleep.
+    /// `now_ns` must be a nanosecond timestamp from `Clock::monotonic_ns()`.
+    pub fn next_deadline_ns(&self, now_ns: u64) -> Option<u64> {
         [
-            self.rto_deadline.remaining_ms(now),
-            self.tlp_deadline.remaining_ms(now),
-            self.keepalive_deadline.remaining_ms(now),
-            self.persist_deadline.remaining_ms(now),
-            self.pacing_next.remaining_ms(now),
+            self.rto_deadline.remaining_ns(now_ns),
+            self.tlp_deadline.remaining_ns(now_ns),
+            self.keepalive_deadline.remaining_ns(now_ns),
+            self.persist_deadline.remaining_ns(now_ns),
+            self.pacing_next.remaining_ns(now_ns),
         ]
         .into_iter().flatten().min()
     }
@@ -2217,7 +2221,7 @@ impl TcpSocket {
     /// RX is now handled by the uplink's poll loop, which calls
     /// [`process_segment`] directly.
     pub fn poll(&mut self) -> Result<()> {
-        let now = self.clock.monotonic_ms();
+        let now = self.clock.monotonic_ns();
 
         // ── TLP ──
         if self.tlp_deadline.is_expired(now) {
@@ -2254,7 +2258,7 @@ impl TcpSocket {
             });
             if let Some((seq, flags, data)) = oldest {
                 for s in &mut self.unacked {
-                    if s.seq == seq { s.retransmits += 1; s.last_sent_ms = now; }
+                    if s.seq == seq { s.retransmits += 1; s.last_sent_ns = now; }
                 }
                 let opts_arr;
                 let ts_arr;
@@ -2279,8 +2283,8 @@ impl TcpSocket {
                 on_error(TcpError::Timeout);
                 return Ok(());
             }
-            self.rto_ms = (self.rto_ms * 2).min(self.cfg.rto_max_ms);
-            self.rto_deadline.arm_from_now(self.rto_ms, now);
+            self.rto_ns = (self.rto_ns * 2).min(self.cfg.rto_max_ms * 1_000_000);
+            self.rto_deadline.arm_from_now_ns(self.rto_ns, now);
             // RFC 8985 §7.2: cancel TLP when RTO fires.
             self.tlp_deadline.disarm();
         }
@@ -2302,7 +2306,7 @@ impl TcpSocket {
             let ts;
             let opts: &[u8] = if self.ts_enabled { ts = self.ts_opt(); &ts } else { &[] };
             let _ = self.send_segment(probe_seq, TcpFlags::ACK, &[], opts);
-            self.keepalive_deadline.arm_from_now(self.cfg.keepalive_interval_ms, now);
+            self.keepalive_deadline.arm_from_now_ms(self.cfg.keepalive_interval_ms, now);
         }
 
         // ── Zero-window persist ──
@@ -2320,9 +2324,9 @@ impl TcpSocket {
                 let _ = self.send_segment(seq, TcpFlags::ACK, &[probe_byte], ts_slice);
             }
             // Exponential backoff, capped at rto_max
-            self.persist_backoff_ms = (self.persist_backoff_ms * 2)
-                .min(self.cfg.rto_max_ms);
-            self.persist_deadline.arm_from_now(self.persist_backoff_ms, now);
+            self.persist_backoff_ns = (self.persist_backoff_ns * 2)
+                .min(self.cfg.rto_max_ms * 1_000_000);
+            self.persist_deadline.arm_from_now_ns(self.persist_backoff_ns, now);
         }
 
         // ── Drain send buffer ──
@@ -2407,21 +2411,21 @@ impl TcpSocket {
     /// Push a FIN into the retransmit buffer and arm RTO so a lost FIN is
     /// retransmitted.
     fn record_fin(&mut self, fin_seq: SeqNum) {
-        let now = self.clock.monotonic_ms();
+        let now = self.clock.monotonic_ns();
         self.unacked.push(TxSegment {
             seq:           fin_seq,
             end_seq:       fin_seq + 1, // FIN occupies 1 sequence byte
             flags:         TcpFlags::FIN | TcpFlags::ACK,
             data:          Vec::new(),
-            first_sent_ms: now,
-            last_sent_ms:  now,
+            first_sent_ns: now,
+            last_sent_ns:  now,
             retransmits:   0,
             sacked:        false,
             delivered_at_send:      self.bbr.delivered,
             delivered_time_at_send: now,
         });
         if !self.rto_deadline.is_armed() {
-            self.rto_deadline.arm_from_now(self.rto_ms, now);
+            self.rto_deadline.arm_from_now_ns(self.rto_ns, now);
         }
     }
 
@@ -2439,7 +2443,7 @@ impl TcpSocket {
     pub fn bbr_bw_shortterm(&self) -> u64 { self.bbr.bw_shortterm }
     pub fn bbr_bw_latest(&self) -> u64 { self.bbr.bw_latest }
     pub fn bbr_inflight_latest(&self) -> u64 { self.bbr.inflight_latest }
-    pub fn bbr_min_rtt_ms(&self) -> u64 { self.bbr.min_rtt_ms }
+    pub fn bbr_min_rtt_ns(&self) -> u64 { self.bbr.min_rtt_ns }
     pub fn bbr_pacing_rate_bps(&self) -> u64 { self.pacing_rate_bps() }
     pub fn bbr_round_count(&self) -> u64 { self.bbr.round_count }
     pub fn bbr_filled_pipe(&self) -> bool { self.bbr.filled_pipe }
@@ -2448,14 +2452,14 @@ impl TcpSocket {
     pub fn bbr_loss_events_in_round(&self) -> u32 { self.bbr.loss_events_in_round }
     pub fn bbr_acked_bytes_round(&self) -> u64 { self.bbr.acked_bytes_round }
     pub fn bbr_prior_cwnd(&self) -> u32 { self.bbr.prior_cwnd }
-    pub fn rack_reo_wnd_ms(&self) -> u64 { self.rack_reo_wnd_ms }
+    pub fn rack_reo_wnd_ns(&self) -> u64 { self.rack_reo_wnd_ns }
     pub fn rack_end_seq(&self) -> u32 { self.rack_end_seq.0 }
-    pub fn rack_xmit_ms(&self) -> u64 { self.rack_xmit_ms }
+    pub fn rack_xmit_ns(&self) -> u64 { self.rack_xmit_ns }
     pub fn dupack_count(&self) -> u8 { self.dupack_count }
     pub fn snd_wnd(&self) -> u32 { (self.snd_wnd_raw as u32) << self.snd_scale }
-    pub fn srtt_ms(&self) -> u64 { self.srtt_ms }
-    pub fn rttvar_ms(&self) -> u64 { self.rttvar_ms }
-    pub fn rto_ms(&self) -> u64 { self.rto_ms }
+    pub fn srtt_ns(&self) -> u64 { self.srtt_ns }
+    pub fn rttvar_ns(&self) -> u64 { self.rttvar_ns }
+    pub fn rto_ns(&self) -> u64 { self.rto_ns }
     pub fn sack_ok(&self) -> bool { self.sack_ok }
     pub fn ts_enabled(&self) -> bool { self.ts_enabled }
     pub fn ecn_enabled(&self) -> bool { self.ecn_enabled }

@@ -149,13 +149,13 @@ impl IcmpRateLimit {
     }
 
     /// Returns `true` if an ICMP Unreachable may be sent, consuming one token.
-    /// `now` is `clock.monotonic_ms()` from the owning `Interface`.
+    /// `now` is `clock.monotonic_ns()` from the owning `Interface`.
     fn allow(&mut self, now: u64) -> bool {
         if self.rate_per_sec == 0 {
             return true; // unlimited
         }
-        let elapsed_ms = now.saturating_sub(self.last_refill);
-        let add = ((elapsed_ms.saturating_mul(self.rate_per_sec as u64)) / 1000) as u32;
+        let elapsed_ns = now.saturating_sub(self.last_refill);
+        let add = (elapsed_ns.saturating_mul(self.rate_per_sec as u64) / 1_000_000_000) as u32;
         if add > 0 {
             self.tokens = self.tokens.saturating_add(add).min(self.burst);
             self.last_refill = now;
@@ -183,7 +183,7 @@ impl ReassemblyTable {
     /// Remove entries whose deadline has expired, reclaiming their memory.
     fn purge(&mut self) {
         let before = self.entries.len();
-        let now = self.clock.monotonic_ms();
+        let now = self.clock.monotonic_ns();
         self.entries.retain(|e| !e.deadline.is_expired(now));
         if self.entries.len() != before {
             self.total_bytes = self.entries.iter().map(|e| e.total_bytes).sum();
@@ -210,7 +210,7 @@ impl ReassemblyTable {
         let payload     = ip.payload(ip_buf);
         let frag_bytes  = payload.len();
         let more_frags  = (ip.flags_frag & FLAG_MF) != 0;
-        let now         = self.clock.monotonic_ms();
+        let now         = self.clock.monotonic_ns();
 
         // ── Locate or create a reassembly entry ──────────────────────────────
 
@@ -243,7 +243,7 @@ impl ReassemblyTable {
                 fragments:   vec![Fragment { offset: frag_offset, data: payload.to_vec() }],
                 total_bytes: frag_bytes,
                 total_len,
-                deadline:    Deadline::from_now(self.timeout_ms, now),
+                deadline:    Deadline::from_now_ms(self.timeout_ms, now),
             };
 
             self.total_bytes += frag_bytes;
@@ -1009,7 +1009,7 @@ impl Interface {
         raw:  &[u8],
         code: u8,
     ) -> Result<()> {
-        let now = self.clock.monotonic_ms();
+        let now = self.clock.monotonic_ns();
         if !self.icmp_rl.allow(now) {
             return Ok(());
         }

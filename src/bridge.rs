@@ -98,9 +98,9 @@ pub enum Jitter {
     /// Uniform jitter: adds between 0 and `2 * half_ns` nanoseconds.
     Uniform(u64),
     /// Gaussian (Box-Muller) jitter.  Negative samples are clamped to 0.
-    Normal { mean_ms: f64, std_dev_ms: f64 },
+    Normal { mean_ns: f64, std_dev_ns: f64 },
     /// Pareto type-II (heavy-tailed) jitter.
-    Pareto { mean_ms: f64, std_dev_ms: f64 },
+    Pareto { mean_ns: f64, std_dev_ns: f64 },
 }
 
 // ── Reorder ───────────────────────────────────────────────────────────────────
@@ -111,25 +111,29 @@ pub struct Reorder {
     /// Probability that a given frame is held and reordered.
     pub rate: f64,
     /// How long (ns) to hold a frame before injecting it out-of-order.
-    pub delay_ms: u64,
+    pub delay_ns: u64,
 }
 
 impl Reorder {
     /// No reordering.
     pub fn none() -> Self {
-        Reorder { rate: 0.0, delay_ms: 0 }
+        Reorder { rate: 0.0, delay_ns: 0 }
     }
 
     /// Reorder `rate` fraction of frames with a default 50 ms hold time.
     pub fn rate(rate: f64) -> Self {
-        Reorder { rate, delay_ms: 50 }
+        Reorder { rate, delay_ns: 50_000_000 }
     }
 
     /// Set the hold delay in milliseconds.
     pub fn delay_ms(self, ms: u64) -> Self {
-        Reorder { delay_ms: ms, ..self }
+        Reorder { delay_ns: ms * 1_000_000, ..self }
     }
 
+    /// Set the hold delay in nanoseconds.
+    pub fn delay_ns(self, ns: u64) -> Self {
+        Reorder { delay_ns: ns, ..self }
+    }
 }
 
 // ── LossState ─────────────────────────────────────────────────────────────────
@@ -146,8 +150,8 @@ pub struct LossState {
 /// One-way link characteristics.
 #[derive(Debug, Clone)]
 pub struct DirectionProfile {
-    /// Base one-way latency in milliseconds.
-    pub latency_ms:     u64,
+    /// Base one-way latency in nanoseconds.
+    pub latency_ns:     u64,
     /// Serialization bandwidth in bits-per-second.  0 = unlimited.
     pub bandwidth_bps:  u64,
     /// Additional per-packet jitter model.
@@ -165,7 +169,7 @@ pub struct DirectionProfile {
 impl Default for DirectionProfile {
     fn default() -> Self {
         DirectionProfile {
-            latency_ms:     0,
+            latency_ns:     0,
             bandwidth_bps:  0,
             jitter:         Jitter::None,
             loss:           Loss::None,
@@ -186,7 +190,12 @@ impl DirectionProfile {
 
     /// Set base latency in milliseconds.
     pub fn latency(self, ms: u64) -> Self {
-        DirectionProfile { latency_ms: ms, ..self }
+        DirectionProfile { latency_ns: ms * 1_000_000, ..self }
+    }
+
+    /// Set base latency in nanoseconds.
+    pub fn latency_ns(self, ns: u64) -> Self {
+        DirectionProfile { latency_ns: ns, ..self }
     }
 
     /// Set serialization bandwidth in bits per second.
@@ -236,36 +245,36 @@ impl DirectionProfile {
 
     // ── Internal helpers ──────────────────────────────────────────────────────
 
-    /// Total one-way delay in milliseconds for a frame of `len` bytes.
-    pub fn delay_ms(&self, len: usize) -> u64 {
-        let serial_ms = if self.bandwidth_bps > 0 {
-            (len as u64 * 8 * 1_000) / self.bandwidth_bps
+    /// Total one-way delay in nanoseconds for a frame of `len` bytes.
+    pub fn delay_ns(&self, len: usize) -> u64 {
+        let serial_ns = if self.bandwidth_bps > 0 {
+            (len as u64 * 8 * 1_000_000_000) / self.bandwidth_bps
         } else {
             0
         };
-        let jitter_ms = self.sample_jitter();
-        self.latency_ms + serial_ms + jitter_ms
+        let jitter_ns = self.sample_jitter_ns();
+        self.latency_ns + serial_ns + jitter_ns
     }
 
-    fn sample_jitter(&self) -> u64 {
+    fn sample_jitter_ns(&self) -> u64 {
         match &self.jitter {
             Jitter::None => 0,
-            Jitter::Uniform(half_ms) => {
-                if *half_ms == 0 { return 0; }
-                next_u64() % (half_ms * 2 + 1)
+            Jitter::Uniform(half_ns) => {
+                if *half_ns == 0 { return 0; }
+                next_u64() % (half_ns * 2 + 1)
             }
-            Jitter::Normal { mean_ms, std_dev_ms } => {
+            Jitter::Normal { mean_ns, std_dev_ns } => {
                 let u1 = rand_f64().max(f64::MIN_POSITIVE);
                 let u2 = rand_f64();
                 let z = (-2.0 * u1.ln()).sqrt()
                     * (2.0 * core::f64::consts::PI * u2).cos();
-                let v = mean_ms + std_dev_ms * z;
+                let v = mean_ns + std_dev_ns * z;
                 if v < 0.0 { 0 } else { v as u64 }
             }
-            Jitter::Pareto { mean_ms, std_dev_ms } => {
-                let cv = std_dev_ms / mean_ms;
+            Jitter::Pareto { mean_ns, std_dev_ns } => {
+                let cv = std_dev_ns / mean_ns;
                 let alpha = 1.0 / (cv * cv) + 2.0;
-                let sigma = mean_ms * (alpha - 1.0);
+                let sigma = mean_ns * (alpha - 1.0);
                 let u = rand_f64().max(f64::MIN_POSITIVE);
                 let v = sigma * (u.powf(-1.0 / alpha) - 1.0);
                 if v < 0.0 { 0 } else { v as u64 }
@@ -1066,7 +1075,7 @@ impl Bridge {
 ///
 /// `sender_now_ns` is the sender's clock reading (nanoseconds) at TX time;
 /// frames that have a non-zero egress delay are pushed into the egress delay
-/// queue stamped at `sender_now_ns + delay_ms * 1_000_000`.  Pass `0` for immediate
+/// queue stamped at `sender_now_ns + delay_ns`.  Pass `0` for immediate
 /// delivery (inject paths).
 fn forward_frame(inner: &mut BridgeInner, ingress_idx: usize, data: Vec<u8>, sender_now_ns: u64) {
     let n_ports = inner.ports.len();
@@ -1107,16 +1116,16 @@ fn forward_frame(inner: &mut BridgeInner, ingress_idx: usize, data: Vec<u8>, sen
             continue;
         };
 
-        let delay_ms = inner.ports[egress_idx].profile_eg.profile.delay_ms(eg_data.len());
+        let delay_ns = inner.ports[egress_idx].profile_eg.profile.delay_ns(eg_data.len());
         inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: Some(egress_idx), data: eg_data.clone(), ts_ns: sender_now_ns });
 
-        if delay_ms == 0 || sender_now_ns == 0 {
+        if delay_ns == 0 || sender_now_ns == 0 {
             // Deliver immediately.
             inner.ports[egress_idx].egress.push(&eg_data);
         } else {
-            // Stamp with sender clock + delay (ms→ns); receiver's deliver
-            // closure will drain when receiver's clock reaches deliver_at.
-            inner.ports[egress_idx].profile_eg.delay_queue.push(sender_now_ns + delay_ms * 1_000_000, eg_data);
+            // Stamp with sender clock + delay; receiver's deliver closure will
+            // drain when receiver's clock reaches deliver_at.
+            inner.ports[egress_idx].profile_eg.delay_queue.push(sender_now_ns + delay_ns, eg_data);
         }
     }
 }
@@ -1351,8 +1360,8 @@ mod tests {
     #[test]
     fn link_profile_instant_fields() {
         let p = LinkProfile::instant();
-        assert_eq!(p.a_to_b.latency_ms, 0);
-        assert_eq!(p.b_to_a.latency_ms, 0);
+        assert_eq!(p.a_to_b.latency_ns, 0);
+        assert_eq!(p.b_to_a.latency_ns, 0);
     }
 
     #[test]

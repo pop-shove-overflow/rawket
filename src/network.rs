@@ -5,7 +5,7 @@
 /// which interface indices it drives via `iface_indices`.
 ///
 /// [`Network::poll_rx`] is the single entry point for inbound traffic: it
-/// updates the timer system, blocks in `poll(2)` for the appropriate
+/// updates the timer system, blocks in `ppoll(2)` for the appropriate
 /// duration, drains all ready rings, and updates the timer system again.
 use core::net::Ipv4Addr;
 use crate::{
@@ -697,45 +697,47 @@ impl Network {
 
     /// Dispatch inbound frames and drive the timer system.
     ///
-    /// Equivalent to `poll_rx_with_timeout(None)`.
+    /// Equivalent to `poll_rx_with_timeout(None)`.  Uses `ppoll(2)` for
+    /// nanosecond-resolution wakeups.
     pub fn poll_rx(&mut self) -> Result<()> {
         self.poll_rx_with_timeout(None)
     }
 
-    /// Like [`poll_rx`] but caps the `poll(2)` wait to at most
+    /// Like [`poll_rx`] but caps the `ppoll(2)` wait to at most
     /// `max_timeout_ms` milliseconds.  Pass `None` to use the timer-derived
     /// deadline only (may block indefinitely when no timers are pending).
     pub fn poll_rx_with_timeout(
         &mut self,
         max_timeout_ms: Option<u64>,
     ) -> Result<()> {
-        // Drive bridge deliver closures: drain delayed frames whose deadline
-        // has arrived.
-        for f in &self.bridge_delivers { f(); }
+        // Drive bridge deliver closures first: drain any delayed frames whose
+        // deadline has arrived, and collect the next pending deadline (ns).
+        let bridge_ns: Option<u64> = {
+            let now_ns = self.timers.clock().monotonic_ns();
+            self.bridge_delivers
+                .iter()
+                .filter_map(|f| f())
+                .min()
+                .map(|deadline_ns| deadline_ns.saturating_sub(now_ns))
+        };
 
-        // First update: fire already-expired timers, get next deadline.
-        let timer_ms = self.timers.update();
+        // First update: fire already-expired timers, get next deadline (ns).
+        let timer_ns = self.timers.update();
 
-        // Fold TCP socket deadlines into the timeout so we wake up in time
-        // to fire RTO / TLP / keep-alive / persist even when no RX arrives.
-        let tcp_now = self.timers.clock().monotonic_ms();
-        let tcp_ms: Option<u64> = self.interfaces
+        // Fold TCP socket deadlines (ns) into the timeout so we wake up in
+        // time to fire RTO / TLP / keep-alive / persist / pacing even when no
+        // RX arrives.
+        let tcp_now = self.timers.clock().monotonic_ns();
+        let tcp_ns: Option<u64> = self.interfaces
             .iter()
             .flat_map(|i| i.tcp_sockets.iter())
-            .filter_map(|s| s.next_deadline_ms(tcp_now))
+            .filter_map(|s| s.next_deadline_ns(tcp_now))
             .min();
 
-        let effective_ms = match (timer_ms, tcp_ms) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b)             => a.or(b),
-        };
-
-        let timeout_ms: libc::c_int = match (effective_ms, max_timeout_ms) {
-            (Some(t), Some(m)) => t.min(m).min(libc::c_int::MAX as u64) as libc::c_int,
-            (Some(t), None)    => t.min(libc::c_int::MAX as u64) as libc::c_int,
-            (None,    Some(m)) => m.min(libc::c_int::MAX as u64) as libc::c_int,
-            (None,    None)    => -1,
-        };
+        // Combine all ns deadlines; apply optional ms ceiling.
+        let max_ns = max_timeout_ms.map(|ms| ms * 1_000_000);
+        let effective_ns: Option<u64> =
+            [timer_ns, tcp_ns, bridge_ns, max_ns].into_iter().flatten().min();
 
         if !self.uplinks.is_empty() {
             let mut pollfds: Vec<libc::pollfd> = self.uplinks
@@ -748,10 +750,17 @@ impl Network {
                 .collect();
 
             let rc = unsafe {
-                libc::poll(
+                // ppoll(2): nanosecond-resolution timeout; null timespec = block
+                // indefinitely; null sigmask = no mask change.
+                let ts = effective_ns.map(|ns| libc::timespec {
+                    tv_sec:  (ns / 1_000_000_000) as i64,
+                    tv_nsec: (ns % 1_000_000_000) as libc::c_long,
+                });
+                libc::ppoll(
                     pollfds.as_mut_ptr(),
                     pollfds.len() as libc::nfds_t,
-                    timeout_ms,
+                    ts.as_ref().map_or(core::ptr::null(), |p| p as *const _),
+                    core::ptr::null(),
                 )
             };
             if rc < 0 {
@@ -767,10 +776,18 @@ impl Network {
             }
         } else if !self.interfaces.is_empty() {
             // No AF_PACKET uplinks — bridge-based or virtual interfaces.
-            if self.bridge_delivers.is_empty() && timeout_ms >= 0 {
-                let ms = timeout_ms as u64;
-                if ms > 0 {
-                    unsafe { libc::usleep((ms * 1_000) as libc::c_uint) };
+            // When bridge deliver closures are registered, timing is driven by
+            // virtual clocks advanced explicitly by the caller; real-time sleep
+            // would only waste wall-clock time and is skipped.
+            if self.bridge_delivers.is_empty() {
+                if let Some(ns) = effective_ns {
+                    if ns > 0 {
+                        let ts = libc::timespec {
+                            tv_sec:  (ns / 1_000_000_000) as i64,
+                            tv_nsec: (ns % 1_000_000_000) as libc::c_long,
+                        };
+                        unsafe { libc::nanosleep(&ts, core::ptr::null_mut()) };
+                    }
                 }
             }
         }

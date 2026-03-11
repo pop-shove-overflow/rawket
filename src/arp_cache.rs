@@ -22,15 +22,15 @@ use crate::{
 pub struct ArpEntry {
     pub ip:  Ipv4Addr,
     pub mac: MacAddr,
-    /// Absolute monotonic timestamp (ms) after which this entry is stale.
-    expires_at: u64,
+    /// Absolute monotonic timestamp (ns) after which this entry is stale.
+    expires_at_ns: u64,
 }
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
 
 pub struct ArpCache {
     entries: Vec<ArpEntry>,
-    /// Maximum lifetime of a cache entry in milliseconds.
+    /// Maximum lifetime of a cache entry in milliseconds (user-facing config).
     /// Also used as the interval between expiry timer firings.
     pub max_age_ms: u64,
     /// Maximum number of entries.  When the cache is full and a new IP is
@@ -47,36 +47,36 @@ impl ArpCache {
     ///
     /// If an entry for `ip` already exists it is updated in place; otherwise
     /// a new entry is appended.  When the cache is full, the oldest entry
-    /// (FIFO) is evicted to make room.  The expiry is set to `now + max_age_ms`.
-    pub fn insert(&mut self, ip: Ipv4Addr, mac: MacAddr, now: u64) {
-        let expires_at = now + self.max_age_ms;
+    /// (FIFO) is evicted to make room.  The expiry is set to `now_ns + max_age_ms * 1_000_000`.
+    pub fn insert(&mut self, ip: Ipv4Addr, mac: MacAddr, now_ns: u64) {
+        let expires_at_ns = now_ns + self.max_age_ms * 1_000_000;
         if let Some(e) = self.entries.iter_mut().find(|e| e.ip == ip) {
             e.mac = mac;
-            e.expires_at = expires_at;
+            e.expires_at_ns = expires_at_ns;
         } else {
             // Evict the oldest entry (index 0) when at capacity.
             if self.entries.len() >= self.max_entries {
                 self.entries.remove(0);
             }
-            self.entries.push(ArpEntry { ip, mac, expires_at });
+            self.entries.push(ArpEntry { ip, mac, expires_at_ns });
         }
     }
 
     /// Return the cached MAC address for `ip`, or `None` if not present or
     /// expired.
-    pub fn lookup(&self, ip: Ipv4Addr, now: u64) -> Option<MacAddr> {
+    pub fn lookup(&self, ip: Ipv4Addr, now_ns: u64) -> Option<MacAddr> {
         self.entries
             .iter()
-            .find(|e| e.ip == ip && e.expires_at > now)
+            .find(|e| e.ip == ip && e.expires_at_ns > now_ns)
             .map(|e| e.mac)
     }
 
     /// Like [`lookup`](Self::lookup), but also extends the entry's expiry to
-    /// `now + max_age_ms` on a hit, preventing frequently-used entries from
-    /// aging out while traffic is flowing.
-    pub fn lookup_and_refresh(&mut self, ip: Ipv4Addr, now: u64) -> Option<MacAddr> {
-        if let Some(e) = self.entries.iter_mut().find(|e| e.ip == ip && e.expires_at > now) {
-            e.expires_at = now + self.max_age_ms;
+    /// `now_ns + max_age_ms * 1_000_000` on a hit, preventing frequently-used
+    /// entries from aging out while traffic is flowing.
+    pub fn lookup_and_refresh(&mut self, ip: Ipv4Addr, now_ns: u64) -> Option<MacAddr> {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.ip == ip && e.expires_at_ns > now_ns) {
+            e.expires_at_ns = now_ns + self.max_age_ms * 1_000_000;
             Some(e.mac)
         } else {
             None
@@ -86,8 +86,8 @@ impl ArpCache {
     /// Remove all entries whose expiry timestamp has passed.
     ///
     /// Called automatically by the timer installed via [`schedule_expiry`].
-    pub fn expire(&mut self, now: u64) {
-        self.entries.retain(|e| e.expires_at > now);
+    pub fn expire(&mut self, now_ns: u64) {
+        self.entries.retain(|e| e.expires_at_ns > now_ns);
     }
 }
 
@@ -184,26 +184,26 @@ impl ArpQueue {
 
     /// Insert or refresh a cache entry (called on ARP receipt).
     pub fn insert(&self, ip: Ipv4Addr, mac: MacAddr) {
-        let now = self.clock.monotonic_ms();
-        self.cache.borrow_mut().insert(ip, mac, now);
+        let now_ns = self.clock.monotonic_ns();
+        self.cache.borrow_mut().insert(ip, mac, now_ns);
     }
 
     /// Purge expired entries (called by the recurring timer).
     pub fn expire(&self) {
-        let now = self.clock.monotonic_ms();
-        self.cache.borrow_mut().expire(now);
+        let now_ns = self.clock.monotonic_ns();
+        self.cache.borrow_mut().expire(now_ns);
     }
 
     /// Look up `ip` without extending its TTL.
     pub fn lookup(&self, ip: Ipv4Addr) -> Option<MacAddr> {
-        let now = self.clock.monotonic_ms();
-        self.cache.borrow().lookup(ip, now)
+        let now_ns = self.clock.monotonic_ns();
+        self.cache.borrow().lookup(ip, now_ns)
     }
 
     /// Look up `ip` and extend its TTL on a hit.
     pub fn lookup_and_refresh(&self, ip: Ipv4Addr) -> Option<MacAddr> {
-        let now = self.clock.monotonic_ms();
-        self.cache.borrow_mut().lookup_and_refresh(ip, now)
+        let now_ns = self.clock.monotonic_ns();
+        self.cache.borrow_mut().lookup_and_refresh(ip, now_ns)
     }
 
     /// Try to route `frame` to `dst_ip`:
@@ -214,8 +214,8 @@ impl ArpQueue {
     /// - **First for IP** → appends and returns [`PushResult::FirstForIp`];
     ///   the caller must send an ARP Request and add a drop timer.
     pub fn push_frame(&self, dst_ip: Ipv4Addr, mut frame: Vec<u8>) -> PushResult {
-        let now = self.clock.monotonic_ms();
-        if let Some(mac) = self.cache.borrow_mut().lookup_and_refresh(dst_ip, now) {
+        let now_ns = self.clock.monotonic_ns();
+        if let Some(mac) = self.cache.borrow_mut().lookup_and_refresh(dst_ip, now_ns) {
             frame[0..6].copy_from_slice(mac.as_bytes());
             return PushResult::Sent(frame);
         }
