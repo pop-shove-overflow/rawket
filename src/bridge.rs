@@ -17,21 +17,21 @@
 //! let mut net_b = Network::new();
 //!
 //! // Create interfaces and register them (no uplink — bridge-driven).
-//! let idx_a = net_a.add_interface(MacAddr::from([0x02, 0, 0, 0, 0, 1])).finish();
-//! let idx_b = net_b.add_interface(MacAddr::from([0x02, 0, 0, 0, 0, 2])).finish();
+//! let idx_a = net_a.add_interface().mac(MacAddr::from([0x02, 0, 0, 0, 0, 1])).finish();
+//! let idx_b = net_b.add_interface().mac(MacAddr::from([0x02, 0, 0, 0, 0, 2])).finish();
 //!
 //! // Wire interfaces through a bridge.
 //! let bridge = Bridge::new();
 //! let port_a = bridge.add_port(&mut net_a, idx_a).finish();
 //! let port_b = bridge.add_port(&mut net_b, idx_b).finish();
 //!
-//! // In the test loop: call bridge.tick() to forward frames between networks.
-//! bridge.tick();
+//! // Frames are forwarded eagerly when the interface TX closure is called.
+//! // Network::poll_rx_with_timeout drives delayed frame delivery.
 //! ```
 
 use std::collections::BinaryHeap;
 use std::cell::Cell;
-use alloc::{collections::{BTreeMap, VecDeque}, rc::Rc, vec, vec::Vec};
+use alloc::{collections::BTreeMap, rc::Rc, vec, vec::Vec};
 use core::cell::RefCell;
 
 use crate::interface::FrameQueue;
@@ -95,7 +95,7 @@ pub enum Loss {
 pub enum Jitter {
     /// No additional jitter.
     None,
-    /// Uniform jitter: adds between 0 and `2 * half_ms` milliseconds.
+    /// Uniform jitter: adds between 0 and `2 * half_ns` nanoseconds.
     Uniform(u64),
     /// Gaussian (Box-Muller) jitter.  Negative samples are clamped to 0.
     Normal { mean_ms: f64, std_dev_ms: f64 },
@@ -110,7 +110,7 @@ pub enum Jitter {
 pub struct Reorder {
     /// Probability that a given frame is held and reordered.
     pub rate: f64,
-    /// How long (ms) to hold a frame before injecting it out-of-order.
+    /// How long (ns) to hold a frame before injecting it out-of-order.
     pub delay_ms: u64,
 }
 
@@ -125,10 +125,11 @@ impl Reorder {
         Reorder { rate, delay_ms: 50 }
     }
 
-    /// Override the hold delay (builder method).
-    pub fn delay_ms(self, delay_ms: u64) -> Self {
-        Reorder { delay_ms, ..self }
+    /// Set the hold delay in milliseconds.
+    pub fn delay_ms(self, ms: u64) -> Self {
+        Reorder { delay_ms: ms, ..self }
     }
+
 }
 
 // ── LossState ─────────────────────────────────────────────────────────────────
@@ -183,7 +184,7 @@ impl DirectionProfile {
 
     // ── Builder helpers ───────────────────────────────────────────────────────
 
-    /// Set base latency.
+    /// Set base latency in milliseconds.
     pub fn latency(self, ms: u64) -> Self {
         DirectionProfile { latency_ms: ms, ..self }
     }
@@ -302,6 +303,7 @@ impl DirectionProfile {
 // ── LinkProfile ───────────────────────────────────────────────────────────────
 
 /// Bidirectional link characteristics.
+#[derive(Clone)]
 pub struct LinkProfile {
     /// A→B direction.
     pub a_to_b: DirectionProfile,
@@ -706,13 +708,13 @@ impl LinkProfile {
 // ── DelayQueue ────────────────────────────────────────────────────────────────
 
 struct DelayedFrame {
-    deliver_at_ms: u64,
+    deliver_at_ns: u64,
     data:          Vec<u8>,
 }
 
 impl PartialEq for DelayedFrame {
     fn eq(&self, other: &Self) -> bool {
-        self.deliver_at_ms == other.deliver_at_ms
+        self.deliver_at_ns == other.deliver_at_ns
     }
 }
 
@@ -727,7 +729,7 @@ impl PartialOrd for DelayedFrame {
 impl Ord for DelayedFrame {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         // Reverse so BinaryHeap (max-heap) acts as a min-heap.
-        other.deliver_at_ms.cmp(&self.deliver_at_ms)
+        other.deliver_at_ns.cmp(&self.deliver_at_ns)
     }
 }
 
@@ -740,12 +742,12 @@ impl DelayQueue {
         DelayQueue { heap: BinaryHeap::new() }
     }
 
-    fn push(&mut self, deliver_at_ms: u64, data: Vec<u8>) {
-        self.heap.push(DelayedFrame { deliver_at_ms, data });
+    fn push(&mut self, deliver_at_ns: u64, data: Vec<u8>) {
+        self.heap.push(DelayedFrame { deliver_at_ns, data });
     }
 
-    fn pop_ready(&mut self, now_ms: u64) -> Option<Vec<u8>> {
-        if self.heap.peek().is_some_and(|f| f.deliver_at_ms <= now_ms) {
+    fn pop_ready(&mut self, now_ns: u64) -> Option<Vec<u8>> {
+        if self.heap.peek().is_some_and(|f| f.deliver_at_ns <= now_ns) {
             self.heap.pop().map(|f| f.data)
         } else {
             None
@@ -753,7 +755,7 @@ impl DelayQueue {
     }
 
     fn next_deadline(&self) -> Option<u64> {
-        self.heap.peek().map(|f| f.deliver_at_ms)
+        self.heap.peek().map(|f| f.deliver_at_ns)
     }
 }
 
@@ -859,6 +861,9 @@ pub struct CapturedFrame {
     pub egress:  Option<usize>,
     /// Raw frame bytes.
     pub data:    Vec<u8>,
+    /// Sender's monotonic clock at TX time, in nanoseconds.
+    /// `0` for frames injected via [`Bridge::inject`].
+    pub ts_ns:   u64,
 }
 
 // ── PortDirection ─────────────────────────────────────────────────────────────
@@ -901,19 +906,6 @@ impl PortDirection {
         Some(data)
     }
 
-    /// Compute the delivery delay for a frame and push it into the delay queue,
-    /// or return it immediately if delay is 0.
-    fn enqueue(&mut self, data: Vec<u8>) -> Option<Vec<u8>> {
-        let delay = self.profile.delay_ms(data.len());
-        if delay == 0 {
-            Some(data)
-        } else {
-            let now = crate::timers::now_ms();
-            self.delay_queue.push(now + delay, data);
-            None
-        }
-    }
-
     /// Drain all delay-queue frames whose deadline has passed.
     fn drain_ready(&mut self, now: u64) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
@@ -927,13 +919,11 @@ impl PortDirection {
 // ── BridgePort ────────────────────────────────────────────────────────────────
 
 struct BridgePort {
-    /// Frames pushed here by the interface's TX closure (ingress to bridge).
-    ingress:    VecDeque<Vec<u8>>,
     /// Queue owned by the interface's `rx_queue` (egress from bridge).
     egress:     FrameQueue,
-    /// Ingress-direction impairment pipeline.
+    /// Ingress-direction impairment pipeline (drop/corrupt applied in TX closure).
     profile_in: PortDirection,
-    /// Egress-direction impairment pipeline.
+    /// Egress-direction impairment pipeline + delay queue.
     profile_eg: PortDirection,
 }
 
@@ -994,11 +984,19 @@ impl Bridge {
         }
     }
 
-    /// Inject a raw frame into `port`'s ingress queue (for unit tests).
+    /// Inject a raw frame into `port`'s ingress side (for unit tests).
     ///
-    /// The frame will be processed by the next call to [`tick`](Self::tick).
+    /// Applies ingress impairments and forwards immediately to the appropriate
+    /// egress port(s), bypassing any delay queue.  Useful in tests where the
+    /// sender is not a real interface TX closure.
     pub fn inject(&self, port: usize, frame: &[u8]) {
-        self.inner.borrow_mut().ports[port].ingress.push_back(frame.to_vec());
+        let mut inner = self.inner.borrow_mut();
+        let Some(data) = inner.ports[port].profile_in.process(frame) else {
+            inner.captured.push(CapturedFrame { ingress: port, egress: None, data: frame.to_vec(), ts_ns: 0 });
+            return;
+        };
+        // Deliver immediately (deliver_at = 0 ≤ any clock value).
+        forward_frame(&mut inner, port, data, 0);
     }
 
     /// Drain and return all captured frames.
@@ -1006,167 +1004,120 @@ impl Bridge {
         core::mem::take(&mut self.inner.borrow_mut().captured)
     }
 
-    /// Forward one tick: drain all port ingress queues, apply impairments,
-    /// and deliver to egress ports.
-    ///
-    /// Also delivers any frames that have aged out of delay queues.
-    pub fn tick(&self) {
-        let now = crate::timers::now_ms();
-        let mut inner = self.inner.borrow_mut();
-        let n_ports = inner.ports.len();
-
-        for ingress_idx in 0..n_ports {
-            // Drain ingress queue.
-            let frames: Vec<Vec<u8>> = inner.ports[ingress_idx].ingress.drain(..).collect();
-
-            for frame in frames {
-                // Apply ingress impairments.
-                let Some(data) = inner.ports[ingress_idx].profile_in.process(&frame) else {
-                    inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: None, data: frame });
-                    continue;
-                };
-
-                // Possibly hold in delay queue.
-                let Some(data) = inner.ports[ingress_idx].profile_in.enqueue(data) else {
-                    // Frame enqueued for later delivery.
-                    continue;
-                };
-
-                // Learn src MAC → ingress port.
-                if data.len() >= 12 {
-                    let src_mac: [u8; 6] = data[6..12].try_into().unwrap();
-                    if src_mac != [0xff; 6] {
-                        inner.fdb.insert(src_mac, ingress_idx);
-                    }
-                }
-
-                // Determine egress port(s).
-                let dst_mac: Option<[u8; 6]> = data.get(0..6)
-                    .and_then(|b| b.try_into().ok());
-
-                let is_broadcast_or_unknown = dst_mac.is_none_or(|mac| {
-                    mac == [0xff; 6]                    // broadcast
-                    || (mac[0] & 1) != 0                // multicast
-                    || !inner.fdb.contains_key(&mac)    // unknown unicast
-                });
-
-                let egress_ports: Vec<usize> = if is_broadcast_or_unknown {
-                    (0..n_ports).filter(|&j| j != ingress_idx).collect()
-                } else {
-                    let dst = dst_mac.unwrap();
-                    let &egress_idx = inner.fdb.get(&dst).unwrap();
-                    if egress_idx == ingress_idx {
-                        vec![] // don't reflect back
-                    } else {
-                        vec![egress_idx]
-                    }
-                };
-
-                if egress_ports.is_empty() {
-                    inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: None, data });
-                    continue;
-                }
-
-                for &egress_idx in &egress_ports {
-                    // Apply egress impairments.
-                    let Some(eg_data) = inner.ports[egress_idx].profile_eg.process(&data) else {
-                        inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: None, data: data.clone() });
-                        continue;
-                    };
-
-                    // Possibly hold in delay queue.
-                    let Some(eg_data) = inner.ports[egress_idx].profile_eg.enqueue(eg_data) else {
-                        continue;
-                    };
-
-                    inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: Some(egress_idx), data: eg_data.clone() });
-                    inner.ports[egress_idx].egress.push(&eg_data);
-                }
-            }
-
-            // Drain ingress delay queue — frames held by latency on the ingress side.
-            let delayed: Vec<Vec<u8>> = inner.ports[ingress_idx].profile_in.drain_ready(now);
-            for data in delayed {
-                // Re-learn and forward delayed ingress frames.
-                if data.len() >= 12 {
-                    let src_mac: [u8; 6] = data[6..12].try_into().unwrap();
-                    if src_mac != [0xff; 6] {
-                        inner.fdb.insert(src_mac, ingress_idx);
-                    }
-                }
-                let dst_mac: Option<[u8; 6]> = data.get(0..6).and_then(|b| b.try_into().ok());
-                let is_bcast = dst_mac.is_none_or(|mac| mac == [0xff; 6] || (mac[0] & 1) != 0 || !inner.fdb.contains_key(&mac));
-                let egress_ports: Vec<usize> = if is_bcast {
-                    (0..n_ports).filter(|&j| j != ingress_idx).collect()
-                } else {
-                    let dst = dst_mac.unwrap();
-                    let &eidx = inner.fdb.get(&dst).unwrap();
-                    if eidx == ingress_idx { vec![] } else { vec![eidx] }
-                };
-                for &egress_idx in &egress_ports {
-                    if let Some(eg_data) = inner.ports[egress_idx].profile_eg.process(&data) {
-                        if let Some(eg_data) = inner.ports[egress_idx].profile_eg.enqueue(eg_data) {
-                            inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: Some(egress_idx), data: eg_data.clone() });
-                            inner.ports[egress_idx].egress.push(&eg_data);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Drain egress delay queues — frames held by latency on the egress side.
-        for egress_idx in 0..n_ports {
-            let delayed: Vec<Vec<u8>> = inner.ports[egress_idx].profile_eg.drain_ready(now);
-            for eg_data in delayed {
-                inner.captured.push(CapturedFrame { ingress: 0 /* unknown */, egress: Some(egress_idx), data: eg_data.clone() });
-                inner.ports[egress_idx].egress.push(&eg_data);
-            }
-        }
-    }
-
     /// Flush all pending delayed frames regardless of their deadline.
+    ///
+    /// Drains every port's egress delay queue and delivers to the egress
+    /// [`FrameQueue`].  Useful in tests that want to force-deliver all
+    /// in-flight frames without advancing time.
     pub fn flush(&self) {
         let mut inner = self.inner.borrow_mut();
         let n_ports = inner.ports.len();
         for egress_idx in 0..n_ports {
             let delayed: Vec<Vec<u8>> = inner.ports[egress_idx].profile_eg.drain_ready(u64::MAX);
             for eg_data in delayed {
-                inner.captured.push(CapturedFrame { ingress: 0, egress: Some(egress_idx), data: eg_data.clone() });
                 inner.ports[egress_idx].egress.push(&eg_data);
-            }
-            let delayed_in: Vec<Vec<u8>> = inner.ports[egress_idx].profile_in.drain_ready(u64::MAX);
-            for data in delayed_in {
-                // Drain ingress delay queues too — re-forward them.
-                for j in 0..n_ports {
-                    if j != egress_idx {
-                        if let Some(eg_data) = inner.ports[j].profile_eg.process(&data) {
-                            if let Some(eg_data) = inner.ports[j].profile_eg.enqueue(eg_data) {
-                                inner.ports[j].egress.push(&eg_data);
-                            }
-                        }
-                    }
-                }
             }
         }
     }
 
-    /// Return the earliest pending delivery deadline across all delay queues.
-    pub fn next_deadline_ms(&self) -> Option<u64> {
+    /// Return the earliest pending egress delivery deadline across all ports,
+    /// in nanoseconds (sender's monotonic clock domain).
+    pub fn next_deadline_ns(&self) -> Option<u64> {
         let inner = self.inner.borrow();
-        inner.ports.iter().flat_map(|p| [
-            p.profile_in.delay_queue.next_deadline(),
-            p.profile_eg.delay_queue.next_deadline(),
-        ]).flatten().min()
+        inner.ports.iter().filter_map(|p| p.profile_eg.delay_queue.next_deadline()).min()
     }
 
     /// Return `true` if all delay queues are empty.
     pub fn is_idle(&self) -> bool {
-        self.next_deadline_ms().is_none()
+        self.next_deadline_ns().is_none()
+    }
+
+    /// Add an impairment to a port's ingress or egress pipeline.
+    ///
+    /// Can be called after the port has been fully configured via
+    /// [`PortBuilder::finish`], making it easy to inject faults into a running
+    /// test without rebuilding the whole bridge.
+    pub fn add_impairment(&self, port: usize, dir: PortDir, imp: Impairment) {
+        let mut inner = self.inner.borrow_mut();
+        let pd = match dir {
+            PortDir::Ingress => &mut inner.ports[port].profile_in,
+            PortDir::Egress  => &mut inner.ports[port].profile_eg,
+        };
+        pd.impairments.push(imp);
+    }
+
+    /// Remove all impairments from a port's ingress **and** egress pipelines.
+    pub fn clear_impairments(&self, port: usize) {
+        let mut inner = self.inner.borrow_mut();
+        inner.ports[port].profile_in.impairments.clear();
+        inner.ports[port].profile_eg.impairments.clear();
     }
 
     /// Clear the MAC forwarding database.
     pub fn flush_fdb(&self) {
         self.inner.borrow_mut().fdb.clear();
+    }
+}
+
+// ── Internal helper ───────────────────────────────────────────────────────────
+
+/// Apply MAC learning, determine egress ports, apply egress impairments, and
+/// deliver `data` (coming from `ingress_idx`) to the correct egress FrameQueues.
+///
+/// `sender_now_ns` is the sender's clock reading (nanoseconds) at TX time;
+/// frames that have a non-zero egress delay are pushed into the egress delay
+/// queue stamped at `sender_now_ns + delay_ms * 1_000_000`.  Pass `0` for immediate
+/// delivery (inject paths).
+fn forward_frame(inner: &mut BridgeInner, ingress_idx: usize, data: Vec<u8>, sender_now_ns: u64) {
+    let n_ports = inner.ports.len();
+
+    // Learn src MAC → ingress port.
+    if data.len() >= 12 {
+        let src_mac: [u8; 6] = data[6..12].try_into().unwrap();
+        if src_mac != [0xff; 6] {
+            inner.fdb.insert(src_mac, ingress_idx);
+        }
+    }
+
+    // Determine egress port(s).
+    let dst_mac: Option<[u8; 6]> = data.get(0..6).and_then(|b| b.try_into().ok());
+    let is_broadcast_or_unknown = dst_mac.is_none_or(|mac| {
+        mac == [0xff; 6]
+        || (mac[0] & 1) != 0
+        || !inner.fdb.contains_key(&mac)
+    });
+
+    let egress_ports: Vec<usize> = if is_broadcast_or_unknown {
+        (0..n_ports).filter(|&j| j != ingress_idx).collect()
+    } else {
+        let dst = dst_mac.unwrap();
+        let &egress_idx = inner.fdb.get(&dst).unwrap();
+        if egress_idx == ingress_idx { vec![] } else { vec![egress_idx] }
+    };
+
+    if egress_ports.is_empty() {
+        inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: None, data, ts_ns: sender_now_ns });
+        return;
+    }
+
+    for &egress_idx in &egress_ports {
+        // Apply egress impairments.
+        let Some(eg_data) = inner.ports[egress_idx].profile_eg.process(&data) else {
+            inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: None, data: data.clone(), ts_ns: sender_now_ns });
+            continue;
+        };
+
+        let delay_ms = inner.ports[egress_idx].profile_eg.profile.delay_ms(eg_data.len());
+        inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: Some(egress_idx), data: eg_data.clone(), ts_ns: sender_now_ns });
+
+        if delay_ms == 0 || sender_now_ns == 0 {
+            // Deliver immediately.
+            inner.ports[egress_idx].egress.push(&eg_data);
+        } else {
+            // Stamp with sender clock + delay (ms→ns); receiver's deliver
+            // closure will drain when receiver's clock reaches deliver_at.
+            inner.ports[egress_idx].profile_eg.delay_queue.push(sender_now_ns + delay_ms * 1_000_000, eg_data);
+        }
     }
 }
 
@@ -1223,15 +1174,17 @@ impl<'a, 'b> PortBuilder<'a, 'b> {
             }
         }
 
+        // Capture sender's clock before borrowing iface.
+        let sender_clock = net.clock_ref();
+
         let iface = net.iface_mut(iface_idx);
         let egress = iface.rx_queue.clone();
 
-        let inner = Rc::clone(&bridge.inner);
+        let bridge_inner = Rc::clone(&bridge.inner);
         let port_idx = {
-            let mut b = inner.borrow_mut();
+            let mut b = bridge_inner.borrow_mut();
             let idx = b.ports.len();
             b.ports.push(BridgePort {
-                ingress:    VecDeque::new(),
                 egress,
                 profile_in: pd_in,
                 profile_eg: pd_eg,
@@ -1239,11 +1192,33 @@ impl<'a, 'b> PortBuilder<'a, 'b> {
             idx
         };
 
-        // Wire interface TX to push into this port's ingress queue.
-        let ingress_ref = Rc::clone(&bridge.inner);
+        // Eager TX closure: apply ingress impairments, learn src MAC, forward
+        // to egress port(s) — delay-stamped with sender's clock.
+        let tx_inner = Rc::clone(&bridge_inner);
         iface.set_tx(Rc::new(move |frame: &[u8]| -> crate::Result<()> {
-            ingress_ref.borrow_mut().ports[port_idx].ingress.push_back(frame.to_vec());
+            let mut inner = tx_inner.borrow_mut();
+            let now_ns = sender_clock.monotonic_ns();
+            let Some(data) = inner.ports[port_idx].profile_in.process(frame) else {
+                inner.captured.push(CapturedFrame { ingress: port_idx, egress: None, data: frame.to_vec(), ts_ns: now_ns });
+                return Ok(());
+            };
+            forward_frame(&mut inner, port_idx, data, now_ns);
             Ok(())
+        }));
+
+        // Register a deliver closure on the receiver Network.  It drains this
+        // port's egress delay queue using the receiver's clock and returns the
+        // next pending deadline for poll timeout calculation.
+        let deliver_inner = Rc::clone(&bridge_inner);
+        let receiver_clock = net.clock_ref();
+        net.add_bridge_deliver(Rc::new(move || {
+            let now_ns = receiver_clock.monotonic_ns();
+            let mut inner = deliver_inner.borrow_mut();
+            let delayed: Vec<Vec<u8>> = inner.ports[port_idx].profile_eg.drain_ready(now_ns);
+            for eg_data in delayed {
+                inner.ports[port_idx].egress.push(&eg_data);
+            }
+            inner.ports[port_idx].profile_eg.delay_queue.next_deadline()
         }));
 
         port_idx
@@ -1275,8 +1250,8 @@ mod tests {
     fn setup_two_port() -> (Network, usize, Network, usize, Bridge) {
         let mut net_a = Network::new();
         let mut net_b = Network::new();
-        let idx_a = net_a.add_interface(mac(1)).finish();
-        let idx_b = net_b.add_interface(mac(2)).finish();
+        let idx_a = net_a.add_interface().mac(mac(1)).finish();
+        let idx_b = net_b.add_interface().mac(mac(2)).finish();
         let bridge = Bridge::new();
         let _port_a = bridge.add_port(&mut net_a, idx_a).finish();
         let _port_b = bridge.add_port(&mut net_b, idx_b).finish();
@@ -1290,7 +1265,7 @@ mod tests {
         // Inject a broadcast frame into port 0.
         let frame = make_broadcast_frame([0x02, 0, 0, 0, 0, 1]);
         bridge.inject(0, &frame);
-        bridge.tick();
+        // (eager TX — no tick needed)
 
         // Should appear in port 1's egress (net_b's rx_queue).
         assert!(!net_b.interfaces()[idx_b].rx_queue.is_empty());
@@ -1306,7 +1281,7 @@ mod tests {
         // But let's instead inject on port 1 first to teach FDB that MAC(2)=port_1.
         let frame_b_to_a = make_frame([0x02, 0, 0, 0, 0, 1], [0x02, 0, 0, 0, 0, 2]);
         bridge.inject(1, &frame_b_to_a);
-        bridge.tick();
+        // (eager TX — no tick needed)
         // Frame should arrive at port 0 (net_a).
         assert!(!net_a.interfaces()[idx_a].rx_queue.is_empty());
         assert!(net_b.interfaces()[idx_b].rx_queue.is_empty());
@@ -1315,7 +1290,7 @@ mod tests {
         let _ = net_a.interfaces()[idx_a].rx_queue.pop();
         let frame_a_to_b = make_frame([0x02, 0, 0, 0, 0, 2], [0x02, 0, 0, 0, 0, 1]);
         bridge.inject(0, &frame_a_to_b);
-        bridge.tick();
+        // (eager TX — no tick needed)
         // Should arrive at B (unicast via FDB).
         assert!(!net_b.interfaces()[idx_b].rx_queue.is_empty());
         assert!(net_a.interfaces()[idx_a].rx_queue.is_empty());
@@ -1325,8 +1300,8 @@ mod tests {
     fn drop_impairment_prevents_delivery() {
         let mut net_a = Network::new();
         let mut net_b = Network::new();
-        let idx_a = net_a.add_interface(mac(1)).finish();
-        let idx_b = net_b.add_interface(mac(2)).finish();
+        let idx_a = net_a.add_interface().mac(mac(1)).finish();
+        let idx_b = net_b.add_interface().mac(mac(2)).finish();
         let bridge = Bridge::new();
         let _port_a = bridge.add_port(&mut net_a, idx_a)
             .add_impairment(PortDir::Ingress, Impairment::Drop(PacketSpec::any()))
@@ -1334,7 +1309,7 @@ mod tests {
         let _port_b = bridge.add_port(&mut net_b, idx_b).finish();
 
         bridge.inject(0, &make_broadcast_frame([0x02, 0, 0, 0, 0, 1]));
-        bridge.tick();
+        // (eager TX — no tick needed)
 
         // Dropped on ingress — should not arrive at B.
         assert!(net_b.interfaces()[idx_b].rx_queue.is_empty());
@@ -1346,7 +1321,7 @@ mod tests {
 
         let frame = make_broadcast_frame([0x02, 0, 0, 0, 0, 1]);
         bridge.inject(0, &frame);
-        bridge.tick();
+        // (eager TX — no tick needed)
 
         let captured = bridge.drain_captured();
         assert!(!captured.is_empty());
@@ -1367,7 +1342,7 @@ mod tests {
             let tx = net_a.interfaces()[idx_a].open_eth_tx();
             tx(&frame).unwrap();
         }
-        bridge.tick();
+        // (eager TX — no tick needed)
         // B's rx_queue should have the frame.
         // (Can't check B here since it's moved; we just verify no panic.)
         assert!(bridge.is_idle());
@@ -1452,8 +1427,8 @@ mod tests {
     fn corrupt_impairment_flips_byte() {
         let mut net_a = Network::new();
         let mut net_b = Network::new();
-        let idx_a = net_a.add_interface(mac(1)).finish();
-        let idx_b = net_b.add_interface(mac(2)).finish();
+        let idx_a = net_a.add_interface().mac(mac(1)).finish();
+        let idx_b = net_b.add_interface().mac(mac(2)).finish();
         let bridge = Bridge::new();
         let _port_a = bridge.add_port(&mut net_a, idx_a)
             .add_impairment(PortDir::Ingress, Impairment::Corrupt {
@@ -1467,7 +1442,7 @@ mod tests {
         let frame = make_broadcast_frame([0x02, 0, 0, 0, 0, 1]);
         let orig_byte0 = frame[0];
         bridge.inject(0, &frame);
-        bridge.tick();
+        // (eager TX — no tick needed)
 
         // The frame should arrive at B with byte 0 corrupted.
         let received = net_b.interfaces()[idx_b].rx_queue.pop().unwrap();
@@ -1496,7 +1471,7 @@ mod tests {
         bridge.inject(0, &frame); // 1st — passes
         bridge.inject(0, &frame); // 2nd — dropped
         bridge.inject(0, &frame); // 3rd — passes
-        bridge.tick();
+        // (eager TX — no tick needed)
 
         // Should receive 2 frames (1st and 3rd).
         let f1 = net_b.interfaces()[idx_b].rx_queue.pop();

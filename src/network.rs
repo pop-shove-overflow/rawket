@@ -18,7 +18,7 @@ use crate::{
     timers::{Clock, Timers},
     Error, Result,
 };
-use alloc::vec::Vec;
+use alloc::{rc::Rc, vec::Vec};
 
 // ── NetworkConfig ─────────────────────────────────────────────────────────────
 
@@ -372,6 +372,9 @@ pub struct Network {
     timers:                Timers,
     routes:                Vec<Route>,
     clock:                 Clock,
+    /// Closures registered by bridge ports.  Each closure delivers ready
+    /// delayed frames and returns the next pending deadline (for poll timeout).
+    bridge_delivers: Vec<Rc<dyn Fn() -> Option<u64>>>,
 }
 
 impl Default for Network {
@@ -387,19 +390,92 @@ impl Network {
     /// Create a network runtime with the given configuration and clock.
     pub fn with_config(config: NetworkConfig, clock: Clock) -> Self {
         Network {
-            uplinks:    Vec::new(),
-            interfaces: Vec::new(),
+            uplinks:         Vec::new(),
+            interfaces:      Vec::new(),
             config,
-            timers:  Timers::new(clock.clone()),
-            routes:  Vec::new(),
+            timers:          Timers::new(clock.clone()),
+            routes:          Vec::new(),
             clock,
+            bridge_delivers: Vec::new(),
         }
+    }
+
+    /// Return a clone of the internal [`Clock`] handle.
+    ///
+    /// Use this to wire the clock into a `Bridge` or `WireHarness` so that
+    /// frame delivery timestamps are consistent with this network's time.
+    ///
+    /// In production builds, `Clock` is a zero-sized type; cloning it is
+    /// free and calling `monotonic_ms()` reads the system clock directly.
+    /// In test builds (`feature = "test-internals"`), the clone shares the
+    /// same simulation state so that advancing one advances all holders.
+    pub fn clock_ref(&self) -> Clock {
+        self.clock.clone()
+    }
+
+    /// Register a bridge-port delivery closure.
+    ///
+    /// Called by [`PortBuilder::finish`](crate::bridge::PortBuilder::finish)
+    /// when a bridge port is attached to this network.  The closure is called
+    /// at the start of every [`poll_rx_with_timeout`](Self::poll_rx_with_timeout)
+    /// to drain delayed frames whose deadline has arrived, and returns the
+    /// earliest remaining deadline so the poll timeout can be set accordingly.
+    pub fn add_bridge_deliver(&mut self, f: Rc<dyn Fn() -> Option<u64>>) {
+        self.bridge_delivers.push(f);
+    }
+
+    /// Zero the clock (set apparent time to 0) and return `&mut self` for chaining.
+    ///
+    /// After this call `clock_monotonic_ms()` returns 0.  Subsequent
+    /// `clock_advance_*` calls count from 0.
+    #[cfg(feature = "test-internals")]
+    pub fn clock_zero(&mut self) -> &mut Self {
+        // Replace the shared clock with a freshly zeroed one.  Because
+        // clock_ref() callers hold Rc clones of the *old* clock, we advance
+        // the existing clock rather than swapping it out.
+        let current_ns = self.clock.monotonic_ns() as i64;
+        self.clock.advance_ns(-current_ns);
+        self
+    }
+
+    /// Pause the clock and return `&mut self` for chaining.
+    #[cfg(feature = "test-internals")]
+    pub fn clock_pause(&mut self) -> &mut Self {
+        self.clock.pause();
+        self
+    }
+
+    /// Resume the clock and return `&mut self` for chaining.
+    #[cfg(feature = "test-internals")]
+    pub fn clock_resume(&mut self) -> &mut Self {
+        self.clock.resume();
+        self
+    }
+
+    /// Advance the clock by `ms` milliseconds and return `&mut self`.
+    #[cfg(feature = "test-internals")]
+    pub fn clock_advance_ms(&mut self, ms: i64) -> &mut Self {
+        self.clock.advance_ms(ms);
+        self
+    }
+
+    /// Advance the clock by `us` microseconds and return `&mut self`.
+    #[cfg(feature = "test-internals")]
+    pub fn clock_advance_us(&mut self, us: i64) -> &mut Self {
+        self.clock.advance_us(us);
+        self
+    }
+
+    /// Return the current monotonic time as seen by this network's clock.
+    #[cfg(feature = "test-internals")]
+    pub fn clock_monotonic_ms(&self) -> u64 {
+        self.clock.monotonic_ms()
     }
 
     /// Begin adding a new interface with the given MAC address.
     ///
     /// Returns an [`InterfaceBuilder`] — call `.bind_afpacket(ifname)` to
-    /// attach to a live AF_PACKET socket, or `.finish()` to create an unbound
+    /// attach to a live AF_PACKET socket or `.finish()` to create an unbound
     /// interface (useful for bridge-based test setups).
     pub fn add_interface(&mut self, mac: MacAddr) -> InterfaceBuilder<'_> {
         InterfaceBuilder { network: self, mac }
@@ -633,6 +709,10 @@ impl Network {
         &mut self,
         max_timeout_ms: Option<u64>,
     ) -> Result<()> {
+        // Drive bridge deliver closures: drain delayed frames whose deadline
+        // has arrived.
+        for f in &self.bridge_delivers { f(); }
+
         // First update: fire already-expired timers, get next deadline.
         let timer_ms = self.timers.update();
 
@@ -687,8 +767,7 @@ impl Network {
             }
         } else if !self.interfaces.is_empty() {
             // No AF_PACKET uplinks — bridge-based or virtual interfaces.
-            // Sleep for the requested timeout so callers can gate on time.
-            if timeout_ms >= 0 {
+            if self.bridge_delivers.is_empty() && timeout_ms >= 0 {
                 let ms = timeout_ms as u64;
                 if ms > 0 {
                     unsafe { libc::usleep((ms * 1_000) as libc::c_uint) };
