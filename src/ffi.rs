@@ -174,6 +174,7 @@ impl From<RawketNetworkConfig> for NetworkConfig {
             tcp_keepalive_count:           c.tcp_keepalive_count,
             tcp_send_buf_max:              c.tcp_send_buf_max,
             tcp_rx_ooo_max:                c.tcp_rx_ooo_max,
+            tcp_time_wait_ms:              120_000,
             checksum_validate_ip:          c.checksum_validate_ip,
             checksum_validate_tcp:         c.checksum_validate_tcp,
             checksum_validate_udp:         c.checksum_validate_udp,
@@ -804,7 +805,7 @@ pub unsafe extern "C" fn rawket_tcp_connect(
     {
         let net_inner = unsafe { &mut (*net).0 };
         match net_inner.interfaces_mut().get_mut(iface_idx) {
-            Some(iface) => iface.add_tcp_socket(sock),
+            Some(iface) => { iface.add_tcp_socket(sock); }
             None => { set_errno_raw(libc::ENOENT); return ptr::null_mut(); }
         }
     }
@@ -858,7 +859,7 @@ pub unsafe extern "C" fn rawket_tcp_listen(
     {
         let net_inner = unsafe { &mut (*net).0 };
         match net_inner.interfaces_mut().get_mut(iface_idx) {
-            Some(iface) => iface.add_tcp_socket(sock),
+            Some(iface) => { iface.add_tcp_socket(sock); }
             None => { set_errno_raw(libc::ENOENT); return ptr::null_mut(); }
         }
     }

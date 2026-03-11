@@ -109,8 +109,6 @@ const RECV_BUF_MAX: u32 = 1 << 20; // 1 MiB
 /// unit represents 16 bytes, giving a max window of 16 × 65535 ≈ 1 MiB.
 const LOCAL_WS_SHIFT: u8 = 4;
 
-/// TIME_WAIT duration (2×MSL = 2×60s).
-const TIME_WAIT_MS: u64 = 120_000;
 
 // ── TcpError ──────────────────────────────────────────────────────────────────
 
@@ -153,6 +151,9 @@ pub struct TcpConfig {
     /// discarding.  SACK blocks are emitted for at most 4 OOO segments
     /// regardless of this value.  Default: 8.
     pub rx_ooo_max:                usize,
+    /// TIME_WAIT linger duration in ms (2×MSL).  Default: 120_000 (2 min).
+    /// Set to a small value (e.g. 100) in test configs to avoid 120 s waits.
+    pub time_wait_ms:              u64,
 }
 
 impl Default for TcpConfig {
@@ -171,6 +172,7 @@ impl Default for TcpConfig {
             keepalive_count:           9,
             send_buf_max:              1 << 20, // 1 MiB
             rx_ooo_max:                8,
+            time_wait_ms:              120_000,
         }
     }
 }
@@ -991,7 +993,7 @@ impl TcpSocket {
 
     /// Spec §5.5: BBRIsProbingBW() — true for phases that are probing bandwidth.
     /// Loss adaptation is SKIPPED during these phases.
-    pub(crate) fn bbr_is_probing_bw(&self) -> bool {
+    pub fn bbr_is_probing_bw(&self) -> bool {
         matches!(self.bbr.phase,
             BbrPhase::Startup | BbrPhase::ProbeBwRefill | BbrPhase::ProbeBwUp)
     }
@@ -2038,7 +2040,7 @@ impl TcpSocket {
                     if fin_acked {
                         let now = self.clock.monotonic_ns();
                         // Reuse rto_deadline as TIME_WAIT linger timer (field is idle during TimeWait).
-                        self.rto_deadline.arm_from_now_ms(TIME_WAIT_MS, now);
+                        self.rto_deadline.arm_from_now_ms(self.cfg.time_wait_ms, now);
                         self.state = State::TimeWait;
                     } else {
                         self.state = State::Closing;
@@ -2079,7 +2081,7 @@ impl TcpSocket {
                     let _ = self.send_ctrl(TcpFlags::ACK);
                     let now = self.clock.monotonic_ns();
                     // Reuse rto_deadline as TIME_WAIT linger timer (field is idle during TimeWait).
-                    self.rto_deadline.arm_from_now_ms(TIME_WAIT_MS, now);
+                    self.rto_deadline.arm_from_now_ms(self.cfg.time_wait_ms, now);
                     self.state = State::TimeWait;
                 } else if !pdu.is_empty() {
                     let _ = self.send_ctrl(TcpFlags::ACK);
@@ -2091,7 +2093,7 @@ impl TcpSocket {
                 if seg.has_flag(TcpFlags::ACK) {
                     let now = self.clock.monotonic_ns();
                     // Reuse rto_deadline as TIME_WAIT linger timer (field is idle during TimeWait).
-                    self.rto_deadline.arm_from_now_ms(TIME_WAIT_MS, now);
+                    self.rto_deadline.arm_from_now_ms(self.cfg.time_wait_ms, now);
                     self.state = State::TimeWait;
                 }
             }
@@ -2460,6 +2462,9 @@ impl TcpSocket {
     pub fn srtt_ns(&self) -> u64 { self.srtt_ns }
     pub fn rttvar_ns(&self) -> u64 { self.rttvar_ns }
     pub fn rto_ns(&self) -> u64 { self.rto_ns }
+    pub fn srtt_ms(&self) -> u64 { self.srtt_ns / 1_000_000 }
+    pub fn rttvar_ms(&self) -> u64 { self.rttvar_ns / 1_000_000 }
+    pub fn rto_ms(&self) -> u64 { self.rto_ns / 1_000_000 }
     pub fn sack_ok(&self) -> bool { self.sack_ok }
     pub fn ts_enabled(&self) -> bool { self.ts_enabled }
     pub fn ecn_enabled(&self) -> bool { self.ecn_enabled }

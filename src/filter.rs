@@ -108,6 +108,9 @@ pub enum Filter {
     DstPortRange(u16, u16),
     PortRange(u16, u16),
 
+    // TCP payload
+    TcpPayloadLen { op: CmpOp, n: usize },
+
     // TCP flags
     TcpFlagSyn,
     TcpFlagAck,
@@ -351,6 +354,14 @@ impl Filter {
                 }
             }
 
+            Filter::TcpPayloadLen { op, n } => {
+                if let Some(etherparse::TransportSlice::Tcp(ref tcp)) = pkt.transport {
+                    op.apply_usize(tcp.payload().len(), *n)
+                } else {
+                    false
+                }
+            }
+
             // Already handled above; unreachable here.
             Filter::True | Filter::False | Filter::Len { .. }
             | Filter::ByteAt { .. } | Filter::Broadcast | Filter::Multicast
@@ -414,7 +425,12 @@ impl Not for Filter {
 // ── Convenience submodules ────────────────────────────────────────────────────
 
 pub mod tcp {
-    use super::Filter;
+    use super::{CmpOp, Filter};
+
+    /// Match TCP frames that carry a payload (payload length > 0).
+    pub fn has_data() -> Filter { Filter::TcpPayloadLen { op: CmpOp::Gt, n: 0 } }
+    /// Match TCP frames whose payload length equals `n` exactly.
+    pub fn has_data_len(n: usize) -> Filter { Filter::TcpPayloadLen { op: CmpOp::Eq, n } }
 
     pub fn syn() -> Filter { Filter::TcpFlagSyn }
     pub fn ack() -> Filter { Filter::TcpFlagAck }

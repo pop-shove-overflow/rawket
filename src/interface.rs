@@ -702,8 +702,10 @@ impl Interface {
     }
 
     /// Register a TCP socket on this interface (passive-accept or connect/listen).
-    pub fn add_tcp_socket(&mut self, sock: TcpSocket) {
+    pub fn add_tcp_socket(&mut self, sock: TcpSocket) -> usize {
+        let idx = self.tcp_sockets.len();
         self.tcp_sockets.push(sock);
+        idx
     }
 
     /// Return a slice of TCP sockets on this interface.

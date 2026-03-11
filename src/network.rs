@@ -109,6 +109,10 @@ pub struct NetworkConfig {
     /// most 4 SACK blocks are emitted regardless of this value.  Default: 8.
     pub tcp_rx_ooo_max: usize,
 
+    /// TIME_WAIT state duration in milliseconds.  RFC 793 recommends 2×MSL
+    /// (120 s); shorter values are safe for testing.  Default: 120 000.
+    pub tcp_time_wait_ms: u64,
+
     // ── Checksum validation ─────────────────────────────────────────────────
 
     /// Validate the IPv4 header checksum on received frames.  Default: false.
@@ -148,6 +152,7 @@ impl Default for NetworkConfig {
             tcp_keepalive_count:           9,
             tcp_send_buf_max:              1 << 20,
             tcp_rx_ooo_max:                8,
+            tcp_time_wait_ms:              120_000,
             checksum_validate_ip:          false,
             checksum_validate_tcp:         false,
             checksum_validate_udp:         false,
@@ -172,6 +177,7 @@ impl NetworkConfig {
             keepalive_count:           self.tcp_keepalive_count,
             send_buf_max:              self.tcp_send_buf_max,
             rx_ooo_max:                self.tcp_rx_ooo_max,
+            time_wait_ms:              self.tcp_time_wait_ms,
         }
     }
 }
