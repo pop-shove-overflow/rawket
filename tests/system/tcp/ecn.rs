@@ -390,3 +390,90 @@ fn no_ect_bits_when_disabled() -> TestResult {
 
     Ok(())
 }
+
+// ── ece_triggers_cwnd_reduction ─────────────────────────────────────────────
+//
+// RFC 3168 §6.1.2 (The TCP Sender): upon receiving ECE, "the TCP source
+// halves the congestion window 'cwnd' and reduces the slow start threshold."
+// Send enough data to grow cwnd above the 4*MSS floor before injecting ECE.
+// Inject an ECE-flagged ACK directly to A to simulate B signalling congestion.
+#[test]
+fn ece_triggers_cwnd_reduction() -> TestResult {
+    let mut pair = setup_tcp_pair().profile(LinkProfile::leased_line_100m()).connect();
+
+    // Phase 1: grow cwnd above 4*MSS floor.
+    pair.tcp_a_mut().send(&[0xAAu8; 50_000])?;
+    pair.transfer();
+
+    let cwnd_before = pair.tcp_a().bbr_cwnd();
+    let mss = pair.tcp_a().peer_mss() as u32;
+    assert_ok!(
+        cwnd_before > 4 * mss,
+        "cwnd ({cwnd_before}) did not grow above 4*MSS ({}) — test scenario invalid",
+        4 * mss
+    );
+    assert_ok!(pair.tcp_a().ecn_enabled(), "ECN not negotiated — test scenario invalid");
+
+    // Phase 2: send fresh data to get current seq/ack values.
+    pair.tcp_a_mut().send(&[0xBBu8; 10_000])?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let af = cap.tcp().from_a().with_data().last()
+        .ok_or_else(|| TestFail::new("no A→B data in phase 2"))?;
+    let a_snd_nxt = af.tcp.seq + af.payload_len as u32;
+    let b_seq = cap.tcp().from_b().last().map(|f| f.tcp.seq).unwrap_or(0);
+
+    pair.clear_capture();
+    let (mac_b, mac_a, ip_b, ip_a) = (pair.mac_b, pair.mac_a, pair.ip_b, pair.ip_a);
+
+    // Phase 3: inject ECE ACK directly to A.
+    // Use snd_una as ack_num (a pure ACK — all data has been ACKed by now).
+    // A will still process the ECE flag even on a zero-window-update ACK.
+    let ece_ack_num = pair.tcp_a().snd_una();
+    let mut ece_ack = build_tcp_data(
+        mac_b, mac_a, ip_b, ip_a,
+        80, 12345,
+        b_seq,
+        ece_ack_num,
+        b"",
+    );
+    let _ = a_snd_nxt;
+    ece_ack[47] |= 0x40; // set ECE bit
+    recompute_frame_tcp_checksum(&mut ece_ack);
+    pair.inject_to_a(ece_ack);
+    pair.transfer_one();
+
+    // Phase 4: verify CWR on next data + drive until cwnd reduces.
+    pair.clear_capture();
+    pair.advance_both(1000);
+    pair.tcp_a_mut().send(&[0xCCu8; 20_000])?;
+
+    let mut cwnd_reduced = false;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&[0xCCu8; 2_000]);
+        }
+        let cwnd_now = p.tcp_a(0).bbr_cwnd();
+        if cwnd_now < cwnd_before {
+            cwnd_reduced = true;
+            return false;
+        }
+        true
+    });
+
+    let cap_cwr = pair.drain_captured();
+    let cwr_set = cap_cwr.tcp().from_a().with_data()
+        .any(|f| f.tcp.flags.has(TcpFlags::CWR));
+    assert_ok!(
+        cwr_set,
+        "A did not set CWR on data after ECE — no congestion response"
+    );
+
+    assert_ok!(
+        cwnd_reduced,
+        "cwnd not reduced after ECE: before={cwnd_before}"
+    );
+
+    Ok(())
+}
