@@ -365,3 +365,71 @@ fn rst_in_syn_sent() -> TestResult {
 
     Ok(())
 }
+
+// RFC 5961 §4.2 (SYN Robustness): In-window SYN in Established must trigger
+// a challenge ACK (not reset the connection).
+#[test]
+fn in_window_syn_challenge_ack() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"x")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let (b_snd_nxt, a_snd_nxt) = {
+        let af = cap.tcp()
+            .find(|f| f.dir == Dir::AtoB && f.payload_len > 0)
+            .ok_or_else(|| crate::assert::TestFail::new("no AtoB data frame"))?;
+        (af.tcp.ack, af.tcp.seq + af.payload_len as u32)
+    };
+
+    let syn = build_tcp_syn(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        b_snd_nxt,
+        a_snd_nxt,
+        0x02,
+        Some(1460), None, None, false,
+    );
+    pair.clear_capture();
+    pair.inject_to_a(syn);
+    pair.transfer();
+
+    assert_state(pair.tcp_a(), State::Established, "A must stay Established after in-window SYN")?;
+
+    let cap2 = pair.drain_captured();
+    let is_pure_ack = |f: &crate::capture::ParsedFrame| {
+        f.dir == Dir::AtoB
+            && f.tcp.flags.has(TcpFlags::ACK)
+            && !f.tcp.flags.has(TcpFlags::SYN)
+            && !f.tcp.flags.has(TcpFlags::RST)
+            && !f.tcp.flags.has(TcpFlags::FIN)
+            && f.payload_len == 0
+    };
+    let challenge = cap2.tcp().find(|f| is_pure_ack(f))
+        .ok_or_else(|| crate::assert::TestFail::new(
+            "A did not send challenge ACK for in-window SYN"
+        ))?;
+
+    // RFC 9293 §3.10.7.4: challenge ACK carries SEQ=SND.NXT, ACK=RCV.NXT.
+    assert_ok!(
+        challenge.tcp.seq == a_snd_nxt,
+        "challenge ACK SEQ ({}) != SND.NXT ({a_snd_nxt})",
+        challenge.tcp.seq
+    );
+    assert_ok!(
+        challenge.tcp.ack == b_snd_nxt,
+        "challenge ACK ACK ({}) != RCV.NXT ({b_snd_nxt})",
+        challenge.tcp.ack
+    );
+
+    // Exactly 1 challenge ACK expected.
+    let ack_count = cap2.tcp().filter(|f| is_pure_ack(f)).count();
+    assert_ok!(ack_count == 1, "expected exactly 1 challenge ACK, got {ack_count}");
+
+    Ok(())
+}
