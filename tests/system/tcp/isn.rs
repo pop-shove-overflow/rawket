@@ -121,3 +121,85 @@ fn isn_spread_same_tuple() -> TestResult {
 
     Ok(())
 }
+
+// ── syn_collision_ack_numbers ─────────────────────────────────────────────────
+//
+// RFC 9293 §3.5: during simultaneous open, each SYN+ACK must acknowledge
+// the peer's ISN (ack = peer ISN + 1).
+#[test]
+fn syn_collision_ack_numbers() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    let client_a = TcpSocket::connect_now(
+        np.iface_a(),
+        "10.0.0.1:12345".parse().unwrap(),
+        "10.0.0.2:80".parse().unwrap(),
+        Ipv4Addr::from([10, 0, 0, 2]),
+        |_| {}, |_| {},
+        cfg.clone(),
+    ).expect("A connect_now");
+    np.add_tcp_a(client_a);
+
+    let client_b = TcpSocket::connect_now(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        "10.0.0.1:12345".parse().unwrap(),
+        Ipv4Addr::from([10, 0, 0, 1]),
+        |_| {}, |_| {},
+        cfg,
+    ).expect("B connect_now");
+    np.add_tcp_b(client_b);
+
+    let cap0 = np.drain_captured();
+    let a_isn = cap0.tcp()
+        .direction(Dir::AtoB)
+        .with_tcp_flags(TcpFlags::SYN)
+        .without_tcp_flags(TcpFlags::ACK)
+        .next()
+        .map(|f| f.tcp.seq)
+        .expect("no SYN from A");
+    let b_isn = cap0.tcp()
+        .direction(Dir::BtoA)
+        .with_tcp_flags(TcpFlags::SYN)
+        .without_tcp_flags(TcpFlags::ACK)
+        .next()
+        .map(|f| f.tcp.seq)
+        .expect("no SYN from B");
+
+    np.transfer();
+
+    let cap1 = np.drain_captured();
+    let a_synack_ack = cap1.tcp()
+        .direction(Dir::AtoB)
+        .with_tcp_flags(TcpFlags::SYN)
+        .with_tcp_flags(TcpFlags::ACK)
+        .next()
+        .map(|f| f.tcp.ack);
+    let b_synack_ack = cap1.tcp()
+        .direction(Dir::BtoA)
+        .with_tcp_flags(TcpFlags::SYN)
+        .with_tcp_flags(TcpFlags::ACK)
+        .next()
+        .map(|f| f.tcp.ack);
+
+    let a_ack = a_synack_ack.ok_or_else(|| crate::assert::TestFail::new(
+        "no SYN+ACK from A during simultaneous open"
+    ))?;
+    let b_ack = b_synack_ack.ok_or_else(|| crate::assert::TestFail::new(
+        "no SYN+ACK from B during simultaneous open"
+    ))?;
+
+    assert_ok!(
+        a_ack == b_isn.wrapping_add(1),
+        "A's SYN+ACK ack ({a_ack}) != B's ISN+1 ({})", b_isn.wrapping_add(1)
+    );
+    assert_ok!(
+        b_ack == a_isn.wrapping_add(1),
+        "B's SYN+ACK ack ({b_ack}) != A's ISN+1 ({})", a_isn.wrapping_add(1)
+    );
+
+    Ok(())
+}
