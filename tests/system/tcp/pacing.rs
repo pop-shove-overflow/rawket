@@ -690,3 +690,64 @@ fn drain_pacing_gain() -> TestResult {
 
     Ok(())
 }
+
+// ── pacing_deadline_gates_transmission ────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.6.2: pacing deadline gates segment departure.
+//
+// After BBR measures BW, consecutive data segments should not all appear at
+// the same timestamp (pacing must gate transmission).
+#[test]
+fn pacing_deadline_gates_transmission() -> TestResult {
+    use rawket::bridge::LinkProfile;
+
+    // 100 Mbps link with 10 ms latency.  Pacing gaps between 1460-byte segments
+    // are ~117 µs — observable in nanosecond capture timestamps.
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::ethernet_100m())
+        .connect();
+
+    // Phase 1: warm up BBR to establish a bandwidth estimate.
+    pair.tcp_a_mut().send(&vec![0x33u8; 30_000])?;
+    pair.transfer();
+
+    let rate = pair.tcp_a().bbr_pacing_rate_bps();
+    assert_ok!(rate > 0, "pacing rate is 0 after warmup — test scenario invalid");
+
+    // Phase 2: send a burst and capture the timestamps of A→B data segments.
+    // transfer() steps virtual time to each scheduled deadline (pacing, bridge
+    // delivery), so captured timestamps reflect exact pacing intervals.
+    pair.clear_capture();
+    pair.tcp_a_mut().send(&vec![0x44u8; 20_000])?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let timestamps: Vec<u64> = cap.tcp()
+        .direction(Dir::AtoB)
+        .with_data()
+        .map(|f| f.ts_ns)
+        .collect();
+
+    assert_ok!(
+        timestamps.len() >= 4,
+        "only {} data segments captured — need ≥4 for gap analysis",
+        timestamps.len()
+    );
+
+    let total_gaps = timestamps.len() - 1;
+    let nonzero_gaps = timestamps.windows(2)
+        .filter(|w| w[1] > w[0])
+        .count();
+
+    // Majority of inter-segment gaps must be nonzero — proves pacing gates
+    // transmission.  Intentionally qualitative: the virtual clock steps to
+    // exact pacing deadlines, so a quantitative interval check would only
+    // validate harness clock-stepping.  Pacing rate correctness is covered
+    // by the BBR gain-ratio tests.
+    assert_ok!(
+        nonzero_gaps > total_gaps / 2,
+        "only {nonzero_gaps}/{total_gaps} gaps are non-zero — pacing did not gate majority of segments"
+    );
+
+    Ok(())
+}
