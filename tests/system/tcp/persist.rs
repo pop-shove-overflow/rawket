@@ -96,3 +96,40 @@ fn zero_window_triggers_persist() -> TestResult {
 
     Ok(())
 }
+
+// ── persist_probe_is_one_byte ─────────────────────────────────────────────────
+//
+// RFC 9293 §3.8.6.1: persist probe carries one byte to elicit a window update.
+//
+// The persist probe must carry exactly 1 byte of payload.
+#[test]
+fn persist_probe_is_one_byte() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    setup_zero_window(&mut pair)?;
+
+    pair.tcp_a_mut().send(b"world")?;
+
+    let rto = pair.tcp_a().rto_ms() as i64;
+    pair.advance_both(rto + 5);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let probe = cap.tcp()
+        .direction(Dir::AtoB)
+        .with_data()
+        .next()
+        .ok_or_else(|| TestFail::new("no persist probe found"))?;
+
+    assert_ok!(
+        probe.payload_len == 1,
+        "persist probe payload_len = {}, expected 1", probe.payload_len
+    );
+
+    // RFC 7323: TSopt MUST be present in every non-RST segment.
+    assert_timestamps_present(&probe, "persist probe")?;
+
+    Ok(())
+}
