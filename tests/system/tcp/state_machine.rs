@@ -317,3 +317,51 @@ fn syn_retransmit() -> TestResult {
 
     Ok(())
 }
+
+// RFC 9293 §3.5.3 (Reset Processing): RST+ACK in SynSent with valid ack
+// closes the connection.
+#[test]
+fn rst_in_syn_sent() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    // Drop everything so B never sees the SYN (A stays in SynSent).
+    np.add_impairment_to_a(Impairment::Drop(PacketSpec::any()));
+
+    let client = TcpSocket::connect_now(
+        np.iface_a(),
+        "10.0.0.1:12345".parse().unwrap(),
+        "10.0.0.2:80".parse().unwrap(),
+        Ipv4Addr::from([10, 0, 0, 2]),
+        |_| {}, |_| {}, cfg,
+    )?;
+    let ia = np.add_tcp_a(client);
+
+    // SYN was sent (by connect_now) but dropped — find its seq from captures.
+    let a_isn = np.drain_captured().all_tcp()
+        .find(|f| f.dir == Dir::AtoB && f.tcp.flags.has(TcpFlags::SYN))
+        .map(|f| f.tcp.seq)
+        .ok_or_else(|| crate::assert::TestFail::new("no SYN from A"))?;
+
+    np.clear_impairments();
+
+    let rst = build_tcp_data_with_flags(
+        np.mac_b, np.mac_a,
+        np.ip_b,  np.ip_a,
+        80, 12345,
+        0,
+        a_isn + 1,
+        0x14, // RST|ACK
+        0,
+        &[],
+    );
+    np.inject_to_a(rst);
+    np.transfer();
+
+    assert_state(np.tcp_a(ia), State::Closed, "A Closed after RST in SynSent")?;
+    assert_error_fired(np.tcp_a(ia), TcpError::Reset, "A error = Reset")?;
+
+    Ok(())
+}
