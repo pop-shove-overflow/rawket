@@ -298,3 +298,54 @@ fn keepalive_probe_content() -> TestResult {
 
     Ok(())
 }
+
+// ── keepalive_probe_response ──────────────────────────────────────────────────
+//
+// RFC 1122 §4.2.3.6: the peer must respond to a keepalive probe with an ACK.
+//
+// After A sends keepalive probe, B responds with an ACK.
+#[test]
+fn keepalive_probe_response() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .keepalive_idle_ms(50)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let idle = pair.tcp_cfg.keepalive_idle_ms as i64;
+
+    let snd_una = pair.tcp_a().snd_una();
+
+    // Advance past idle timeout so A sends keepalive probe.
+    // transfer_one fires the timer; advance for bridge latency; transfer_one
+    // delivers probe to B which sends ACK; one more delivers ACK to A.
+    pair.advance_both(idle + 10);
+    pair.transfer_one();
+    pair.advance_both(25);
+    pair.transfer_one();
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let probe = cap.tcp()
+        .direction(Dir::AtoB)
+        .filter(|f| f.payload_len == 0
+            && f.tcp.flags.has(TcpFlags::ACK)
+            && !f.tcp.flags.has(TcpFlags::SYN)
+            && !f.tcp.flags.has(TcpFlags::RST)
+            && !f.tcp.flags.has(TcpFlags::FIN)
+            && f.tcp.seq == snd_una.wrapping_sub(1))
+        .next();
+    assert_ok!(probe.is_some(), "A did not send keepalive probe");
+
+    // B's response must ACK with ack = A's snd_una (confirming A's seq space).
+    let rcv_nxt = pair.tcp_b().rcv_nxt();
+    let response = cap.tcp()
+        .direction(Dir::BtoA)
+        .with_tcp_flags(TcpFlags::ACK)
+        .find(|f| f.tcp.ack == snd_una);
+    assert_ok!(
+        response.is_some(),
+        "B did not respond with ACK = {snd_una} (rcv_nxt={rcv_nxt})"
+    );
+
+    Ok(())
+}
