@@ -319,3 +319,47 @@ fn ooo_segment_overlaps_rcv_nxt() -> TestResult {
 
     Ok(())
 }
+
+// ── sack_reflects_all_holes ───────────────────────────────────────────────────
+//
+// RFC 2018 §3: SACK option lists all non-contiguous received blocks.
+//
+// 3 non-contiguous OOO segs → SACK blocks should cover all 3 ranges.
+#[test]
+fn sack_reflects_all_holes() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let (b_rcv_nxt, b_snd_nxt) = baseline_seqs(&mut pair)?;
+
+    for off in [1u32, 3, 5] {
+        let seg = a_to_b(&pair, b_rcv_nxt + off, b_snd_nxt, b"x");
+        pair.inject_to_b(seg);
+        pair.transfer_one();
+    }
+
+    let cap = pair.drain_captured();
+    let last_sack = cap.tcp()
+        .direction(Dir::BtoA)
+        .with_tcp_flags(TcpFlags::ACK)
+        .filter(|f| f.tcp.opts.sack_blocks.len() >= 3)
+        .last()
+        .ok_or_else(|| crate::assert::TestFail::new("no ACK with ≥3 SACK blocks"))?;
+    let blocks = &last_sack.tcp.opts.sack_blocks;
+    assert_ok!(blocks.len() == 3, "expected 3 SACK blocks, got {}: {:?}", blocks.len(), blocks);
+
+    // Exact 1-byte boundaries for OOO segments at offsets 1, 3, 5.
+    for &off in &[1u32, 3, 5] {
+        let has = blocks.iter().any(|&(l, r)| l == b_rcv_nxt + off && r == b_rcv_nxt + off + 1);
+        assert_ok!(has, "SACK missing exact block for offset {off}: {:?}", blocks);
+    }
+
+    // Most recent (offset 5) must be first per RFC 2018 §4.
+    assert_ok!(
+        blocks[0] == (b_rcv_nxt + 5, b_rcv_nxt + 6),
+        "first block {:?} should be most recent (offset 5)", blocks[0]
+    );
+
+    Ok(())
+}
