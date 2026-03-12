@@ -1,7 +1,7 @@
 use rawket::{
     bridge::{Impairment, LinkProfile, PacketSpec},
     filter,
-    tcp::{TcpFlags, TcpSocket},
+    tcp::{TcpConfig, TcpFlags, TcpSocket},
 };
 use crate::{
     assert::{TestFail, assert_dsack, assert_sack_blocks, assert_sack_permitted},
@@ -300,6 +300,83 @@ fn ooo_buffer_limit() -> TestResult {
         !sack_seqs.contains(&ninth_offset),
         "9th OOO segment (offset {ninth_offset}) should be dropped but appears in SACK"
     );
+
+    Ok(())
+}
+
+// RFC 2018 §2: "This option may be sent in a SYN by a TCP that has been
+// extended to receive (and presumably process) the SACK option once the
+// connection has opened." If peer SYN lacks SACK-Permitted, server must NOT
+// send SACK blocks.
+#[test]
+fn sack_not_sent_without_permitted() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    let server = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {},
+        cfg,
+    )?;
+    np.add_tcp_b(server);
+
+    let isn_a = 0x4000_0000u32;
+    let syn = build_tcp_syn(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a, 0,
+        0x02,
+        Some(1460), None, None, false, // no SACK-Permitted
+    );
+    np.inject_to_b(syn);
+    np.transfer_one();
+
+    let cap = np.drain_captured();
+    let syn_ack = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::SYN)
+        .with_tcp_flags(TcpFlags::ACK)
+        .next()
+        .ok_or_else(|| TestFail::new("no SYN-ACK from B"))?;
+
+    assert_ok!(
+        !syn_ack.tcp.opts.sack_permitted,
+        "SYN-ACK has SACK-Permitted despite peer SYN omitting it"
+    );
+
+    let ack = build_tcp_data(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a + 1, syn_ack.tcp.seq + 1,
+        &[],
+    );
+    np.inject_to_b(ack);
+    np.transfer_one();
+
+    let b_rcv_nxt = isn_a + 1;
+    let b_snd_nxt = syn_ack.tcp.seq + 1;
+    np.clear_capture();
+
+    // Inject OOO segment.
+    let ooo = build_tcp_data(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        b_rcv_nxt + 1, b_snd_nxt,
+        b"ooo",
+    );
+    np.inject_to_b(ooo);
+    np.transfer_one();
+
+    let cap = np.drain_captured();
+    let has_sack = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::ACK)
+        .any(|f| !f.tcp.opts.sack_blocks.is_empty());
+    assert_ok!(!has_sack, "B sent SACK blocks despite peer not sending SACK-Permitted");
 
     Ok(())
 }
