@@ -349,3 +349,68 @@ fn keepalive_probe_response() -> TestResult {
 
     Ok(())
 }
+
+// ── keepalive_reset_on_ack ────────────────────────────────────────────────────
+//
+// RFC 1122 §4.2.3.6: receiving data from the peer resets the keepalive timer.
+//
+// B sends data at 40 ms; A receives it (timer reset).  Another 40 ms: still
+// Established and no probes fired.
+#[test]
+fn keepalive_reset_on_ack() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .keepalive_idle_ms(500)
+        .keepalive_interval_ms(100)
+        .keepalive_count(3)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Blackhole B→A so probes go unanswered (will eventually timeout).
+    pair.blackhole_to_a();
+
+    // Without data, keepalive timeout = idle + count*interval = 500 + 300 = 800ms.
+    // Measure time from connect to Closed.
+    let t0 = pair.clock_a.monotonic_ns();
+    pair.transfer_while(|p| p.tcp_a(0).state != State::Closed);
+    let no_data_timeout = (pair.clock_a.monotonic_ns() - t0) / 1_000_000;
+
+    // Now repeat with data sent at idle/2 to reset the timer.
+    pair.clear_impairments();
+    let mut pair2 = setup_tcp_pair()
+        .keepalive_idle_ms(500)
+        .keepalive_interval_ms(100)
+        .keepalive_count(3)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    pair2.blackhole_to_a();
+
+    // Send data at idle/2 to reset the keepalive timer.
+    pair2.advance_both(250);
+    pair2.transfer_one();
+    pair2.clear_impairments();
+    pair2.tcp_b_mut().send(b"ping")?;
+    let b_una = pair2.tcp_b().snd_una();
+    pair2.transfer_while(|p| p.tcp_b(0).snd_una() == b_una);
+    pair2.blackhole_to_a();
+
+    let t1 = pair2.clock_a.monotonic_ns();
+    pair2.transfer_while(|p| p.tcp_a(0).state != State::Closed);
+    let with_data_timeout = (pair2.clock_a.monotonic_ns() - t1) / 1_000_000;
+
+    // With data reset, the timeout from t1 should be approximately
+    // idle + count*interval = 800ms (timer was reset by the data).
+    // Without reset, from t0 it was ~800ms. But with_data starts at ~270ms
+    // after connect, so total from connect = ~270 + 800 = ~1070ms.
+    // The key: with_data_timeout (from data receipt) ≈ no_data_timeout (from connect).
+    // If the timer was NOT reset, with_data_timeout would be much shorter
+    // (remaining idle time after the data, not a full idle + probes).
+    assert_ok!(
+        with_data_timeout >= no_data_timeout * 80 / 100
+            && with_data_timeout <= no_data_timeout * 120 / 100,
+        "timer not reset: with_data={with_data_timeout}ms, expected ≈{no_data_timeout}ms (±20%)"
+    );
+    assert_state(pair2.tcp_a(), State::Closed, "A Closed after keepalive timeout")?;
+
+    Ok(())
+}
