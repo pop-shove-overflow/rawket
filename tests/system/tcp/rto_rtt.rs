@@ -302,3 +302,33 @@ fn timestamps_override_karn() -> TestResult {
 
     Ok(())
 }
+
+// RFC 6298 rule (2.4): "if [RTO] is less than 1 second, then the RTO SHOULD
+// be rounded up to 1 second." Our implementation uses rto_min_ms (configurable).
+// After fast ACKs (low RTT), RTO must still be ≥ cfg.rto_min_ms.
+#[test]
+fn rto_min_floor() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .rto_min_ms(10)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let cfg = pair.tcp_cfg.clone();
+
+    for _ in 0..5 {
+        pair.tcp_a_mut().send(b"hello-rto-min")?;
+        pair.transfer();
+    }
+
+    let rto = pair.tcp_a().rto_ms();
+    assert_ok!(
+        rto >= cfg.rto_min_ms,
+        "RTO ({rto} ms) < rto_min_ms ({} ms)", cfg.rto_min_ms
+    );
+    // After 5 clean exchanges, RTO should not be stuck at rto_max.
+    assert_ok!(
+        rto < cfg.rto_max_ms,
+        "RTO ({rto} ms) == rto_max_ms after clean exchanges — not converging"
+    );
+
+    Ok(())
+}
