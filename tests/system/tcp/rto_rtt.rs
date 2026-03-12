@@ -522,3 +522,66 @@ fn rfc6298_arithmetic() -> TestResult {
 
     Ok(())
 }
+
+// RFC 8985 §7.2: with FlightSize==1, PTO = 2*SRTT + max_ack_delay.
+// Verify TLP fires near this deadline, not before.
+#[test]
+fn tlp_fires_at_two_srtt() -> TestResult {
+    // Freeze clocks so real CLOCK_MONOTONIC cannot shift the TLP deadline.
+    let mut pair = setup_tcp_pair().profile(LinkProfile::leased_line_100m()).connect();
+
+    // Phase 1: exchange data to establish SRTT.
+    pair.tcp_a_mut().send(&[0xFFu8; 5000])?;
+    pair.transfer();
+
+    let srtt = pair.tcp_a().srtt_ms();
+    assert_ok!(srtt > 0, "no SRTT measured");
+
+    // Phase 2: drop data so it stays unacked (FlightSize=1).
+    pair.clear_capture();
+    pair.add_impairment_to_b(Impairment::Drop(PacketSpec::matching(filter::tcp::has_data())));
+    pair.advance_both(2000);
+    pair.tcp_a_mut().send(&[0xDDu8; 100])?;
+    pair.transfer_one();
+
+    // Remove drop so TLP probe can go through.
+    pair.clear_impairments();
+    pair.clear_capture();
+
+    // Confirm TLP is specifically armed (not just "some timer").
+    let timers = pair.tcp_a().timer_state();
+    assert_ok!(
+        timers.tlp_ns.is_some(),
+        "TLP not armed after send with unacked data: {timers:?}"
+    );
+
+    // RFC 8985 §7.2: PTO = 2*SRTT + max_ack_delay for FlightSize==1.
+    // Verify the implementation's TLP deadline matches this formula.
+    let srtt_ns = pair.tcp_a().srtt_ns();
+    let expected_pto_ns = 2 * srtt_ns + rawket::tcp::WC_DEL_ACK_NS;
+    let actual_pto_ns = timers.tlp_ns.unwrap();
+    assert_ok!(
+        actual_pto_ns >= expected_pto_ns * 9 / 10
+            && actual_pto_ns <= expected_pto_ns * 11 / 10,
+        "TLP deadline ({} ms) not ≈ 2*SRTT + max_ack_delay ({} ms) [±10%]",
+        actual_pto_ns / 1_000_000, expected_pto_ns / 1_000_000
+    );
+
+    // Advance to 1ms before the expected PTO — TLP should not fire.
+    let before_ns = actual_pto_ns.saturating_sub(1_000_000);
+    pair.clock_a.advance_ns(before_ns as i64);
+    pair.clock_b.advance_ns(before_ns as i64);
+
+    // Advance 2ms past — TLP should fire.
+    pair.clear_capture();
+    pair.advance_both(2);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    assert_ok!(
+        cap.tcp().from_a().with_data().next().is_some(),
+        "TLP did not fire at expected PTO deadline, FlightSize=1"
+    );
+
+    Ok(())
+}
