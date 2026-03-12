@@ -266,3 +266,56 @@ fn ooo_duplicate_seq() -> TestResult {
 
     Ok(())
 }
+
+// ── ooo_segment_overlaps_rcv_nxt ─────────────────────────────────────────────
+//
+// RFC 9293 §3.10.7.4: segment starting before rcv_nxt but extending past it
+// — trim the already-received portion; accept the new bytes.
+#[test]
+fn ooo_segment_overlaps_rcv_nxt() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let (b_rcv_nxt, b_snd_nxt) = baseline_seqs(&mut pair)?;
+
+    let overlap = a_to_b(
+        &pair,
+        b_rcv_nxt.wrapping_sub(2),
+        b_snd_nxt,
+        b"xyAB",
+    );
+    pair.inject_to_b(overlap);
+    let result = pair.transfer();
+
+    let cap = pair.drain_captured();
+    let max_ack = cap.tcp()
+        .direction(Dir::BtoA)
+        .with_tcp_flags(TcpFlags::ACK)
+        .map(|f| f.tcp.ack)
+        .max();
+    assert_ok!(
+        max_ack == Some(b_rcv_nxt + 2),
+        "B should have trimmed overlap and accepted 2 new bytes \
+         (ack={:?}, expected={})", max_ack, b_rcv_nxt + 2
+    );
+
+    let got_ack = cap.tcp()
+        .direction(Dir::BtoA)
+        .with_tcp_flags(TcpFlags::ACK)
+        .count() > 0;
+    assert_ok!(got_ack, "B did not ACK the overlapping segment");
+
+    // Verify only the new bytes ("AB") were delivered after trimming the
+    // already-received prefix ("xy").
+    // (baseline "a" was consumed by drain_b in baseline_seqs.)
+    let received = result.b.get(&0).map(|v| v.as_slice()).unwrap_or(&[]);
+    assert_ok!(received.len() == 2, "expected 2 bytes delivered to B (AB), got {}", received.len());
+    assert_ok!(
+        received == b"AB",
+        "delivered payload {:?} != expected {:?} — overlap trim incorrect",
+        received, b"AB"
+    );
+
+    Ok(())
+}
