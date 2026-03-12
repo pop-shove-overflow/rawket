@@ -133,3 +133,67 @@ fn persist_probe_is_one_byte() -> TestResult {
 
     Ok(())
 }
+
+// ── persist_exponential_backoff ───────────────────────────────────────────────
+//
+// RFC 1122 §4.2.2.17: persist timer uses exponential backoff.
+//
+// Collect 3 probes; verify gaps roughly double (≥1.5× each time).
+#[test]
+fn persist_exponential_backoff() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    setup_zero_window(&mut pair)?;
+
+    // Drop all A→B frames so B's non-zero window ACKs cannot reopen the window.
+    pair.add_impairment_to_b(Impairment::Drop(PacketSpec::any()));
+
+    pair.tcp_a_mut().send(b"world")?;
+
+    let rto = pair.tcp_a().rto_ms() as i64;
+
+    // Advance through 3 persist probes with exponential backoff.
+    pair.advance_both(rto + 5);
+    pair.transfer_one();
+    pair.advance_both(rto * 2 + 5);
+    pair.transfer_one();
+    pair.advance_both(rto * 4 + 5);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    // Probes may be "dropped" by the impairment we added; use all_tcp() to see them all.
+    let probe_times: Vec<u64> = cap.all_tcp()
+        .direction(Dir::AtoB)
+        .filter(|f| f.payload_len == 1)
+        .map(|f| f.ts_ns / 1_000_000) // ns → ms
+        .collect();
+
+    assert_ok!(
+        probe_times.len() >= 3,
+        "expected ≥3 persist probes for backoff test, got {}", probe_times.len()
+    );
+
+    let gaps: Vec<u64> = probe_times.windows(2).map(|w| w[1] - w[0]).collect();
+
+    // First inter-probe gap should be ≈ 2*RTO (persist doubles after first probe).
+    let rto_ms = rto as u64;
+    assert_ok!(
+        gaps[0] >= rto_ms * 3 / 2 && gaps[0] <= rto_ms * 5 / 2,
+        "first inter-probe gap {} ms not near 2*RTO ({} ms) — expected [{}, {}]",
+        gaps[0], rto_ms * 2, rto_ms * 3 / 2, rto_ms * 5 / 2
+    );
+
+    // Each subsequent gap should roughly double (≥1.9× previous).
+    for i in 1..gaps.len() {
+        assert_ok!(
+            gaps[i] >= gaps[i - 1] * 19 / 10,
+            "persist backoff not exponential: gap[{}]={} ms, gap[{}]={} ms \
+             (expected ≥1.9× previous)",
+            i - 1, gaps[i - 1], i, gaps[i]
+        );
+    }
+
+    Ok(())
+}
