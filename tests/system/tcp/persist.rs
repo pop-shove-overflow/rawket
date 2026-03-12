@@ -395,3 +395,55 @@ fn persist_probe_seq() -> TestResult {
 
     Ok(())
 }
+
+// ── persist_window_update_ack ─────────────────────────────────────────────────
+//
+// RFC 9293 §3.8.6.1: receiver responds to persist probe with window update.
+//
+// After the persist probe, B responds with a window update ACK.
+#[test]
+fn persist_window_update_ack() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    setup_zero_window(&mut pair)?;
+
+    pair.tcp_a_mut().send(b"world")?;
+
+    // Advance past persist deadline; fire probe, deliver to B, B responds.
+    let rto = pair.tcp_a().rto_ms() as i64;
+    pair.advance_both(rto + 5);
+    pair.transfer_one();  // A sends probe
+    pair.advance_both(25); // bridge latency
+    pair.transfer_one();  // B receives probe, sends window-update ACK
+    pair.transfer_one();  // deliver ACK to A
+
+    let cap = pair.drain_captured();
+    let probes = cap.tcp()
+        .direction(Dir::AtoB)
+        .filter(|f| f.payload_len == 1)
+        .count();
+    assert_ok!(probes >= 1, "no persist probe sent");
+
+    // B's window-update ACK (non-zero window) is in this same capture because
+    // advance_both drives both clocks simultaneously on the instant link.
+    let window_ack = cap.tcp()
+        .direction(Dir::BtoA)
+        .with_tcp_flags(TcpFlags::ACK)
+        .find(|f| f.tcp.window_raw > 0)
+        .ok_or_else(|| TestFail::new("B did not send window update ACK after persist probe"))?;
+
+    // RFC only requires window > 0 for a window update.  Reconstruct the
+    // effective window from the raw field and the negotiated scale.
+    let rcv_scale = pair.tcp_b().rcv_scale();
+    let effective_wnd = (window_ack.tcp.window_raw as u32) << rcv_scale;
+    let mss = pair.tcp_a().peer_mss() as u32;
+    assert_ok!(
+        effective_wnd >= mss,
+        "effective window ({effective_wnd} = {} << {rcv_scale}) < MSS ({mss})",
+        window_ack.tcp.window_raw
+    );
+
+    Ok(())
+}
