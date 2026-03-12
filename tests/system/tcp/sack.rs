@@ -612,3 +612,46 @@ fn dsack_rto_retransmit() -> TestResult {
 
     Ok(())
 }
+
+// RFC 6675 §5: when cumulative ACK advances past SACKed segments, they are
+// removed from the scoreboard and unacked queue must drain.
+#[test]
+fn cumulative_ack_clears_sacked_segments() -> TestResult {
+    // Use a leased-line profile to get RTT so RACK can trigger
+    let link = LinkProfile::leased_line_100m();
+    let mut pair = setup_tcp_pair().profile(link).connect();
+
+    // Drop seg2 (2nd data segment from A).
+    pair.add_impairment_to_b(Impairment::Drop(PacketSpec::nth_matching(2, filter::tcp::has_data())));
+
+    pair.tcp_a_mut().send(&[0x55u8; 5000])?;
+
+    // Drive until B has sent a SACK (gap detected) but don't run full recovery yet.
+    let mut saw_sack = false;
+    pair.transfer_while(|p| {
+        let cap = p.drain_captured();
+        if cap.tcp().from_b().any(|f| !f.tcp.opts.sack_blocks.is_empty()) {
+            saw_sack = true;
+        }
+        !saw_sack
+    });
+    assert_ok!(saw_sack, "B never sent SACK for dropped seg2");
+
+    let unacked_before = pair.tcp_a().unacked_len();
+    assert_ok!(unacked_before > 0, "unacked should be >0 while seg2 is still lost");
+
+    // Remove impairment, drive recovery.
+    pair.clear_impairments();
+    pair.transfer();
+
+    let unacked_after = pair.tcp_a().unacked_len();
+    assert_ok!(
+        unacked_after == 0,
+        "unacked queue not drained after cumulative ACK: before={unacked_before}, after={unacked_after}"
+    );
+
+    let bif = pair.tcp_a().bytes_in_flight();
+    assert_ok!(bif == 0, "bytes_in_flight ({bif}) not 0 after all data acked");
+
+    Ok(())
+}
