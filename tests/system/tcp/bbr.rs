@@ -304,3 +304,67 @@ fn startup_exit_on_loss() -> TestResult {
 
     Ok(())
 }
+
+// ── probe_rtt_cwnd_reduced ─────────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.3.4, §4.4.2: ProbeRTT sets
+// cwnd = BBRMinPipeCwnd = 4*MSS.
+// Send enough data to grow cwnd above 4*MSS, then trigger ProbeRtt and
+// verify cwnd drops to ≤ 4*MSS.
+#[test]
+fn probe_rtt_cwnd_reduced() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Drive to ProbeBW first — ensures min_rtt is measured and cwnd is grown.
+    drive_to_probe_bw(&mut pair)?;
+
+    let mss = pair.tcp_a().peer_mss() as u32;
+    let mss_threshold = 5 * mss;
+    let cwnd_before = pair.tcp_a().bbr_cwnd();
+    assert_ok!(
+        cwnd_before > mss_threshold,
+        "cwnd ({cwnd_before}) not above 5*MSS ({mss_threshold}) — test setup insufficient"
+    );
+
+    // Advance past probe_rtt_interval (5000 ms).
+    pair.advance_both(6_000);
+
+    // Send data to trigger ProbeRtt; use bbr_history() to find the entry.
+    let mut found = false;
+    pair.tcp_a_mut().send(&vec![0x55u8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0x55u8; 2_000]);
+        }
+
+        for snap in p.tcp_a(0).bbr_history() {
+            if snap.phase == BbrPhase::ProbeRtt {
+                found = true;
+            }
+        }
+        !found
+    });
+    assert_ok!(found, "never observed ProbeRtt entry in bbr_history()");
+
+    for snap in pair.tcp_a().bbr_history() {
+        if snap.phase == BbrPhase::ProbeRtt {
+            // BBRSetCwnd (spec §5.6.2): cwnd = 4*MSS in ProbeRtt.
+            assert_ok!(
+                snap.cwnd == 4 * mss,
+                "cwnd at ProbeRtt entry ({}) != 4*MSS ({}) — prior_cwnd={}",
+                snap.cwnd, 4 * mss, snap.prior_cwnd
+            );
+            // prior_cwnd must capture the pre-ProbeRtt value.
+            assert_ok!(
+                snap.prior_cwnd > mss_threshold,
+                "prior_cwnd ({}) not above 5*MSS — not properly saved",
+                snap.prior_cwnd
+            );
+            return Ok(());
+        }
+    }
+    assert_ok!(false, "ProbeRtt found during transfer but not in final history");
+    Ok(())
+}
