@@ -621,3 +621,31 @@ fn probe_rtt_exit_back_to_probe_bw() -> TestResult {
 
     Ok(())
 }
+
+// ── bw_sample_window ──────────────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §5.1: BBROnACK updates max_bw from delivery
+// rate samples over a windowed max filter.
+//
+// After data exchange, bbr_max_bw() should reflect the measured bandwidth.
+// 10KB in ~200ms simulated = ~50 KB/s minimum.
+#[test]
+fn bw_sample_window() -> TestResult {
+    let mut pair = setup_tcp_pair().profile(LinkProfile::leased_line_100m()).connect();
+
+    // Send enough data for BBR to converge on the 100 Mbps link.
+    // 10KB is insufficient — BBR needs multiple RTTs to ramp up.
+    pair.tcp_a_mut().send(&vec![0x77u8; 200_000])?;
+    pair.transfer();
+
+    // On a 100 Mbps link, max_bw should be in the megabit range after
+    // enough rounds.  The old threshold of 50 KB/s was ~4000x below
+    // link capacity.
+    let max_bw = pair.tcp_a().bbr_max_bw();
+    assert_ok!(
+        max_bw >= 1_000_000,
+        "bbr_max_bw() = {max_bw} bps — too low after 200KB on 100 Mbps link (expected ≥ 1 Mbps)"
+    );
+
+    Ok(())
+}
