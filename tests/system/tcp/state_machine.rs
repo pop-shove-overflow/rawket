@@ -576,3 +576,73 @@ fn rst_in_window_challenge_ack() -> TestResult {
 
     Ok(())
 }
+
+// RFC 5961 §5, §7 (Challenge ACK Rate Limiting): Challenge ACKs must be
+// rate-limited to prevent amplification attacks.
+#[test]
+fn challenge_ack_rate_limit() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let limit = rawket::tcp::CHALLENGE_ACK_LIMIT as usize;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"x")?;
+    pair.transfer();
+
+    let b_snd_nxt = pair.drain_captured().tcp()
+        .find(|f| f.dir == Dir::AtoB && f.payload_len > 0)
+        .map(|f| f.tcp.ack)
+        .ok_or_else(|| crate::assert::TestFail::new("no AtoB data frame"))?;
+
+    let inject_rst = |pair: &mut crate::harness::TcpSocketPair| {
+        let rst = build_tcp_rst(
+            pair.mac_b, pair.mac_a,
+            pair.ip_b,  pair.ip_a,
+            80, 12345,
+            b_snd_nxt + 1,
+        );
+        pair.inject_to_a(rst);
+    };
+
+    pair.clear_capture();
+    for _ in 0..limit * 2 {
+        inject_rst(&mut pair);
+    }
+    pair.transfer();
+
+    let is_pure_ack = |f: &crate::capture::ParsedFrame| {
+        f.dir == Dir::AtoB
+            && f.tcp.flags.has(TcpFlags::ACK)
+            && !f.tcp.flags.has(TcpFlags::SYN)
+            && !f.tcp.flags.has(TcpFlags::RST)
+            && !f.tcp.flags.has(TcpFlags::FIN)
+            && f.payload_len == 0
+    };
+
+    let cap = pair.drain_captured();
+    let ack_count = cap.tcp().filter(|f| is_pure_ack(f)).count();
+
+    assert_ok!(ack_count > 0, "no challenge ACKs sent");
+    assert_ok!(
+        ack_count == limit,
+        "expected exactly {limit} challenge ACKs (rate limit), got {ack_count}"
+    );
+    assert_state(pair.tcp_a(), State::Established, "A must survive burst of in-window RSTs")?;
+
+    // Recovery: advance clock past the 1s window, then verify challenge ACKs resume.
+    pair.advance_both(1001);
+    pair.clear_capture();
+
+    inject_rst(&mut pair);
+    pair.transfer();
+
+    let cap2 = pair.drain_captured();
+    let recovery_acks = cap2.tcp().filter(|f| is_pure_ack(f)).count();
+    assert_ok!(
+        recovery_acks == 1,
+        "expected 1 challenge ACK after rate-limit window reset, got {recovery_acks}"
+    );
+
+    Ok(())
+}
