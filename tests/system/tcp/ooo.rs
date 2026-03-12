@@ -202,3 +202,67 @@ fn multiple_gaps_filled_in_order() -> TestResult {
 
     Ok(())
 }
+
+// ── ooo_duplicate_seq ────────────────────────────────────────────────────────
+//
+// RFC 2883 §3: D-SACK reports duplicate OOO segment via first SACK block.
+//
+// Inject a 2-byte OOO segment, then re-inject the first byte as a duplicate.
+// D-SACK block 0 (duplicate) must be a strict subset of block 1 (full OOO range).
+#[test]
+fn ooo_duplicate_seq() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let (b_rcv_nxt, b_snd_nxt) = baseline_seqs(&mut pair)?;
+
+    // Inject a 2-byte OOO segment at offset+1.
+    let seg = a_to_b(&pair, b_rcv_nxt + 1, b_snd_nxt, b"DE");
+    pair.inject_to_b(seg);
+    pair.transfer_one();
+    pair.drain_captured();
+
+    // Re-inject the first byte as a duplicate.
+    let dup = a_to_b(&pair, b_rcv_nxt + 1, b_snd_nxt, b"D");
+    pair.inject_to_b(dup);
+    pair.transfer_one();
+
+    // RFC 2883 §4 example 3: OOO D-SACK — first block (duplicate range)
+    // is a strict subset of the second block (full OOO range).
+    let cap = pair.drain_captured();
+    let dsack_ack = cap.tcp()
+        .direction(Dir::BtoA)
+        .find(|f| f.tcp.opts.sack_blocks.len() >= 2);
+    let dsack_ack = dsack_ack
+        .ok_or_else(|| TestFail::new("expected ≥2 SACK blocks for OOO D-SACK after duplicate"))?;
+    let blocks = &dsack_ack.tcp.opts.sack_blocks;
+    // Block 0 (D-SACK): the duplicate byte [+1, +2).
+    assert_ok!(
+        blocks[0] == (b_rcv_nxt + 1, b_rcv_nxt + 2),
+        "D-SACK block 0 should be [{}, {}), got [{}, {})",
+        b_rcv_nxt + 1, b_rcv_nxt + 2, blocks[0].0, blocks[0].1
+    );
+    // Block 1: the full OOO range [+1, +3) — strictly larger than block 0.
+    assert_ok!(
+        blocks[1] == (b_rcv_nxt + 1, b_rcv_nxt + 3),
+        "D-SACK block 1 should be [{}, {}), got [{}, {})",
+        b_rcv_nxt + 1, b_rcv_nxt + 3, blocks[1].0, blocks[1].1
+    );
+
+    let fill = a_to_b(&pair, b_rcv_nxt, b_snd_nxt, b"C");
+    pair.inject_to_b(fill);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let max_ack = cap.tcp()
+        .direction(Dir::BtoA)
+        .map(|f| f.tcp.ack)
+        .max();
+    assert_ok!(
+        max_ack == Some(b_rcv_nxt + 3),
+        "ACK should be exactly +3 after gap fill with 2-byte OOO"
+    );
+
+    Ok(())
+}
