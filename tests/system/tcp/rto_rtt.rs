@@ -203,3 +203,56 @@ fn rto_max_retransmits() -> TestResult {
 
     Ok(())
 }
+
+// RFC 6298 §5.2: "When all outstanding data has been acknowledged, turn off
+// the retransmission timer." A sends data (RTO armed); a synthetic ACK from
+// B clears the unacked queue. Advancing past rto_min_ms must NOT produce a
+// retransmit.
+#[test]
+fn rto_cleared_on_full_ack() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .rto_min_ms(10)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Drop A's data so B never replies automatically.
+    pair.add_impairment_to_b(Impairment::Drop(PacketSpec::matching(filter::tcp::has_data())));
+
+    pair.tcp_a_mut().send(b"hello")?;
+    // Drive until data is in-flight and RTO is armed, then stop.
+    pair.transfer_while(|p| p.tcp_a(0).timer_state().rto_ns.is_none());
+
+    // Read seq/ack from the dropped frame.
+    let cap = pair.drain_captured();
+    let dropped = cap.all_tcp().from_a().dropped().with_data().next()
+        .ok_or_else(|| TestFail::new("no dropped data frame"))?;
+    let (a_snd_una, b_snd_nxt) = (dropped.tcp.seq, dropped.tcp.ack);
+
+    // Inject a full ACK from B (with TS so PAWS doesn't reject it).
+    let ack = crate::harness::b_to_a(&pair, b_snd_nxt, a_snd_una + 5, b"");
+    pair.clear_capture();
+    pair.clear_impairments();
+    pair.inject_to_a(ack);
+    pair.transfer_one();
+
+    // Prove the injected ACK was accepted.
+    assert_ok!(
+        pair.tcp_a().snd_una() == a_snd_una + 5,
+        "snd_una did not advance to {} after full ACK: {}",
+        a_snd_una + 5, pair.tcp_a().snd_una()
+    );
+
+    // After full ACK, RTO must be disarmed (unacked queue empty).
+    let timers = pair.tcp_a().timer_state();
+    assert_ok!(
+        timers.rto_ns.is_none(),
+        "RTO still armed after full ACK: {timers:?}"
+    );
+
+    // No spurious retransmit should have occurred.
+    let cap = pair.drain_captured();
+    let spurious_retx = cap.all_tcp().from_a().with_data().next().is_some();
+    assert_ok!(!spurious_retx, "RTO fired despite receiving full ACK before deadline");
+
+    Ok(())
+}
