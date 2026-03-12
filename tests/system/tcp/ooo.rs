@@ -150,3 +150,55 @@ fn fin_in_ooo() -> TestResult {
 
     Ok(())
 }
+
+// ── multiple_gaps_filled_in_order ────────────────────────────────────────────
+//
+// RFC 9293 §3.10.7.4: cumulative ACK advances as each gap is filled.
+//
+// OOO at +1 and +3; fill +0 then +2. Verify ACK advances past all 4 bytes.
+#[test]
+fn multiple_gaps_filled_in_order() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let (b_rcv_nxt, b_snd_nxt) = baseline_seqs(&mut pair)?;
+
+    for off in [1u32, 3] {
+        let seg = a_to_b(&pair, b_rcv_nxt + off, b_snd_nxt, b"x");
+        pair.inject_to_b(seg);
+        pair.transfer_one();
+    }
+
+    let fill0 = a_to_b(&pair, b_rcv_nxt, b_snd_nxt, b"a");
+    pair.inject_to_b(fill0);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let ack_after_fill0 = cap.tcp()
+        .direction(Dir::BtoA)
+        .with_tcp_flags(TcpFlags::ACK)
+        .map(|f| f.tcp.ack)
+        .max();
+    assert_ok!(
+        ack_after_fill0 == Some(b_rcv_nxt + 2),
+        "ACK should be exactly +2 after filling gap at +0"
+    );
+
+    let fill2 = a_to_b(&pair, b_rcv_nxt + 2, b_snd_nxt, b"c");
+    pair.inject_to_b(fill2);
+    pair.transfer_one();
+
+    let cap2 = pair.drain_captured();
+    let ack_after_fill2 = cap2.tcp()
+        .direction(Dir::BtoA)
+        .with_tcp_flags(TcpFlags::ACK)
+        .map(|f| f.tcp.ack)
+        .max();
+    assert_ok!(
+        ack_after_fill2 == Some(b_rcv_nxt + 4),
+        "ACK should be exactly +4 after filling all gaps"
+    );
+
+    Ok(())
+}
