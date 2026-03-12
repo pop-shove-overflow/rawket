@@ -290,3 +290,37 @@ fn cwr_sent_only_once() -> TestResult {
 
     Ok(())
 }
+
+// ── ect_bits_on_data_segments ───────────────────────────────────────────────
+//
+// RFC 3168 §6.1.2 (The TCP Sender): "ECT(0) SHOULD be used" when only one
+// ECT codepoint is needed.  Our implementation always uses ECT(0).
+#[test]
+fn ect_bits_on_data_segments() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Send data from both sides.
+    pair.tcp_a_mut().send(b"hello")?;
+    pair.tcp_b_mut().send(b"world")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+
+    // A's outgoing data must carry ECT(0).
+    let a_data: Vec<_> = cap.tcp().from_a().with_data().collect();
+    assert_ok!(!a_data.is_empty(), "no AtoB data frames");
+    for f in &a_data {
+        assert_ect0(f, "A→B data segment")?;
+    }
+
+    // B's outgoing data must also carry ECT(0).
+    let b_data: Vec<_> = cap.tcp().from_b().with_data().collect();
+    assert_ok!(!b_data.is_empty(), "no BtoA data frames");
+    for f in &b_data {
+        assert_ect0(f, "B→A data segment")?;
+    }
+
+    Ok(())
+}
