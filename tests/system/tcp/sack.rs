@@ -250,3 +250,56 @@ fn sack_permitted_negotiation() -> TestResult {
 
     Ok(())
 }
+
+// Implementation limit: OOO buffer holds at most rx_ooo_max (default 8)
+// segments.  RFC 2018 §8 permits discarding previously SACKed data, but
+// does not mandate a specific buffer size.
+#[test]
+fn ooo_buffer_limit() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"a")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let af = cap.tcp().from_a().with_data().next().ok_or_else(|| TestFail::new("no AtoB data"))?;
+    let b_rcv_nxt = af.tcp.seq + af.payload_len as u32;
+    let b_snd_nxt = af.tcp.ack;
+    pair.clear_capture();
+
+    // Implementation limit: rx_ooo buffer holds at most 8 segments.
+    // This is a fixed internal constant (not configurable).  If the eviction
+    // policy changes (e.g., to LRU or merge-based), this assertion should be
+    // updated to match the new capacity semantic.
+    let rx_ooo_max = 8usize;
+
+    for i in 0..=(rx_ooo_max as u32) {
+        let offset = i * 2 + 1;
+        let seg = a_to_b(&pair, b_rcv_nxt + offset, b_snd_nxt, b"x");
+        pair.inject_to_b(seg);
+        pair.transfer_one();
+    }
+
+    let cap = pair.drain_captured();
+    let sack_seqs: std::collections::BTreeSet<u32> = cap.tcp().from_b()
+        .flat_map(|f| f.tcp.opts.sack_blocks.iter().map(|&(l, _)| l).collect::<Vec<_>>())
+        .collect();
+
+    assert_ok!(
+        sack_seqs.len() == rx_ooo_max,
+        "expected exactly {rx_ooo_max} unique SACK block starts, got {}: {:?}",
+        sack_seqs.len(), sack_seqs
+    );
+
+    // 9th segment (offset 17) must have been dropped — not present in any SACK.
+    let ninth_offset = b_rcv_nxt + (rx_ooo_max as u32) * 2 + 1;
+    assert_ok!(
+        !sack_seqs.contains(&ninth_offset),
+        "9th OOO segment (offset {ninth_offset}) should be dropped but appears in SACK"
+    );
+
+    Ok(())
+}
