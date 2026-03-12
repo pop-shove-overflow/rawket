@@ -269,3 +269,56 @@ fn window_open_clears_persist() -> TestResult {
 
     Ok(())
 }
+
+// ── rto_does_not_fire_during_persist ─────────────────────────────────────────
+//
+// Implementation choice: RTO is disarmed while persist timer is active.
+// RFC 1122 §4.2.2.17 does not explicitly prohibit RTO during persist, but
+// persist and retransmission are mutually exclusive timer states.
+#[test]
+fn rto_does_not_fire_during_persist() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    setup_zero_window(&mut pair)?;
+
+    pair.add_impairment_to_b(Impairment::Drop(PacketSpec::any()));
+
+    pair.tcp_a_mut().send(b"world")?;
+
+    // Verify RTO is disarmed during persist (persist takes over).
+    let timers = pair.tcp_a().timer_state();
+    assert_ok!(timers.persist_ns.is_some(), "persist not armed: {timers:?}");
+
+    // Advance well past rto_max_ms.
+    let rto_max = pair.tcp_cfg.rto_max_ms as i64;
+    for _ in 0..((rto_max * 2 / 500) + 1) {
+        pair.advance_both(500);
+        pair.transfer_one();
+    }
+
+    assert_state(pair.tcp_a(), State::Established, "A should be Established during persist")?;
+
+    let cap = pair.drain_captured();
+    // Probes are dropped by our impairment; use all_tcp() to count all A→B frames.
+    let oversized = cap.all_tcp()
+        .direction(Dir::AtoB)
+        .filter(|f| f.payload_len > 1)
+        .count();
+    assert_ok!(
+        oversized == 0,
+        "RTO retransmit fired during persist ({oversized} frames with payload > 1)"
+    );
+
+    let probe_count = cap.all_tcp()
+        .direction(Dir::AtoB)
+        .filter(|f| f.payload_len == 1)
+        .count();
+    assert_ok!(
+        probe_count >= 1,
+        "no persist probes sent — test scenario may be vacuous"
+    );
+
+    Ok(())
+}
