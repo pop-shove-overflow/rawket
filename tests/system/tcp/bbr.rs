@@ -424,3 +424,82 @@ fn cwnd_floor_after_loss() -> TestResult {
 
     Ok(())
 }
+
+// ── ack_splitting_no_cwnd_inflation ───────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.4.2: cwnd is bounded by the model, not by
+// ACK count.  RFC 3465 / BBR: multiple small ACKs covering the same data
+// as one large ACK must not grow cwnd faster.  Inject 10 partial ACKs for a single
+// MSS-sized segment and verify cwnd didn't inflate beyond what a single
+// full ACK would produce.
+#[test]
+fn ack_splitting_no_cwnd_inflation() -> TestResult {
+    use crate::packet::build_tcp_data_with_flags;
+
+    // Use a latency link so the real ACK from B is still in the bridge
+    // delay queue while we inject crafted split ACKs.
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let cwnd_before = pair.tcp_a().bbr_cwnd();
+    let mss = pair.tcp_a().peer_mss() as u32;
+
+    // Send one MSS of data and transfer so B receives it.
+    pair.tcp_a_mut().send(&vec![0xAAu8; mss as usize])?;
+    pair.transfer();
+
+    // Capture the sent segment.
+    let cap = pair.drain_captured();
+    let seg = cap
+        .tcp()
+        .find(|f| matches!(f.dir, crate::capture::Dir::AtoB) && f.payload_len > 0)
+        .map(|f| (f.tcp.seq, f.tcp.ack, f.payload_len as u32));
+    let (a_seq, b_snd_nxt, payload_len) =
+        seg.ok_or_else(|| crate::assert::TestFail::new("no AtoB data frame found"))?;
+
+    // Inject 10 partial ACKs that collectively cover the full segment.
+    // Use ingress() to bypass delay and deliver directly to A's rx_queue.
+    let step: u32 = payload_len / 10;
+    let mac_b = pair.net.mac_b;
+    let mac_a = pair.net.mac_a;
+    let ip_b = pair.net.ip_b;
+    let ip_a = pair.net.ip_a;
+
+    let mut ack_num: u32 = a_seq.wrapping_add(step);
+    for i in 0..10u32 {
+        if i == 9 {
+            ack_num = a_seq.wrapping_add(payload_len);
+        }
+        let ack_frame = build_tcp_data_with_flags(
+            mac_b, mac_a, ip_b, ip_a,
+            80, 12345,
+            b_snd_nxt, ack_num,
+            0x10, // ACK
+            65535,
+            &[],
+        );
+        pair.net.inject_to_a(ack_frame);
+        ack_num = ack_num.wrapping_add(step);
+    }
+    // Process all injected ACKs at once.
+    pair.transfer();
+
+    let cwnd_after = pair.tcp_a().bbr_cwnd();
+
+    // cwnd should grow by at most ~2 MSS (one MSS of data was ACKed).
+    let growth = cwnd_after.saturating_sub(cwnd_before);
+    assert_ok!(
+        growth <= 2 * mss,
+        "cwnd grew {growth} bytes after 10 split ACKs for 1 MSS — expected ≤ 2*MSS={} (before={cwnd_before}, after={cwnd_after})",
+        2 * mss
+    );
+
+    let state = pair.tcp_a().state;
+    assert_ok!(
+        state == rawket::tcp::State::Established,
+        "A not Established: {state:?}"
+    );
+
+    Ok(())
+}
