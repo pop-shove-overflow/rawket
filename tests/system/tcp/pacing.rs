@@ -491,3 +491,51 @@ fn probe_bw_up_increases_rate() -> TestResult {
     assert_ok!(false, "ProbeBwUp found during transfer but not in final history");
     Ok(())
 }
+
+// ── probe_bw_down_decreases_rate ──────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.3.3.6: ProbeBwDown pacing_gain = 0.90.
+//
+// Drive BBR past Startup into ProbeBwDown; verify pacing_rate < max_bw at
+// that time (down-gain < 1.0).  Uses a 100 Mbps link so RTT is non-zero and
+// ProbeBwDown phase lasts long enough to be observed.
+#[test]
+fn probe_bw_down_decreases_rate() -> TestResult {
+    // Use a 100 Mbps leased line (10 ms RTT) so BBR phases are stable and observable.
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let mut found_down = false;
+    pair.tcp_a_mut().send(&vec![0x33u8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0x33u8; 2_000]);
+        }
+
+        for snap in p.tcp_a(0).bbr_history() {
+            if snap.phase == BbrPhase::ProbeBwDown && snap.max_bw > 0 {
+                found_down = true;
+            }
+        }
+        !found_down
+    });
+
+    assert_ok!(found_down, "never observed ProbeBwDown entry with measurable BW in bbr_history()");
+    for snap in pair.tcp_a().bbr_history() {
+        if snap.phase == BbrPhase::ProbeBwDown && snap.max_bw > 0 {
+            let rate = snap.pacing_rate_bps;
+            let bw = snap.max_bw;
+            // BBRv3 §4.4.6: ProbeBwDown pacing_gain = 0.90.
+            // Verify rate/bw ∈ [0.85, 0.95] (±5% around 0.90).
+            assert_ok!(
+                rate >= bw * 85 / 100 && rate <= bw * 95 / 100,
+                "ProbeBwDown pacing_rate/max_bw not in [0.85, 0.95]: rate={rate}, bw={bw}, \
+                 ratio={:.2}", rate as f64 / bw as f64
+            );
+            return Ok(());
+        }
+    }
+    assert_ok!(false, "ProbeBwDown found during transfer but not in final history");
+    Ok(())
+}
