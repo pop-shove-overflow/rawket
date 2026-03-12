@@ -1110,3 +1110,59 @@ fn bw_sampling_effective_bw() -> TestResult {
 
     Ok(())
 }
+
+// ── cruise_refill_pacing_gain ──────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.3.3.7 (CRUISE), §4.3.3.8 (REFILL):
+// both sub-phases use pacing_gain = 1.00.
+// Verify pacing_rate ≈ max_bw (ratio ~100%) during these phases.
+#[test]
+fn cruise_refill_pacing_gain() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let mut saw_cruise = false;
+    let mut cruise_gain = 0u64;
+    let mut saw_refill = false;
+    let mut refill_gain = 0u64;
+
+    pair.tcp_a_mut().send(&vec![0x11u8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0x11u8; 2_000]);
+        }
+
+        for snap in p.tcp_a(0).bbr_history() {
+            if snap.max_bw == 0 { continue; }
+            let ratio = snap.pacing_rate_bps * 100 / snap.max_bw;
+
+            match snap.phase {
+                BbrPhase::ProbeBwCruise if !saw_cruise => {
+                    saw_cruise = true;
+                    cruise_gain = ratio;
+                }
+                BbrPhase::ProbeBwRefill if !saw_refill => {
+                    saw_refill = true;
+                    refill_gain = ratio;
+                }
+                _ => {}
+            }
+        }
+        !(saw_cruise && saw_refill)
+    });
+
+    assert_ok!(saw_cruise, "never observed ProbeBW_CRUISE phase");
+    assert_ok!(
+        (95..=105).contains(&cruise_gain),
+        "ProbeBW_CRUISE pacing gain {cruise_gain}% not ≈100 (expected 1.00×)"
+    );
+
+    assert_ok!(saw_refill, "never observed ProbeBW_REFILL phase");
+    assert_ok!(
+        (95..=105).contains(&refill_gain),
+        "ProbeBW_REFILL pacing gain {refill_gain}% not ≈100 (expected 1.00×)"
+    );
+
+    Ok(())
+}
