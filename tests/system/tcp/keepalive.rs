@@ -220,3 +220,38 @@ fn no_probe_in_non_established() -> TestResult {
 
     Ok(())
 }
+
+// ── keepalive_disabled_by_default ────────────────────────────────────────────
+//
+// RFC 1122 §4.2.3.6: keepalive is optional and MUST default to off.
+//
+// TcpConfig::default() has keepalive_idle_ms = 0 (disabled).  No probes after 60 s.
+#[test]
+fn keepalive_disabled_by_default() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let snd_una = pair.tcp_a().snd_una();
+    pair.clear_capture();
+
+    pair.advance_both(60_000);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let probes = cap.tcp()
+        .direction(Dir::AtoB)
+        .filter(|f| f.payload_len == 0
+            && f.tcp.flags.has(TcpFlags::ACK)
+            && !f.tcp.flags.has(TcpFlags::SYN)
+            && !f.tcp.flags.has(TcpFlags::FIN)
+            && !f.tcp.flags.has(TcpFlags::RST)
+            && f.tcp.seq == snd_una.wrapping_sub(1))
+        .count();
+    assert_ok!(
+        probes == 0,
+        "keepalive probes fired with idle_ms=0 ({probes} probes)"
+    );
+
+    Ok(())
+}
