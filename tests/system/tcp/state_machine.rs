@@ -7,7 +7,7 @@ use crate::{
     TestResult, assert_ok,
     assert::{assert_ack, assert_error_fired, assert_flags, assert_flags_exact, assert_state},
     capture::{Dir, ParsedFrameExt},
-    harness::{fast_tcp_cfg, setup_network_pair, setup_tcp_pair},
+    harness::{setup_network_pair, setup_tcp_pair},
     packet::{build_tcp_data, build_tcp_data_with_flags, build_tcp_rst, build_tcp_syn,
              build_udp_data},
 };
@@ -252,6 +252,68 @@ fn rst_with_invalid_seq() -> TestResult {
     let cap = pair.drain_captured();
     let a_sent = cap.tcp().direction(Dir::AtoB).count();
     assert_ok!(a_sent == 0, "A sent {a_sent} frame(s) in response to out-of-window RST — expected 0");
+
+    Ok(())
+}
+
+// RFC 9293 §3.8.1 (Retransmission): SYN retransmit with exponential backoff
+// until max_retransmits is exhausted.
+#[test]
+fn syn_retransmit() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let max_retransmits: u8 = 4;
+    let rto_min_ms: u64 = 10;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default().rto_min_ms(rto_min_ms).max_retransmits(max_retransmits);
+
+    np.add_impairment_to_b(Impairment::Drop(PacketSpec::matching(filter::tcp::syn())));
+
+    let client = TcpSocket::connect_now(
+        np.iface_a(),
+        "10.0.0.1:12345".parse().unwrap(),
+        "10.0.0.2:80".parse().unwrap(),
+        Ipv4Addr::from([10, 0, 0, 2]),
+        |_| {}, |_| {}, cfg,
+    )?;
+    let ia = np.add_tcp_a(client);
+
+    np.transfer_while(|p| p.tcp_a(ia).state != State::Closed);
+
+    assert_state(np.tcp_a(ia), State::Closed, "client after SYN exhaustion")?;
+    assert_error_fired(np.tcp_a(ia), TcpError::Timeout, "client error after SYN exhaustion")?;
+
+    // Verify exact SYN count: 1 initial + max_retransmits retries.
+    let cap = np.drain_captured();
+    let syns: Vec<_> = cap.all_tcp()
+        .filter(|f| f.dir == Dir::AtoB
+            && f.tcp.flags.has(TcpFlags::SYN)
+            && !f.tcp.flags.has(TcpFlags::ACK))
+        .collect();
+    // 1 initial SYN + max_retransmits retransmits.
+    let expected_syns = (max_retransmits as usize) + 1;
+    assert_ok!(
+        syns.len() == expected_syns,
+        "expected {expected_syns} SYNs (1 initial + {max_retransmits} retransmits), got {}",
+        syns.len()
+    );
+
+    // Verify exponential backoff: each interval should be ~2× the previous.
+    // Intervals: rto_min, 2*rto_min, 4*rto_min, 8*rto_min, ...
+    // Only check the first max_retransmits intervals (the last retransmit
+    // may share a timestamp with the close).
+    let check_count = (syns.len() - 1).min(max_retransmits as usize);
+    for i in 1..=check_count {
+        let interval_ns = syns[i].ts_ns.saturating_sub(syns[i - 1].ts_ns);
+        let interval_ms = interval_ns / 1_000_000;
+        let expected_ms = rto_min_ms << (i - 1);
+        // Allow 50% tolerance for timing granularity.
+        assert_ok!(
+            interval_ms >= expected_ms / 2 && interval_ms <= expected_ms * 2,
+            "SYN retransmit {i}: interval {interval_ms}ms, expected ~{expected_ms}ms (2^{} * {rto_min_ms}ms)",
+            i - 1
+        );
+    }
 
     Ok(())
 }
