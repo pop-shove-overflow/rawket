@@ -113,3 +113,70 @@ fn multiple_gaps_two_blocks() -> TestResult {
 
     Ok(())
 }
+
+// RFC 2018 §3: up to 4 SACK blocks may be sent, but timestamps reduce the
+// available option space to 3. 4 OOO segments; with TS, at most 3 SACK blocks fit.
+#[test]
+fn four_block_maximum() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"a")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let af = cap.tcp().from_a().with_data().next().ok_or_else(|| TestFail::new("no AtoB data"))?;
+    let b_rcv_nxt = af.tcp.seq + af.payload_len as u32;
+    let b_snd_nxt = af.tcp.ack;
+    pair.clear_capture();
+
+    for &i in [1u32, 3, 5, 7].iter() {
+        let seg = a_to_b(&pair, b_rcv_nxt + i, b_snd_nxt, b"x");
+        pair.inject_to_b(seg);
+        pair.transfer_one();
+    }
+
+    let cap = pair.drain_captured();
+    let max_blocks = cap.tcp().from_b().with_tcp_flags(TcpFlags::ACK)
+        .map(|f| f.tcp.opts.sack_blocks.len())
+        .max()
+        .unwrap_or(0);
+
+    // TCP options space = 40 bytes.  With timestamps (10 bytes + 2 NOP pad = 12)
+    // and SACK-Permitted already negotiated, each SACK block takes 8 bytes.
+    // Available: 40 - 12 (TS) - 2 (SACK option kind+len) = 26 bytes → 3 blocks.
+    // RFC 2018 allows max 4, but timestamps reduce that to 3.
+    assert_ok!(
+        max_blocks == 3,
+        "expected exactly 3 SACK blocks (TS limits option space to 3), got {max_blocks}"
+    );
+
+    // Most recent (offset 7) must be first per RFC 2018 §4.
+    let last_sack = cap.tcp().from_b()
+        .filter(|f| f.tcp.opts.sack_blocks.len() == 3)
+        .last()
+        .ok_or_else(|| TestFail::new("no ACK with 3 SACK blocks"))?;
+    let blocks = &last_sack.tcp.opts.sack_blocks;
+    assert_ok!(
+        blocks[0] == (b_rcv_nxt + 7, b_rcv_nxt + 8),
+        "first block {:?} should be most recent [{}, {})",
+        blocks[0], b_rcv_nxt + 7, b_rcv_nxt + 8
+    );
+
+    // All 3 blocks must have exact 1-byte boundaries from the OOO segments.
+    for &(l, r) in blocks {
+        assert_ok!(
+            r == l + 1 && [1, 3, 5, 7].contains(&(l.wrapping_sub(b_rcv_nxt))),
+            "unexpected SACK block [{l}, {r}): expected 1-byte block at offset 1, 3, 5, or 7"
+        );
+    }
+
+    let ts_on_sack = cap.tcp().from_b()
+        .filter(|f| !f.tcp.opts.sack_blocks.is_empty())
+        .all(|f| f.tcp.opts.timestamps.is_some());
+    assert_ok!(ts_on_sack, "SACK ACKs should include TS option");
+
+    Ok(())
+}
