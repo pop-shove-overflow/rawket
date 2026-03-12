@@ -156,3 +156,78 @@ fn ts_disabled_if_peer_omits() -> TestResult {
 
     Ok(())
 }
+
+// RFC 7323 §5.3 R1: segment with stale TSval (and RST not set) is treated
+// as not acceptable — "Send an acknowledgment in reply... and drop the
+// segment."
+#[test]
+fn paws_drop_stale() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"x")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let af = cap.tcp().from_a().with_data().next()
+        .ok_or_else(|| TestFail::new("no AtoB data frame"))?;
+    let a_ts_val = af.tcp.opts.timestamps.map(|(v, _)| v).unwrap_or(0);
+    // B's rcv_nxt = af.tcp.seq + af.payload_len
+    let b_rcv_nxt = af.tcp.seq + af.payload_len as u32;
+
+    // B's snd_nxt = SYN-ACK seq + 1
+    let b_snd_nxt = cap.all_tcp().from_b()
+        .with_tcp_flags(TcpFlags::SYN)
+        .last()
+        .map(|f| f.tcp.seq.wrapping_add(1))
+        .unwrap_or(0);
+
+    let ts_recent_before = pair.tcp_b().ts_recent();
+    pair.clear_capture();
+
+    // Inject NEW in-order data at B's rcv_nxt with a STALE TSval.
+    let stale = build_tcp_data_with_ts(
+        pair.mac_a, pair.mac_b,
+        pair.ip_a,  pair.ip_b,
+        12345, 80,
+        b_rcv_nxt,                    // new data at rcv_nxt
+        b_snd_nxt,
+        a_ts_val.wrapping_sub(1000),  // stale TSval
+        0,
+        b"y",
+    );
+    pair.inject_to_b(stale);
+    pair.transfer_one();
+
+    // B must NOT advance rcv_nxt — segment was dropped by PAWS.
+    let rcv_nxt_after = pair.tcp_b().rcv_nxt();
+    assert_ok!(
+        rcv_nxt_after == b_rcv_nxt,
+        "B's rcv_nxt advanced ({b_rcv_nxt} → {rcv_nxt_after}) — PAWS did not drop the segment"
+    );
+
+    // RFC 7323 §5.3 R1: "Send an acknowledgment in reply... and drop the segment."
+    // The ACK must be a duplicate ACK with ack == rcv_nxt (unchanged).
+    let cap = pair.drain_captured();
+    let ack_frame = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::ACK)
+        .without_tcp_flags(TcpFlags::SYN)
+        .next()
+        .ok_or_else(|| TestFail::new("B did not send ACK in response to PAWS-dropped segment"))?;
+    assert_ok!(
+        ack_frame.tcp.ack == b_rcv_nxt,
+        "B's PAWS ACK ({}) != rcv_nxt ({b_rcv_nxt}) — should be duplicate ACK",
+        ack_frame.tcp.ack
+    );
+
+    // ts_recent must NOT be updated by the stale segment.
+    let ts_recent_after = pair.tcp_b().ts_recent();
+    assert_ok!(
+        ts_recent_after == ts_recent_before,
+        "ts_recent changed from {ts_recent_before} to {ts_recent_after} after PAWS-dropped segment"
+    );
+
+    Ok(())
+}
