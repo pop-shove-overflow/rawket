@@ -128,3 +128,94 @@ fn partial_ack() -> TestResult {
 
     Ok(())
 }
+
+// ── dupack_count_resets ───────────────────────────────────────────────────────
+//
+// RFC 6675 §5: "If the incoming ACK is a cumulative acknowledgment, the
+// TCP MUST reset DupAcks to zero."
+//
+// Inject 2 DUPACKs (not enough for fast retransmit), then a full ACK that
+// advances snd_una; inject another 2 DUPACKs for a new segment — still no
+// retransmit (counter was reset).  A third DUPACK triggers fast retransmit.
+#[test]
+fn dupack_count_resets() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Phase 1: send "hello", blackhole to prevent real ACK.
+    pair.blackhole_to_a();
+    pair.tcp_a_mut().send(b"hello")?;
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let data_frame = cap.all_tcp().from_a().with_data().next()
+        .ok_or_else(|| TestFail::new("no AtoB data frame"))?;
+    let a_snd_una = data_frame.tcp.seq;
+    let b_snd_nxt = data_frame.tcp.ack;
+    pair.clear_impairments();
+
+    // 2 DUPACKs — must NOT trigger fast retransmit.
+    for _ in 0..2u32 {
+        let frame = b_to_a(&pair, b_snd_nxt, a_snd_una, b"");
+        pair.inject_to_a(frame);
+    }
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let retx_after_2dup = cap.all_tcp().from_a().with_data()
+        .filter(|f| f.tcp.seq == a_snd_una)
+        .count();
+    assert_ok!(retx_after_2dup == 0, "fast retransmit fired prematurely after 2 DUPACKs");
+
+    // Full ACK clears "hello" → dupack_count resets.
+    let frame = b_to_a(&pair, b_snd_nxt, a_snd_una + 5, b"");
+    pair.inject_to_a(frame);
+    pair.transfer_one();
+    pair.clear_capture();
+
+    pair.advance_both(1000);
+
+    // Phase 2: send "world", blackhole again.
+    pair.blackhole_to_a();
+    pair.tcp_a_mut().send(b"world")?;
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let world_frame = cap.all_tcp().from_a().with_data().next()
+        .ok_or_else(|| TestFail::new("no AtoB data frame for 'world'"))?;
+    let a_snd_una2 = world_frame.tcp.seq;
+    pair.clear_impairments();
+
+    // 2 DUPACKs (counter reset — no retransmit).
+    for _ in 0..2u32 {
+        let frame = b_to_a(&pair, b_snd_nxt, a_snd_una2, b"");
+        pair.inject_to_a(frame);
+    }
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let retx_after_reset_2dup = cap.all_tcp().from_a().with_data()
+        .filter(|f| f.tcp.seq == a_snd_una2)
+        .count();
+    assert_ok!(
+        retx_after_reset_2dup == 0,
+        "fast retransmit fired after only 2 DUPACKs following reset (count not reset?)"
+    );
+
+    // 3rd DUPACK — fast retransmit fires.
+    let frame = b_to_a(&pair, b_snd_nxt, a_snd_una2, b"");
+    pair.inject_to_a(frame);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let retx_after_3rd_dup = cap.all_tcp().from_a().with_data()
+        .filter(|f| f.tcp.seq == a_snd_una2)
+        .count();
+    assert_ok!(
+        retx_after_3rd_dup >= 1,
+        "fast retransmit did not fire after 3 DUPACKs (count was reset correctly but did not fire)"
+    );
+
+    Ok(())
+}
