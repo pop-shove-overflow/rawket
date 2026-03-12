@@ -363,3 +363,41 @@ fn sack_reflects_all_holes() -> TestResult {
 
     Ok(())
 }
+
+// ── drain_ooo_loop ────────────────────────────────────────────────────────────
+//
+// RFC 9293 §3.10.7.4: filling a gap drains consecutive OOO segments.
+//
+// Inject segs at +1, +2, +3; deliver +0 last. B's ACK should advance past +4.
+#[test]
+fn drain_ooo_loop() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let (b_rcv_nxt, b_snd_nxt) = baseline_seqs(&mut pair)?;
+
+    for off in [1u32, 2, 3] {
+        let seg = a_to_b(&pair, b_rcv_nxt + off, b_snd_nxt, b"x");
+        pair.inject_to_b(seg);
+        pair.transfer_one();
+    }
+
+    pair.clear_capture();
+
+    let fill = a_to_b(&pair, b_rcv_nxt, b_snd_nxt, b"x");
+    pair.inject_to_b(fill);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let max_ack = cap.tcp()
+        .direction(Dir::BtoA)
+        .map(|f| f.tcp.ack)
+        .max();
+    assert_ok!(
+        max_ack == Some(b_rcv_nxt + 4),
+        "B did not drain OOO buffer — ACK at {:?}, expected {}", max_ack, b_rcv_nxt + 4
+    );
+
+    Ok(())
+}
