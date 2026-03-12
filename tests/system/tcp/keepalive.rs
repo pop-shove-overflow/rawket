@@ -1,10 +1,9 @@
-use std::net::Ipv4Addr;
-use rawket::tcp::{State, TcpConfig, TcpError, TcpFlags, TcpSocket};
+use rawket::tcp::{State, TcpError, TcpFlags};
 use crate::{
     assert::{assert_error_fired, assert_state, assert_timestamps_present},
     assert_ok,
     capture::{Dir, ParsedFrameExt},
-    harness::{setup_network_pair, setup_tcp_pair},
+    harness::setup_tcp_pair,
     packet::build_tcp_data_with_ts,
     TestResult,
 };
@@ -411,6 +410,60 @@ fn keepalive_reset_on_ack() -> TestResult {
         "timer not reset: with_data={with_data_timeout}ms, expected ≈{no_data_timeout}ms (±20%)"
     );
     assert_state(pair2.tcp_a(), State::Closed, "A Closed after keepalive timeout")?;
+
+    Ok(())
+}
+
+// ── incoming_nonzero_payload_probe_elicits_ack ────────────────────────────────
+//
+// RFC 9293 §3.8.4: B sends a 1-byte keepalive probe (seq = rcv_nxt - 1).
+// A must ACK and must NOT advance rcv_nxt (byte outside window).
+#[test]
+fn incoming_nonzero_payload_probe_elicits_ack() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let rcv_nxt   = pair.tcp_a().rcv_nxt();
+    let b_ts_val  = pair.clock_b.monotonic_ms() as u32;
+    let b_ts_ecr  = pair.tcp_b().ts_recent();
+    let a_snd_nxt = pair.tcp_a().snd_nxt();
+    pair.clear_capture();
+
+    let frame = build_tcp_data_with_ts(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        rcv_nxt.wrapping_sub(1), // seq = rcv_nxt - 1 (keepalive probe)
+        a_snd_nxt,
+        b_ts_val,
+        b_ts_ecr,
+        &[0xAB],
+    );
+    pair.inject_to_a(frame);
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let ack_frame = cap.tcp()
+        .direction(Dir::AtoB)
+        .with_tcp_flags(TcpFlags::ACK)
+        .next()
+        .ok_or_else(|| crate::assert::TestFail::new("A did not ACK the 1-byte keepalive probe from B"))?;
+    // A's ACK must be exactly rcv_nxt (duplicate ACK — probe byte is outside window).
+    assert_ok!(
+        ack_frame.tcp.ack == rcv_nxt,
+        "A's ACK ({}) != rcv_nxt ({rcv_nxt}) — should be duplicate ACK, not advance",
+        ack_frame.tcp.ack
+    );
+
+    let rcv_nxt_after = pair.tcp_a().rcv_nxt();
+    assert_ok!(
+        rcv_nxt_after == rcv_nxt,
+        "A rcv_nxt advanced ({} → {}) after 1-byte keepalive probe — \
+         probe byte must not be delivered",
+        rcv_nxt, rcv_nxt_after
+    );
 
     Ok(())
 }
