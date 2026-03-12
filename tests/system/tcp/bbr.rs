@@ -649,3 +649,50 @@ fn bw_sample_window() -> TestResult {
 
     Ok(())
 }
+
+// ── cwnd_target_includes_bdp ───────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.4.2: BBRSetCwnd targets cwnd >= BDP =
+// max_bw * min_rtt, with a floor of BBRMinPipeCwnd = 4*MSS.
+//
+// In steady state, cwnd should be at least BDP = max_bw * min_rtt, and
+// never below the 4*MSS floor.
+#[test]
+fn cwnd_target_includes_bdp() -> TestResult {
+    let mut pair = setup_tcp_pair().profile(LinkProfile::leased_line_100m()).connect();
+
+    // Keep the pipe full so BBR measures max_bw and min_rtt.
+    pair.tcp_a_mut().send(&vec![0x88u8; 100_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0x88u8; 50_000]);
+        }
+        // Run until BBR has both max_bw and min_rtt measured.
+        p.tcp_a(0).bbr_max_bw() == 0 || p.tcp_a(0).bbr_min_rtt_ns() == u64::MAX
+    });
+
+    let cwnd = pair.tcp_a().bbr_cwnd();
+    let mss = pair.tcp_a().peer_mss() as u32;
+    let max_bw = pair.tcp_a().bbr_max_bw();
+    let min_rtt_ns = pair.tcp_a().bbr_min_rtt_ns();
+
+    assert_ok!(cwnd >= 4 * mss, "cwnd ({cwnd}) < 4*MSS ({})", 4 * mss);
+    assert_ok!(max_bw > 0, "max_bw is 0 after sustained transfer — BBR BW estimation failed");
+    assert_ok!(
+        min_rtt_ns > 0 && min_rtt_ns < u64::MAX,
+        "min_rtt_ns not measured after sustained transfer: {min_rtt_ns}"
+    );
+
+    // Use nanosecond precision for BDP to avoid truncation on sub-ms RTTs.
+    let bdp = (max_bw * min_rtt_ns / 1_000_000_000) as u32;
+    // If BDP <= 4*MSS floor, the floor dominates and BDP check is tautological.
+    if bdp > 4 * mss {
+        assert_ok!(
+            cwnd >= bdp,
+            "cwnd ({cwnd}) < BDP ({bdp}) — cwnd target should include BDP \
+             (max_bw={max_bw}, min_rtt_ns={min_rtt_ns})"
+        );
+    }
+
+    Ok(())
+}
