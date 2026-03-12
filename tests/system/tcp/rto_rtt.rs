@@ -1,7 +1,7 @@
 use rawket::{
     bridge::{Impairment, LinkProfile, PacketSpec},
     filter,
-    tcp::{State, TcpError, TcpSocket},
+    tcp::{State, TcpConfig, TcpError, TcpFlags, TcpSocket},
 };
 use crate::{
     assert::{assert_error_fired, assert_gap_approx, assert_state, assert_timestamps_present, TestFail},
@@ -154,6 +154,51 @@ fn rto_recovery_after_retransmit() -> TestResult {
     assert_ok!(
         pair.tcp_a().state == State::Established,
         "A not Established after retransmit ACK: {:?}", pair.tcp_a().state
+    );
+
+    Ok(())
+}
+
+// RFC 9293 §3.8.3 (TCP Connection Failures): excessive retransmissions close
+// the connection.
+// With max_retransmits=4 and all data dropped, socket must close with
+// error=Timeout after exactly max_retransmits+1 data sends.
+#[test]
+fn rto_max_retransmits() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .rto_min_ms(10).max_retransmits(4)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let cfg = pair.tcp_cfg.clone();
+
+    // Drop all AtoB data frames.
+    pair.add_impairment_to_b(Impairment::Drop(PacketSpec::matching(filter::tcp::has_data())));
+
+    pair.tcp_a_mut().send(b"hello")?;
+    pair.transfer_while(|p| p.tcp_a(0).state != State::Closed);
+
+    let sock_a = pair.tcp_a();
+    assert_state(sock_a, State::Closed, "A Closed after max retransmits")?;
+    assert_error_fired(sock_a, TcpError::Timeout, "A error = Timeout")?;
+
+    let cap = pair.drain_captured();
+
+    // Implementation choice: send RST to notify peer on retransmit exhaustion.
+    // RFC 9293 §3.8.3 says "close the connection" but does not mandate RST.
+    let rst_count = cap.all_tcp().from_a().with_tcp_flags(TcpFlags::RST).count();
+    assert_ok!(rst_count == 1, "expected 1 RST from A on timeout, got {rst_count}");
+
+    // Count data sends: 1 original + max_retransmits RTO retransmits.
+    // TLP (RFC 8985) may fire once before the first RTO when SRTT > 0
+    // from the handshake — it does not increment rto_count, so it is an
+    // extra send beyond the max_retransmits budget.
+    let total_data = cap.all_tcp().from_a().dropped().with_data().count();
+    let expected_rto = cfg.max_retransmits as usize + 1;
+    let tlp_count = total_data.saturating_sub(expected_rto);
+    assert_ok!(
+        tlp_count <= 1,
+        "expected {} data sends (1 + max_retransmits={}), got {total_data} ({tlp_count} extra — at most 1 TLP expected)",
+        expected_rto, cfg.max_retransmits
     );
 
     Ok(())
