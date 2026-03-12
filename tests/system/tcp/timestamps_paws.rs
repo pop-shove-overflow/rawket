@@ -231,3 +231,84 @@ fn paws_drop_stale() -> TestResult {
 
     Ok(())
 }
+
+// RFC 7323 §5 (PAWS): PAWS must handle 32-bit TSval wraparound correctly;
+// a post-wrap TSval that is forward in serial-number space is accepted.
+#[test]
+fn wraparound_accepted() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    let server = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {},
+        cfg,
+    )?;
+    np.add_tcp_b(server);
+
+    // Inject SYN with high TSval (near wrap).
+    let isn_a = 0x7000_0000u32;
+    let syn = build_tcp_syn(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a, 0,
+        0x02,
+        Some(1460), Some(4),
+        Some((0xFFFF_FF00, 0)),
+        true,
+    );
+    np.inject_to_b(syn);
+    np.transfer_one();
+
+    let cap = np.drain_captured();
+    let syn_ack = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::SYN)
+        .with_tcp_flags(TcpFlags::ACK)
+        .next()
+        .ok_or_else(|| TestFail::new("no SYN-ACK from B"))?;
+    let b_isn = syn_ack.tcp.seq;
+    let b_tsval = syn_ack.tcp.opts.timestamps.map(|(v, _)| v).unwrap_or(0);
+
+    let ack = build_tcp_data_with_ts(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a + 1, b_isn + 1,
+        0x0000_0010,
+        b_tsval,
+        &[],
+    );
+    np.inject_to_b(ack);
+    np.transfer_one();
+
+    assert_state(np.tcp_b(0), State::Established, "B Established after TS wrap handshake")?;
+
+    np.clear_capture();
+
+    // Inject data with a post-wrap TSval — must be accepted.
+    let data = build_tcp_data_with_ts(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a + 1, b_isn + 1,
+        0x0000_0020, // post-wrap TSval (forward from 0x00000010)
+        b_tsval,
+        b"wrap-ok",
+    );
+    np.inject_to_b(data);
+    np.transfer_one();
+
+    let cap = np.drain_captured();
+    let acked = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::ACK)
+        .any(|f| f.tcp.ack > isn_a + 1);
+    assert_ok!(acked, "B dropped data after TSval wrap — PAWS not handling wraparound");
+
+    assert_state(np.tcp_b(0), State::Established, "B Established after accepting wrapped TSval")?;
+
+    Ok(())
+}
