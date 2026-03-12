@@ -373,3 +373,44 @@ fn rto_max_ceiling() -> TestResult {
 
     Ok(())
 }
+
+// RFC 6298 §5.1: "Every time a packet containing data is sent (including a
+// retransmission), if the timer is not running, start it."
+// After the first send(), next_deadline_ns() should return Some (timer armed).
+#[test]
+fn rto_armed_on_first_send() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // After handshake, unacked queue is empty — RTO should be disarmed.
+    let before = pair.tcp_a().timer_state();
+    assert_ok!(
+        before.rto_ns.is_none(),
+        "RTO should be disarmed after handshake (no unacked data): {before:?}"
+    );
+
+    pair.tcp_a_mut().send(b"arm-test")?;
+    // Don't transfer — check timers immediately after send, before ACK arrives.
+
+    let after = pair.tcp_a().timer_state();
+    assert_ok!(
+        after.rto_ns.is_some(),
+        "RTO not armed after first send: {after:?}"
+    );
+    let rto_ns = after.rto_ns.unwrap();
+    assert_ok!(rto_ns > 0, "RTO deadline already expired after first send");
+
+    // RFC 6298 §2.1: "Until a round-trip time (RTT) measurement has been
+    // made [...] the sender SHOULD set RTO <- 1 second".  Our implementation
+    // uses rto_min_ms as the initial RTO (default 200ms), which is a
+    // deliberate divergence for faster recovery.  Verify it matches config.
+    let rto_ms = rto_ns / 1_000_000;
+    assert_ok!(
+        rto_ms >= pair.tcp_cfg.rto_min_ms && rto_ms <= pair.tcp_cfg.rto_max_ms,
+        "initial RTO ({rto_ms} ms) outside [{}, {}] ms",
+        pair.tcp_cfg.rto_min_ms, pair.tcp_cfg.rto_max_ms
+    );
+
+    Ok(())
+}
