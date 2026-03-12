@@ -448,3 +448,30 @@ fn rto_update_convergence() -> TestResult {
 
     Ok(())
 }
+
+// RFC 6298 §2: RTTVAR tracks the variance of RTT samples via the EWMA
+// β=1/4. On a stable link, rttvar should converge to a small value relative
+// to srtt.
+//
+// Uses a leased-line profile so link latency (~20ms RTT) dominates over
+// real-time jitter.
+#[test]
+fn rttvar_tracks_jitter() -> TestResult {
+    let mut pair = setup_tcp_pair().profile(LinkProfile::leased_line_100m()).connect();
+
+    for _ in 0..10 {
+        pair.tcp_a_mut().send(b"rttvar")?;
+        pair.transfer();
+    }
+
+    let rttvar = pair.tcp_a().rttvar_ms();
+    let srtt   = pair.tcp_a().srtt_ms();
+
+    assert_ok!(srtt > 0, "srtt not updated after 10 ACK rounds");
+    assert_ok!(
+        rttvar <= srtt,
+        "rttvar ({rttvar} ms) unreasonably large relative to srtt ({srtt} ms)"
+    );
+
+    Ok(())
+}
