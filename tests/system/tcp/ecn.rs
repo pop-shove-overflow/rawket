@@ -2,7 +2,7 @@ use std::net::Ipv4Addr;
 use rawket::{
     bridge::{Impairment, LinkProfile, PacketSpec},
     filter,
-    tcp::{State, TcpFlags, TcpSocket},
+    tcp::{State, TcpConfig, TcpFlags, TcpSocket},
 };
 use crate::{
     assert::{assert_ect0, assert_state, TestFail},
@@ -143,6 +143,72 @@ fn ce_marking_ece_cwr() -> TestResult {
     assert_ok!(
         !still_ece,
         "A still echoing ECE after receiving CWR — feedback loop not closed"
+    );
+
+    Ok(())
+}
+
+// ── ecn_disabled_if_not_supported ────────────────────────────────────────────
+//
+// RFC 3168 §6.1.1 (TCP Initialization): If the SYN-ACK does not carry ECE,
+// the connection MUST fall back to non-ECN operation.
+//
+// Inject a SYN-ACK without ECE to A (simulating a non-ECN server).
+// A must stay in Established without ECN, and must not set ECE/CWR on data.
+#[test]
+fn ecn_disabled_if_not_supported() -> TestResult {
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    // Drop all BtoA frames so B's real SYN-ACK (with ECE) never reaches A.
+    np.add_impairment_to_a(Impairment::Drop(PacketSpec::any()));
+
+    let client = TcpSocket::connect_now(
+        np.iface_a(),
+        "10.0.0.1:12345".parse().unwrap(),
+        "10.0.0.2:80".parse().unwrap(),
+        Ipv4Addr::from([10, 0, 0, 2]),
+        |_| {}, |_| {},
+        cfg,
+    )?;
+    np.add_tcp_a(client);
+
+    // Get A's ISN from its SYN (sent by connect_now).
+    let cap = np.drain_captured();
+    let a_isn = cap.tcp().from_a().with_tcp_flags(TcpFlags::SYN).next()
+        .map(|f| f.tcp.seq)
+        .ok_or_else(|| TestFail::new("no SYN from A"))?;
+
+    // Inject synthetic SYN-ACK to A — no ECE flag, simulating an ECN-unaware peer.
+    let isn_b = 0x5000_0000u32;
+    let syn_ack = build_tcp_syn(
+        np.mac_b, np.mac_a,
+        np.ip_b,  np.ip_a,
+        80, 12345,
+        isn_b,
+        a_isn + 1,
+        0x12,       // SYN|ACK only, no ECE
+        Some(1460),
+        None, None, false,
+    );
+    np.clear_impairments();
+    np.inject_to_a(syn_ack);
+    np.transfer_one();
+
+    assert_state(np.tcp_a(0), State::Established, "A state after non-ECN SYN-ACK")?;
+
+    // A sends data; must not have ECE or CWR flags.
+    np.clear_capture();
+    np.tcp_a_mut(0).send(b"hello")?;
+    np.transfer_one();
+
+    let cap = np.drain_captured();
+    let has_ecn = cap.tcp().from_a().with_data()
+        .any(|f| f.tcp.flags.has(TcpFlags::ECE) || f.tcp.flags.has(TcpFlags::CWR));
+    assert_ok!(
+        !has_ecn,
+        "A sent ECE/CWR on data frames despite ECN not being negotiated"
     );
 
     Ok(())
