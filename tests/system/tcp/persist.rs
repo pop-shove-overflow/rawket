@@ -358,3 +358,40 @@ fn persist_does_not_timeout_connection() -> TestResult {
 
     Ok(())
 }
+
+// ── persist_probe_seq ─────────────────────────────────────────────────────────
+//
+// Implementation choice: persist probe uses seq = SND.NXT - 1 (Stevens
+// convention).  RFC 9293 §3.8.6.1 requires transmitting "at least one octet
+// of new data" but does not specify the sequence number.
+#[test]
+fn persist_probe_seq() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    setup_zero_window(&mut pair)?;
+
+    pair.tcp_a_mut().send(b"world")?;
+    let snd_nxt = pair.tcp_a().snd_nxt();
+
+    let rto = pair.tcp_a().rto_ms() as i64;
+    pair.advance_both(rto + 5);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let probe = cap.tcp()
+        .direction(Dir::AtoB)
+        .filter(|f| f.payload_len == 1)
+        .next()
+        .ok_or_else(|| TestFail::new("no persist probe found"))?;
+
+    let expected_seq = snd_nxt.wrapping_sub(1);
+    assert_ok!(
+        probe.tcp.seq == expected_seq,
+        "persist probe seq ({}) != SND.NXT-1 ({expected_seq})",
+        probe.tcp.seq
+    );
+
+    Ok(())
+}
