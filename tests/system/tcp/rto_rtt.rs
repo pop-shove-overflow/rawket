@@ -7,7 +7,7 @@ use crate::{
     assert::{assert_error_fired, assert_gap_approx, assert_state, assert_timestamps_present, TestFail},
     assert_ok,
     capture::ParsedFrameExt,
-    harness::{fast_tcp_cfg, setup_network_pair, setup_tcp_pair},
+    harness::{setup_network_pair, setup_tcp_pair},
     packet::build_tcp_data,
     TestResult,
 };
@@ -94,6 +94,67 @@ fn rto_exponential_backoff() -> TestResult {
     let retx = cap.all_tcp().from_a().dropped().with_data().next()
         .ok_or_else(|| TestFail::new("no RTO retransmit frame"))?;
     assert_timestamps_present(&retx, "RTO retransmit")?;
+
+    Ok(())
+}
+
+// RFC 7323 §4.1: Timestamps enable per-segment RTT measurement. After a
+// retransmit is ACKed, timestamps allow accurate RTT sampling so RTO
+// recovers to a reasonable value (not stuck at rto_max from backoff).
+#[test]
+fn rto_recovery_after_retransmit() -> TestResult {
+    // Leased-line (~20ms RTT) so the backed-off RTO is measurably larger
+    // than the recovered value.
+    let mut pair = setup_tcp_pair()
+        .rto_min_ms(10)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Drop ALL data so neither original nor TLP probe gets through.
+    // This forces RTO to fire and back off.
+    pair.add_impairment_to_b(Impairment::Drop(PacketSpec::matching(filter::tcp::has_data())));
+    pair.tcp_a_mut().send(b"hello")?;
+
+    // RTO must be armed after send (data is unacked).
+    assert_ok!(
+        pair.tcp_a().timer_state().rto_ns.is_some(),
+        "RTO not armed after send"
+    );
+
+    // transfer_while until RTO backs off (retransmit sent).
+    let rto = pair.tcp_a().rto_ms();
+    pair.transfer_while(|p| p.tcp_a(0).rto_ms() <= rto);
+
+    let rto_backed_off = pair.tcp_a().rto_ms();
+    assert_ok!(
+        rto_backed_off > rto,
+        "RTO should be backed off after retransmit: {rto_backed_off} ms vs initial {rto} ms"
+    );
+
+    // Clear impairments so the retransmit reaches B and ACK comes back.
+    pair.clear_impairments();
+    pair.transfer();
+
+    let rto_after = pair.tcp_a().rto_ms();
+    assert_ok!(
+        rto_after < rto_backed_off,
+        "RTO did not recover: backed_off={rto_backed_off} ms, after={rto_after} ms"
+    );
+    // After recovery with all data ACKed, RTO should be disarmed (nothing
+    // left to retransmit).  If still armed, verify it's at the recovered value.
+    let timers = pair.tcp_a().timer_state();
+    if let Some(rto_remaining_ns) = timers.rto_ns {
+        let remaining_ms = rto_remaining_ns / 1_000_000;
+        assert_ok!(
+            remaining_ms <= rto_after + 1,
+            "RTO remaining ({remaining_ms} ms) > recovered rto ({rto_after} ms)"
+        );
+    }
+    // Either RTO is disarmed (all ACKed) or armed at the recovered value — both valid.
+    assert_ok!(
+        pair.tcp_a().state == State::Established,
+        "A not Established after retransmit ACK: {:?}", pair.tcp_a().state
+    );
 
     Ok(())
 }
