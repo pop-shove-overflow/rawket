@@ -1289,3 +1289,76 @@ fn startup_loss_exit_requires_6_ranges() -> TestResult {
 
     Ok(())
 }
+
+// ── probe_bw_cycle_phase_ordering ─────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.3.3: ProbeBW sub-phases cycle in strict order:
+//   DOWN → CRUISE → REFILL → UP
+// Observe at least one complete cycle and verify the required sequence.
+#[test]
+fn probe_bw_cycle_phase_ordering() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Drive enough data to traverse at least two complete ProbeBW cycles.
+    // bbr_history() records every phase transition, so we collect all
+    // ProbeBW phases from the history and verify ordering.
+    pair.tcp_a_mut().send(&vec![0x22u8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0x22u8; 2_000]);
+        }
+
+        let down_count = p.tcp_a(0).bbr_history().iter()
+            .filter(|s| s.phase == BbrPhase::ProbeBwDown)
+            .count();
+        down_count < 2
+    });
+
+    // Extract ProbeBW phases from the full history.
+    let probe_phases: Vec<BbrPhase> = pair.tcp_a().bbr_history().iter()
+        .map(|s| s.phase)
+        .filter(|p| is_probe_bw(*p))
+        .collect();
+
+    let first_down = probe_phases.iter()
+        .position(|&p| p == BbrPhase::ProbeBwDown);
+    assert_ok!(
+        first_down.is_some(),
+        "never entered ProbeBwDown; phases seen: {probe_phases:?}"
+    );
+    let start = first_down.unwrap();
+
+    // Deduplicate consecutive identical phases after the first DOWN.
+    let mut after_down: Vec<BbrPhase> = Vec::new();
+    for &p in &probe_phases[start..] {
+        if after_down.last() != Some(&p) {
+            after_down.push(p);
+        }
+    }
+
+    assert_ok!(
+        after_down.len() >= 4,
+        "too few ProbeBW transitions after first DOWN (got {}): {after_down:?}",
+        after_down.len()
+    );
+
+    // after_down[0] = DOWN, then must be CRUISE → REFILL → UP.
+    let expected = [
+        BbrPhase::ProbeBwDown,
+        BbrPhase::ProbeBwCruise,
+        BbrPhase::ProbeBwRefill,
+        BbrPhase::ProbeBwUp,
+    ];
+    for (i, &want) in expected.iter().enumerate() {
+        assert_ok!(
+            after_down[i] == want,
+            "ProbeBW cycle step {} wrong: expected {want:?}, got {:?}; full sequence: {after_down:?}",
+            i,
+            after_down[i]
+        );
+    }
+
+    Ok(())
+}
