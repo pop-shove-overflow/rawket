@@ -633,3 +633,60 @@ fn startup_pacing_gain() -> TestResult {
 
     Ok(())
 }
+
+// ── drain_pacing_gain ────────────────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.3.2: Drain pacing_gain < 1.0.
+//
+// After Startup exit, BBR enters Drain (gain < 1). Connection must survive
+// and eventually transition to ProbeBW.
+#[test]
+fn drain_pacing_gain() -> TestResult {
+    let mut pair = setup_tcp_pair().profile(LinkProfile::leased_line_100m()).connect();
+
+    let mut saw_drain = false;
+    pair.tcp_a_mut().send(&vec![0xBBu8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0xBBu8; 2_000]);
+        }
+        for snap in p.tcp_a(0).bbr_history() {
+            if snap.phase == BbrPhase::Drain {
+                saw_drain = true;
+            }
+        }
+        !saw_drain
+    });
+
+    assert_ok!(saw_drain, "never observed Drain phase");
+
+    // draft-ietf-ccwg-bbr-04 §4.3.2: Drain pacing_gain = ln(2)/2 ≈ 0.347.
+    // Verify pacing_rate/max_bw ratio in [30%, 40%].
+    let drain_snap = pair.tcp_a().bbr_history().iter()
+        .find(|s| s.phase == BbrPhase::Drain && s.max_bw > 0)
+        .cloned();
+    assert_ok!(drain_snap.is_some(), "no Drain snapshot with max_bw > 0 in bbr_history()");
+    let snap = drain_snap.unwrap();
+    let ratio_pct = snap.pacing_rate_bps * 100 / snap.max_bw.max(1);
+    assert_ok!(
+        ratio_pct >= 30 && ratio_pct <= 40,
+        "Drain pacing gain {ratio_pct}% not in [30%, 40%] (expected ~35% = ln(2)/2): \
+         rate={}, bw={}", snap.pacing_rate_bps, snap.max_bw
+    );
+
+    let phase = pair.tcp_a().bbr_phase();
+    assert_ok!(
+        matches!(
+            phase,
+            BbrPhase::Drain
+            | BbrPhase::ProbeBwDown
+            | BbrPhase::ProbeBwCruise
+            | BbrPhase::ProbeBwRefill
+            | BbrPhase::ProbeBwUp
+            | BbrPhase::ProbeRtt
+        ),
+        "BBR should be in Drain/ProbeBW/ProbeRtt after Startup exit, got {phase:?}"
+    );
+
+    Ok(())
+}
