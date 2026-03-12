@@ -144,6 +144,66 @@ pub fn build_tcp_data(
     frame
 }
 
+/// Like `build_tcp_data` but appends a Window Scale option (for testing that
+/// WS in non-SYN segments is ignored per RFC 7323 §2.2).
+pub fn build_tcp_data_with_ws(
+    src_mac:  [u8; 6],
+    dst_mac:  [u8; 6],
+    src_ip:   [u8; 4],
+    dst_ip:   [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    seq:      u32,
+    ack_num:  u32,
+    ws_shift: u8,
+    payload:  &[u8],
+) -> Vec<u8> {
+    // Options: NOP NOP TS(10) NOP WS(3) = 16 bytes → data_offset = 9
+    let tcp_opts_len = 16;
+    let tcp_hdr  = 20 + tcp_opts_len;
+    let ip_len   = 20 + tcp_hdr + payload.len();
+    let total    = 14 + ip_len;
+    let mut frame = vec![0u8; total];
+
+    frame[0..6].copy_from_slice(&dst_mac);
+    frame[6..12].copy_from_slice(&src_mac);
+    frame[12..14].copy_from_slice(&[0x08, 0x00]);
+
+    frame[14] = 0x45;
+    frame[16..18].copy_from_slice(&(ip_len as u16).to_be_bytes());
+    frame[20..22].copy_from_slice(&[0x40, 0x00]);
+    frame[22] = 64;
+    frame[23] = 6;
+    frame[26..30].copy_from_slice(&src_ip);
+    frame[30..34].copy_from_slice(&dst_ip);
+    let ip_cksum = internet_checksum(&frame[14..34]);
+    frame[24..26].copy_from_slice(&ip_cksum.to_be_bytes());
+
+    frame[34..36].copy_from_slice(&src_port.to_be_bytes());
+    frame[36..38].copy_from_slice(&dst_port.to_be_bytes());
+    frame[38..42].copy_from_slice(&seq.to_be_bytes());
+    frame[42..46].copy_from_slice(&ack_num.to_be_bytes());
+    frame[46] = 0x90; // data_offset = 9 (36 bytes)
+    frame[47] = 0x10; // ACK flag
+    frame[48..50].copy_from_slice(&65535u16.to_be_bytes());
+    // Timestamps option: NOP NOP kind=8 len=10 TSval=0 TSecr=0
+    frame[54] = 0x01; frame[55] = 0x01;
+    frame[56] = 0x08; frame[57] = 0x0a;
+    // TSval [58..62] and TSecr [62..66] are already zero
+    // Window Scale option: NOP kind=3 len=3 shift
+    frame[66] = 0x01; // NOP
+    frame[67] = 0x03; // kind = Window Scale
+    frame[68] = 0x03; // len = 3
+    frame[69] = ws_shift;
+
+    frame[70..70 + payload.len()].copy_from_slice(payload);
+
+    let tcp_cksum = tcp_checksum(src_ip, dst_ip, &frame[34..total]);
+    frame[50..52].copy_from_slice(&tcp_cksum.to_be_bytes());
+
+    frame
+}
+
 /// Build an Ethernet+IPv4+TCP frame with caller-specified flags and a zeroed
 /// Timestamps option.  TSval and TSecr are set to 0; `TcpSocketPair::inject_to_a/b`
 /// will patch them to valid clock-derived values before delivery.
