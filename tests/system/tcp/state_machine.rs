@@ -1,5 +1,5 @@
 #![allow(dead_code, unused_imports)]
-use rawket::tcp::{State, TcpError, TcpFlags, TcpSocket};
+use rawket::tcp::{State, TcpConfig, TcpError, TcpFlags, TcpSocket};
 use rawket::bridge::{Impairment, PacketSpec};
 use rawket::filter;
 use std::net::Ipv4Addr;
@@ -78,6 +78,110 @@ fn basic_handshake() -> TestResult {
 
     assert_state(pair.tcp_a(), State::Established, "client")?;
     assert_state(pair.tcp_b(), State::Established, "server")?;
+
+    Ok(())
+}
+
+// RFC 9293 §3.5 (Connection Establishment): Simultaneous open — both SYNs
+// cross in flight, both sides reach SynReceived then Established.
+#[test]
+fn simultaneous_open() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    let client = TcpSocket::connect_now(
+        np.iface_a(),
+        "10.0.0.1:12345".parse().unwrap(),
+        "10.0.0.2:80".parse().unwrap(),
+        Ipv4Addr::from([10, 0, 0, 2]),
+        |_| {}, |_| {}, cfg.clone(),
+    )?;
+    let ia = np.add_tcp_a(client);
+
+    let peer = TcpSocket::connect_now(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        "10.0.0.1:12345".parse().unwrap(),
+        Ipv4Addr::from([10, 0, 0, 1]),
+        |_| {}, |_| {}, cfg,
+    )?;
+    let ib = np.add_tcp_b(peer);
+
+    // Both SYNs cross in flight → SynReceived → SYN-ACK exchange → Established.
+    // Step through to verify SynReceived intermediate state (RFC 9293 §3.5 Fig 8).
+    // Advance past link delay so SYNs arrive, then poll once.
+    let mut saw_syn_rcvd = false;
+    np.transfer_while(|p| {
+        if p.tcp_a(ia).state == State::SynReceived
+            && p.tcp_b(ib).state == State::SynReceived
+        {
+            saw_syn_rcvd = true;
+            return false;
+        }
+        true
+    });
+    assert_ok!(saw_syn_rcvd, "never observed both sides in SynReceived");
+
+    // Complete the handshake.
+    np.transfer();
+
+    assert_state(np.tcp_a(ia), State::Established, "A")?;
+    assert_state(np.tcp_b(ib), State::Established, "B")?;
+
+    // Verify the simultaneous open handshake from captures:
+    // 2 SYNs (one from each side) + 2 SYN-ACKs + 0 RSTs.
+    let cap = np.drain_captured();
+
+    let syn_count = cap.all_tcp()
+        .filter(|f| f.tcp.flags.has(TcpFlags::SYN) && !f.tcp.flags.has(TcpFlags::ACK))
+        .count();
+    assert_ok!(syn_count == 2, "expected 2 SYNs, got {syn_count}");
+
+    let synack_count = cap.all_tcp()
+        .filter(|f| f.tcp.flags.has(TcpFlags::SYN) && f.tcp.flags.has(TcpFlags::ACK))
+        .count();
+    assert_ok!(synack_count == 2, "expected 2 SYN-ACKs, got {synack_count}");
+
+    let rst_count = cap.all_tcp()
+        .filter(|f| f.tcp.flags.has(TcpFlags::RST))
+        .count();
+    assert_ok!(rst_count == 0, "simultaneous open produced {rst_count} RST frame(s)");
+
+    // Verify SYN-ACK sequence numbers match the simultaneous open path.
+    let a_syn = cap.all_tcp().find(|f| f.dir == Dir::AtoB && f.tcp.flags.has(TcpFlags::SYN) && !f.tcp.flags.has(TcpFlags::ACK))
+        .ok_or_else(|| crate::assert::TestFail::new("no AtoB SYN"))?;
+    let b_syn = cap.all_tcp().find(|f| f.dir == Dir::BtoA && f.tcp.flags.has(TcpFlags::SYN) && !f.tcp.flags.has(TcpFlags::ACK))
+        .ok_or_else(|| crate::assert::TestFail::new("no BtoA SYN"))?;
+    let b_synack = cap.all_tcp().find(|f| f.dir == Dir::BtoA && f.tcp.flags.has(TcpFlags::SYN) && f.tcp.flags.has(TcpFlags::ACK))
+        .ok_or_else(|| crate::assert::TestFail::new("no BtoA SYN-ACK"))?;
+    let a_synack = cap.all_tcp().find(|f| f.dir == Dir::AtoB && f.tcp.flags.has(TcpFlags::SYN) && f.tcp.flags.has(TcpFlags::ACK))
+        .ok_or_else(|| crate::assert::TestFail::new("no AtoB SYN-ACK"))?;
+
+    assert_ack(&b_synack, a_syn.tcp.seq.wrapping_add(1), "B's SYN-ACK acks A's ISN")?;
+    assert_ack(&a_synack, b_syn.tcp.seq.wrapping_add(1), "A's SYN-ACK acks B's ISN")?;
+
+    // Data flow must work after simultaneous open.
+    np.clear_capture();
+    np.tcp_a_mut(ia).send(b"from-a")?;
+    np.tcp_b_mut(ib).send(b"from-b")?;
+    let result = np.transfer();
+
+    assert_state(np.tcp_a(ia), State::Established, "A after data")?;
+    assert_state(np.tcp_b(ib), State::Established, "B after data")?;
+
+    let cap = np.drain_captured();
+    let a_data = cap.tcp().filter(|f| f.dir == Dir::AtoB && f.payload_len > 0).count();
+    let b_data = cap.tcp().filter(|f| f.dir == Dir::BtoA && f.payload_len > 0).count();
+    assert_ok!(a_data > 0, "no data segments from A to B after simultaneous open");
+    assert_ok!(b_data > 0, "no data segments from B to A after simultaneous open");
+
+    // Verify app-level delivery: B received "from-a", A received "from-b".
+    let b_received = result.b.get(&ib).map(|v| v.as_slice()).unwrap_or(&[]);
+    let a_received = result.a.get(&ia).map(|v| v.as_slice()).unwrap_or(&[]);
+    assert_ok!(b_received == b"from-a", "B did not receive 'from-a': got {:?}", b_received);
+    assert_ok!(a_received == b"from-b", "A did not receive 'from-b': got {:?}", a_received);
 
     Ok(())
 }
