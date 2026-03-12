@@ -197,3 +197,75 @@ fn persist_exponential_backoff() -> TestResult {
 
     Ok(())
 }
+
+// ── window_open_clears_persist ────────────────────────────────────────────────
+//
+// RFC 9293 §3.8.6.1: persist timer disarms when window reopens.
+//
+// After the first probe, inject a window-open ACK.  No further probes should
+// appear (persist timer disarmed).
+#[test]
+fn window_open_clears_persist() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let (a_snd_una, b_snd_nxt) = setup_zero_window(&mut pair)?;
+
+    pair.tcp_a_mut().send(b"world")?;
+
+    let rto = pair.tcp_a().rto_ms() as i64;
+    pair.advance_both(rto + 5);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let probes_before = cap.tcp()
+        .direction(Dir::AtoB)
+        .filter(|f| f.payload_len == 1)
+        .count();
+    assert_ok!(probes_before >= 1, "first persist probe not sent");
+
+    // Open the window.
+    let open = build_tcp_data(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        b_snd_nxt,
+        a_snd_una,
+        b"",
+    );
+    pair.inject_to_a(open);
+    pair.transfer_one();
+
+    // Verify persist disarmed after window opens.
+    let timers = pair.tcp_a().timer_state();
+    assert_ok!(timers.persist_ns.is_none(), "persist still armed after window open: {timers:?}");
+
+    pair.clear_capture();
+
+    pair.advance_both(rto * 2 + 15);
+    pair.transfer_one();
+
+    let cap2 = pair.drain_captured();
+    let probes_after = cap2.tcp()
+        .direction(Dir::AtoB)
+        .filter(|f| f.payload_len == 1)
+        .count();
+    assert_ok!(
+        probes_after == 0,
+        "persist probe fired after window opened ({probes_after} probes)"
+    );
+
+    // Data should resume now that the window is open.
+    let data_sent = cap2.tcp()
+        .direction(Dir::AtoB)
+        .with_data()
+        .map(|f| f.payload_len)
+        .sum::<usize>();
+    assert_ok!(
+        data_sent > 0,
+        "no data sent after window opened — send buffer should have drained"
+    );
+
+    Ok(())
+}
