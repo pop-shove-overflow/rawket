@@ -471,3 +471,108 @@ fn rst_exact_match_resets() -> TestResult {
 
     Ok(())
 }
+
+// RFC 5961 §3.2 (RST Robustness): In-window RST with SEQ != RCV.NXT must
+// trigger a challenge ACK instead of resetting the connection.
+#[test]
+fn rst_in_window_challenge_ack() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"x")?;
+    pair.transfer();
+
+    let a_snd_nxt = pair.tcp_a().snd_nxt();
+
+    let b_snd_nxt = pair.drain_captured().tcp()
+        .find(|f| f.dir == Dir::AtoB && f.payload_len > 0)
+        .map(|f| f.tcp.ack)
+        .ok_or_else(|| crate::assert::TestFail::new("no AtoB data frame"))?;
+
+    // RST with SEQ just past the exact match — in-window but not exact.
+    let rst = build_tcp_rst(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        b_snd_nxt + 1,
+    );
+    pair.clear_capture();
+    pair.inject_to_a(rst);
+    pair.transfer();
+
+    assert_state(pair.tcp_a(), State::Established, "A must stay Established after in-window-but-not-exact RST")?;
+
+    let cap = pair.drain_captured();
+    // Filter for pure ACK: has ACK but not SYN/RST/FIN.
+    let challenge = cap.tcp()
+        .find(|f| f.dir == Dir::AtoB
+            && f.tcp.flags.has(TcpFlags::ACK)
+            && !f.tcp.flags.has(TcpFlags::SYN)
+            && !f.tcp.flags.has(TcpFlags::RST)
+            && !f.tcp.flags.has(TcpFlags::FIN)
+            && f.payload_len == 0);
+    assert_ok!(challenge.is_some(), "A did not send challenge ACK for in-window RST");
+    let challenge = challenge.unwrap();
+
+    // RFC 9293 §3.10.7.4: challenge ACK carries SEQ=SND.NXT, ACK=RCV.NXT.
+    assert_ok!(
+        challenge.tcp.seq == a_snd_nxt,
+        "challenge ACK SEQ={} != SND.NXT={a_snd_nxt}",
+        challenge.tcp.seq
+    );
+    assert_ok!(
+        challenge.tcp.ack == b_snd_nxt,
+        "challenge ACK ACK={} != RCV.NXT={b_snd_nxt}",
+        challenge.tcp.ack
+    );
+
+    // Exactly 1 challenge ACK expected.
+    let ack_count = cap.tcp()
+        .filter(|f| f.dir == Dir::AtoB
+            && f.tcp.flags.has(TcpFlags::ACK)
+            && !f.tcp.flags.has(TcpFlags::SYN)
+            && !f.tcp.flags.has(TcpFlags::RST)
+            && !f.tcp.flags.has(TcpFlags::FIN)
+            && f.payload_len == 0)
+        .count();
+    assert_ok!(ack_count == 1, "expected exactly 1 challenge ACK, got {ack_count}");
+
+    // Test deeper in-window RST — midway through receive window.
+    pair.clear_capture();
+    let rst_deep = build_tcp_rst(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        b_snd_nxt.wrapping_add(1000),
+    );
+    pair.clear_capture();
+    pair.inject_to_a(rst_deep);
+    pair.transfer();
+
+    assert_state(pair.tcp_a(), State::Established, "A must stay Established after deeper in-window RST")?;
+
+    let cap2 = pair.drain_captured();
+    let deep_challenge = cap2.tcp()
+        .find(|f| f.dir == Dir::AtoB
+            && f.tcp.flags.has(TcpFlags::ACK)
+            && !f.tcp.flags.has(TcpFlags::SYN)
+            && !f.tcp.flags.has(TcpFlags::RST)
+            && !f.tcp.flags.has(TcpFlags::FIN)
+            && f.payload_len == 0);
+    assert_ok!(deep_challenge.is_some(), "A did not send challenge ACK for deeper in-window RST");
+    let deep_challenge = deep_challenge.unwrap();
+    assert_ok!(
+        deep_challenge.tcp.seq == a_snd_nxt,
+        "deep challenge ACK SEQ={} != SND.NXT={a_snd_nxt}",
+        deep_challenge.tcp.seq
+    );
+    assert_ok!(
+        deep_challenge.tcp.ack == b_snd_nxt,
+        "deep challenge ACK ACK={} != RCV.NXT={b_snd_nxt}",
+        deep_challenge.tcp.ack
+    );
+
+    Ok(())
+}
