@@ -380,3 +380,64 @@ fn sack_not_sent_without_permitted() -> TestResult {
 
     Ok(())
 }
+
+// RFC 2018 §4: most recently received OOO segment's SACK block must be first.
+#[test]
+fn most_recent_block_first() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"a")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let af = cap.tcp().from_a().with_data().next().ok_or_else(|| TestFail::new("no AtoB data"))?;
+    let b_rcv_nxt = af.tcp.seq + af.payload_len as u32;
+    let b_snd_nxt = af.tcp.ack;
+    pair.clear_capture();
+
+    // Inject first OOO at +1.
+    let seg1 = a_to_b(&pair, b_rcv_nxt + 1, b_snd_nxt, b"a");
+    pair.inject_to_b(seg1);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let first_sack = cap.tcp().from_b()
+        .filter(|f| !f.tcp.opts.sack_blocks.is_empty())
+        .last()
+        .ok_or_else(|| TestFail::new("no SACK ACK from B after first OOO segment"))?;
+    let has_seg1 = first_sack.tcp.opts.sack_blocks.iter()
+        .any(|&(l, r)| l == b_rcv_nxt + 1 && r == b_rcv_nxt + 2);
+    assert_ok!(has_seg1, "first SACK missing exact block for seg1: {:?}", first_sack.tcp.opts.sack_blocks);
+
+    pair.clear_capture();
+
+    // Inject second OOO at +3 (most recent).
+    let seg2 = a_to_b(&pair, b_rcv_nxt + 3, b_snd_nxt, b"b");
+    pair.inject_to_b(seg2);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let sack_ack = cap.tcp().from_b()
+        .filter(|f| !f.tcp.opts.sack_blocks.is_empty())
+        .last()
+        .ok_or_else(|| TestFail::new("no SACK ACK from B after second OOO segment"))?;
+    let blocks = &sack_ack.tcp.opts.sack_blocks;
+    assert_ok!(blocks.len() == 2, "expected 2 SACK blocks, got {}: {:?}", blocks.len(), blocks);
+
+    let has_seg1 = blocks.iter().any(|&(l, r)| l == b_rcv_nxt + 1 && r == b_rcv_nxt + 2);
+    let has_seg2 = blocks.iter().any(|&(l, r)| l == b_rcv_nxt + 3 && r == b_rcv_nxt + 4);
+    assert_ok!(has_seg1, "SACK missing exact block for seg1: {:?}", blocks);
+    assert_ok!(has_seg2, "SACK missing exact block for seg2: {:?}", blocks);
+
+    // RFC 2018 §4: most recently received block must be first.
+    assert_ok!(
+        blocks[0] == (b_rcv_nxt + 3, b_rcv_nxt + 4),
+        "first SACK block {:?} is not seg2 [{}, {}) — most recent must be first",
+        blocks[0], b_rcv_nxt + 3, b_rcv_nxt + 4
+    );
+
+    Ok(())
+}
