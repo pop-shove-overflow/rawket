@@ -62,3 +62,32 @@ fn negotiation() -> TestResult {
 
     Ok(())
 }
+
+// RFC 7323 §4.1 (RTT Measurement): B's ACK for A's data must echo A's TSval
+// in its TSecr.
+#[test]
+fn ts_ecr_reflects_tsval() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"x")?;
+    pair.transfer();
+
+    let cap2 = pair.drain_captured();
+    let a_tsval = cap2.tcp().from_a().with_data()
+        .find_map(|f| f.tcp.opts.timestamps.map(|(v, _)| v))
+        .ok_or_else(|| TestFail::new("no timestamps in A's data frame"))?;
+    let b_tsecr = cap2.tcp().from_b()
+        .with_tcp_flags(TcpFlags::ACK)
+        .find_map(|f| f.tcp.opts.timestamps.map(|(_, ecr)| ecr))
+        .ok_or_else(|| TestFail::new("no timestamped ACK from B"))?;
+
+    assert_ok!(
+        b_tsecr == a_tsval,
+        "B's TSecr ({b_tsecr}) should equal A's TSval ({a_tsval})"
+    );
+
+    Ok(())
+}
