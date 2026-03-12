@@ -66,3 +66,50 @@ fn basic_ooo_one_gap() -> TestResult {
 
     Ok(())
 }
+
+// RFC 2018 §3: each contiguous OOO region generates a separate SACK block.
+// 2 OOO segments with a gap between them — B should SACK both blocks.
+#[test]
+fn multiple_gaps_two_blocks() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"a")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let af = cap.tcp().from_a().with_data().next().ok_or_else(|| TestFail::new("no AtoB data"))?;
+    let b_rcv_nxt = af.tcp.seq + af.payload_len as u32;
+    let b_snd_nxt = af.tcp.ack;
+    pair.clear_capture();
+
+    let seg_b = a_to_b(&pair, b_rcv_nxt + 1, b_snd_nxt, b"b");
+    let seg_d = a_to_b(&pair, b_rcv_nxt + 3, b_snd_nxt, b"d");
+
+    pair.inject_to_b(seg_b);
+    pair.inject_to_b(seg_d);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let sack_acks: Vec<_> = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::ACK)
+        .filter(|f| !f.tcp.opts.sack_blocks.is_empty())
+        .collect();
+    assert_ok!(!sack_acks.is_empty(), "B sent no SACK ACKs for two OOO segments");
+
+    let last_sack = sack_acks.last().unwrap();
+    let blocks = &last_sack.tcp.opts.sack_blocks;
+    assert_ok!(blocks.len() == 2, "expected 2 SACK blocks, got {}: {:?}", blocks.len(), blocks);
+
+    // Exact SACK block boundaries: seg_b = [rcv_nxt+1, rcv_nxt+2), seg_d = [rcv_nxt+3, rcv_nxt+4).
+    let has_b = blocks.iter().any(|&(l, r)| l == b_rcv_nxt + 1 && r == b_rcv_nxt + 2);
+    let has_d = blocks.iter().any(|&(l, r)| l == b_rcv_nxt + 3 && r == b_rcv_nxt + 4);
+    assert_ok!(has_b, "SACK missing exact block for seg_b [{}, {}): {:?}",
+        b_rcv_nxt + 1, b_rcv_nxt + 2, blocks);
+    assert_ok!(has_d, "SACK missing exact block for seg_d [{}, {}): {:?}",
+        b_rcv_nxt + 3, b_rcv_nxt + 4, blocks);
+
+    Ok(())
+}
