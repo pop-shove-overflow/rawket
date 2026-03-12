@@ -1166,3 +1166,54 @@ fn cruise_refill_pacing_gain() -> TestResult {
 
     Ok(())
 }
+
+// ── beta_070_multiplicative_decrease ──────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §5.5: BBRAdaptLowerBounds applies Beta=0.7
+// multiplicative decrease to bw_shortterm on sustained loss.
+//
+// On instant link with sustained 10% loss, Beta compounds 2-4 times per
+// ProbeBW cycle before REFILL resets.  Track the ratio between max_bw and
+// the lowest observed bw_shortterm.  With 2 rounds of Beta=0.7: ratio ≈ 49%.
+// Assert [20%, 55%] — rejects Beta=0.9 (0.9²=81%) and gross errors.
+#[test]
+fn beta_070_multiplicative_decrease() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .rto_min_ms(10).max_retransmits(100).rto_max_ms(200)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    pair.loss_to_b(0.10);
+
+    drive_to_probe_bw(&mut pair)?;
+
+    let mut min_ratio_pct = u64::MAX;
+    pair.tcp_a_mut().send(&vec![0x77u8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0x77u8; 2_000]);
+        }
+        for snap in p.tcp_a(0).bbr_history() {
+            if snap.bw_shortterm != u64::MAX && snap.bw_shortterm > 0 && snap.max_bw > 0 {
+                let ratio = snap.bw_shortterm * 100 / snap.max_bw;
+                min_ratio_pct = min_ratio_pct.min(ratio);
+            }
+        }
+        min_ratio_pct > 75
+    });
+
+    assert_ok!(
+        min_ratio_pct < u64::MAX,
+        "bw_shortterm never reduced from sentinel — Beta not observed under 10% loss"
+    );
+
+    // Beta=0.7: on a latency link, one application per cycle gives ratio ≈70%.
+    // On faster links, Beta compounds 2+ times: 0.7²=49%, 0.7³=34%.
+    // Upper bound 75% rejects Beta ≥ 0.8; lower bound 20% rejects Beta ≤ 0.45.
+    assert_ok!(
+        min_ratio_pct >= 20 && min_ratio_pct <= 75,
+        "bw_shortterm/max_bw min ratio {min_ratio_pct}% outside [20%, 75%] — \
+         expected Beta=0.7 (0.7^1=70%, 0.7^2=49%, 0.7^3=34%)"
+    );
+
+    Ok(())
+}
