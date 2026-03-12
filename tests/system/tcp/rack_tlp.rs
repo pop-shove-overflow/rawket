@@ -1,0 +1,107 @@
+use rawket::{
+    bridge::{Impairment, LinkProfile, Loss, PacketSpec},
+    filter,
+    tcp::TcpSocket,
+};
+use crate::{
+    assert::{TestFail, assert_timestamps_present},
+    assert_ok,
+    capture::ParsedFrameExt,
+    harness::{fast_tcp_cfg, setup_network_pair, setup_tcp_pair},
+    packet::build_tcp_data_with_sack,
+    TestResult,
+};
+use std::net::Ipv4Addr;
+
+// RFC 8985 §6.2 (Upon Receiving an ACK): RACK detects loss when a higher-seq
+// segment is ACKed but a lower-seq segment is still unacked. Drop seg2, let
+// seg3 through, verify A retransmits seg2.
+#[test]
+fn rack_basic_loss_detection() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Phase 1: seed BBR/SRTT.
+    pair.tcp_a_mut().send(b"seg1-data-xxxxxxxxxx")?;
+    pair.transfer();
+    pair.clear_capture();
+
+    let rack_end_before = pair.tcp_a().rack_end_seq();
+
+    // Drop the 1st data segment from A (seg2).
+    pair.add_impairment_to_b(Impairment::Drop(PacketSpec::nth_matching(1, filter::tcp::has_data())));
+
+    // Send seg2+seg3, clear impairments, then transfer drives SACK→RACK recovery.
+    pair.tcp_a_mut().send(b"seg2-dropped-xxxxxxx")?;
+    pair.tcp_a_mut().send(b"seg3-xxxxxxxxxxxxxxxxx")?;
+    pair.clear_impairments();
+    pair.transfer();
+
+    // Verify seg2 appeared at least twice (original dropped + RACK retransmit).
+    let cap = pair.drain_captured();
+    let seg2_seq = cap.all_tcp()
+        .from_a()
+        .dropped()
+        .with_data()
+        .next()
+        .map(|f| f.tcp.seq)
+        .ok_or_else(|| TestFail::new("no dropped AtoB data frame for seg2"))?;
+
+    let seg2_count = cap.all_tcp().from_a().with_data()
+        .filter(|f| f.tcp.seq == seg2_seq)
+        .count();
+    assert_ok!(
+        seg2_count >= 2,
+        "expected ≥2 frames with seg2 seq={seg2_seq} (dropped+RACK retransmit), got {seg2_count}"
+    );
+
+    // Verify retransmit was delivered (not dropped).
+    let delivered = cap.all_tcp().from_a().delivered().with_data()
+        .filter(|f| f.tcp.seq == seg2_seq)
+        .count();
+    assert_ok!(
+        delivered >= 1,
+        "RACK retransmit of seg2 seq={seg2_seq} was never delivered"
+    );
+
+    assert_ok!(
+        pair.tcp_a().state == rawket::tcp::State::Established,
+        "A not Established after RACK retransmit: {:?}", pair.tcp_a().state
+    );
+
+    // RACK state must have advanced past the recovered segment.
+    let rack_end_after = pair.tcp_a().rack_end_seq();
+    assert_ok!(
+        rack_end_after > rack_end_before,
+        "rack_end_seq did not advance after RACK loss detection: before={rack_end_before}, after={rack_end_after}"
+    );
+
+    // The retransmit was triggered by RACK, not RTO.  Proof:
+    // 1. rack_end_seq advanced (checked above)
+    // 2. B sent a SACK indicating the gap
+    // 3. Retransmit timing: from original send to retransmit must be < RTO.
+    //    RACK fires after SACK arrival (~1 RTT) + reo_wnd (min_rtt/4),
+    //    which is ~1.25 RTT — well under RTO.
+    let sack_count = cap.tcp().from_b()
+        .filter(|f| f.tcp.opts.sack_blocks.len() > 0)
+        .count();
+    assert_ok!(sack_count > 0, "no SACK from B — RACK had no loss signal");
+
+    let original_ts = cap.all_tcp().from_a().dropped().with_data()
+        .find(|f| f.tcp.seq == seg2_seq)
+        .map(|f| f.ts_ns);
+    let retx_ts = cap.all_tcp().from_a().delivered().with_data()
+        .find(|f| f.tcp.seq == seg2_seq)
+        .map(|f| f.ts_ns);
+    assert_ok!(original_ts.is_some(), "dropped seg2 timestamp missing");
+    assert_ok!(retx_ts.is_some(), "retransmit seg2 timestamp missing");
+    let gap_ms = (retx_ts.unwrap() - original_ts.unwrap()) / 1_000_000;
+    let rto = pair.tcp_a().rto_ms();
+    assert_ok!(
+        gap_ms < rto,
+        "original→retransmit gap {gap_ms}ms >= RTO ({rto}ms) — looks like RTO, not RACK"
+    );
+
+    Ok(())
+}
