@@ -368,3 +368,59 @@ fn probe_rtt_cwnd_reduced() -> TestResult {
     assert_ok!(false, "ProbeRtt found during transfer but not in final history");
     Ok(())
 }
+
+// ── cwnd_floor_after_loss ──────────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §5.6.3: BBRBoundCwndForModel applies
+// inflight_shortterm as an upper bound (ceiling), not a floor.
+// The only cwnd floor is BBRMinPipeCwnd = 4*MSS.
+#[test]
+fn cwnd_floor_after_loss() -> TestResult {
+    // Clean handshake on leased-line, then add 10% loss.
+    let mut pair = setup_tcp_pair()
+        .max_retransmits(100)
+        .rto_max_ms(200)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    pair.loss_to_b(0.10);
+
+    drive_to_probe_bw(&mut pair)?;
+
+    let mss = pair.tcp_a().peer_mss() as u32;
+    let mut saw_down_cruise = false;
+    let mut floor_violated_cwnd = 0u32;
+    let mut floor_violated_floor = 0u32;
+
+    pair.tcp_a_mut().send(&vec![0x88u8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0x88u8; 2_000]);
+        }
+        for snap in p.tcp_a(0).bbr_history() {
+            if matches!(snap.phase, BbrPhase::ProbeBwDown | BbrPhase::ProbeBwCruise) {
+                saw_down_cruise = true;
+                let floor = 4 * mss;
+                if snap.cwnd < floor && floor_violated_cwnd == 0 {
+                    floor_violated_cwnd = snap.cwnd;
+                    floor_violated_floor = floor;
+                }
+            }
+        }
+        !saw_down_cruise
+    });
+
+    assert_ok!(
+        pair.tcp_a().state == rawket::tcp::State::Established,
+        "A not Established after sustained loss"
+    );
+    assert_ok!(
+        saw_down_cruise,
+        "never observed ProbeBW_DOWN/CRUISE during sustained loss"
+    );
+    assert_ok!(
+        floor_violated_cwnd == 0,
+        "cwnd ({floor_violated_cwnd}) < floor ({floor_violated_floor}) during ProbeBW_DOWN/CRUISE"
+    );
+
+    Ok(())
+}
