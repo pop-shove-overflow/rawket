@@ -179,3 +179,44 @@ fn data_resets_timer() -> TestResult {
 
     Ok(())
 }
+
+// ── no_probe_in_non_established ───────────────────────────────────────────────
+//
+// Implementation choice: keepalive probes only fire in Established.
+// RFC 1122 §4.2.3.6 does not explicitly restrict keepalives to Established.
+// After B sends FIN and A enters CloseWait, verify no probes fire.
+#[test]
+fn no_probe_in_non_established() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .keepalive_idle_ms(50)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_b_mut().close()?;
+    pair.transfer_while(|p| p.tcp_a(0).state != State::CloseWait);
+    assert_state(pair.tcp_a(), State::CloseWait, "A CloseWait")?;
+    let snd_una = pair.tcp_a().snd_una();
+
+    pair.clear_capture();
+
+    pair.advance_both(200);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let probes = cap.tcp()
+        .direction(Dir::AtoB)
+        .filter(|f| f.payload_len == 0
+            && f.tcp.flags.has(TcpFlags::ACK)
+            && !f.tcp.flags.has(TcpFlags::SYN)
+            && !f.tcp.flags.has(TcpFlags::FIN)
+            && !f.tcp.flags.has(TcpFlags::RST)
+            && f.tcp.seq == snd_una.wrapping_sub(1))
+        .count();
+    assert_ok!(
+        probes == 0,
+        "keepalive probes fired in CloseWait ({probes} probes)"
+    );
+
+    Ok(())
+}
