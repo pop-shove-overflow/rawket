@@ -210,3 +210,48 @@ fn rst_in_established() -> TestResult {
 
     Ok(())
 }
+
+// RFC 5961 §3.2 (RST Robustness): Out-of-window RST must be silently dropped.
+#[test]
+fn rst_with_invalid_seq() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let (mut pair, cap) = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect_and_capture();
+
+    let synack = cap.all_tcp()
+        .find(|f| f.tcp.flags.has(TcpFlags::SYN) && f.tcp.flags.has(TcpFlags::ACK))
+        .ok_or_else(|| crate::assert::TestFail::new("no SYN-ACK in capture"))?;
+
+    let rcv_nxt = synack.tcp.seq.wrapping_add(1);
+    let wscale = synack.tcp.opts.window_scale.unwrap_or(0);
+    let rcv_wnd_scaled = (synack.tcp.window_raw as u32) << wscale;
+    let invalid_seq = rcv_nxt.wrapping_add(16 << 20);
+    let offset = invalid_seq.wrapping_sub(rcv_nxt);
+    assert_ok!(
+        offset > rcv_wnd_scaled,
+        "invalid_seq offset {offset} is within receive window {rcv_wnd_scaled} — test scenario invalid"
+    );
+
+    let rst = build_tcp_rst(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        invalid_seq,
+    );
+    pair.clear_capture();
+    pair.inject_to_a(rst);
+    pair.transfer();
+
+    assert_state(pair.tcp_a(), State::Established, "client")?;
+    assert_ok!(
+        pair.tcp_a().last_error.is_none(),
+        "out-of-window RST should not set error, got {:?}", pair.tcp_a().last_error
+    );
+
+    let cap = pair.drain_captured();
+    let a_sent = cap.tcp().direction(Dir::AtoB).count();
+    assert_ok!(a_sent == 0, "A sent {a_sent} frame(s) in response to out-of-window RST — expected 0");
+
+    Ok(())
+}
