@@ -815,3 +815,68 @@ fn pacing_gain_per_phase() -> TestResult {
 
     Ok(())
 }
+
+// ── prior_cwnd_restored_after_probe_rtt ───────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.3.4, §4.3.4.6: on entering ProbeRTT,
+// prior_cwnd = cwnd; on exit (BBRExitProbeRTT), cwnd = max(cwnd, prior_cwnd).
+#[test]
+fn prior_cwnd_restored_after_probe_rtt() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Drive to ProbeBW to grow cwnd above 4*MSS.
+    drive_to_probe_bw(&mut pair)?;
+
+    let mss = pair.tcp_a().peer_mss() as u32;
+    let pre_probe_cwnd = pair.tcp_a().bbr_cwnd();
+    assert_ok!(
+        pre_probe_cwnd > 4 * mss,
+        "cwnd before ProbeRtt ({pre_probe_cwnd}) not > 4*MSS — test scenario invalid"
+    );
+
+    // Advance past probe_rtt_interval (5s) to trigger ProbeRtt.
+    pair.advance_both(6_000);
+
+    // Drive through ProbeRtt entry and exit via transfer_while,
+    // capturing prior_cwnd and post-exit cwnd from snapshots.
+    let mut entered_probe_rtt = false;
+    let mut exited = false;
+    let mut probe_rtt_prior = 0u32;
+    let mut post_probe_rtt_cwnd = 0u32;
+    pair.tcp_a_mut().send(&vec![0x44u8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0x44u8; 2_000]);
+        }
+        for snap in p.tcp_a(0).bbr_history() {
+            if snap.phase == BbrPhase::ProbeRtt {
+                entered_probe_rtt = true;
+                probe_rtt_prior = snap.prior_cwnd;
+            } else if entered_probe_rtt && is_probe_bw(snap.phase) && !exited {
+                exited = true;
+                post_probe_rtt_cwnd = snap.cwnd;
+            }
+        }
+        !exited
+    });
+
+    assert_ok!(entered_probe_rtt, "never entered ProbeRtt — test scenario invalid");
+    assert_ok!(exited, "never exited ProbeRtt — test scenario invalid");
+
+    assert_ok!(
+        probe_rtt_prior > 4 * mss,
+        "prior_cwnd ({probe_rtt_prior}) should be > 4*MSS after entering ProbeRtt"
+    );
+    // Spec §4.3.4.6 BBRExitProbeRTT: cwnd = max(cwnd, prior_cwnd).
+    // On a lossless link the model bounds (inflight_shortterm/longterm)
+    // are MAX, so cwnd should be restored to at least prior_cwnd.
+    assert_ok!(
+        post_probe_rtt_cwnd >= probe_rtt_prior,
+        "cwnd after ProbeRtt exit ({post_probe_rtt_cwnd}) < prior_cwnd ({probe_rtt_prior}) — \
+         spec requires max(cwnd, prior_cwnd)"
+    );
+
+    Ok(())
+}
