@@ -1,9 +1,9 @@
-use rawket::tcp::{State, TcpFlags, TcpSocket};
+use rawket::tcp::{State, TcpConfig, TcpFlags, TcpSocket};
 use crate::{
     assert::{assert_timestamps_present, assert_state, TestFail},
     assert_ok,
     capture::ParsedFrameExt,
-    harness::{fast_tcp_cfg, setup_network_pair, setup_tcp_pair},
+    harness::{setup_network_pair, setup_tcp_pair},
     packet::{build_tcp_data, build_tcp_data_with_ts, build_tcp_syn},
     TestResult,
 };
@@ -87,6 +87,71 @@ fn ts_ecr_reflects_tsval() -> TestResult {
     assert_ok!(
         b_tsecr == a_tsval,
         "B's TSecr ({b_tsecr}) should equal A's TSval ({a_tsval})"
+    );
+
+    Ok(())
+}
+
+// RFC 7323 §3.2 (Timestamps Negotiation): When client SYN has no TS option,
+// server must not use timestamps on data.
+#[test]
+fn ts_disabled_if_peer_omits() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    let server = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {},
+        cfg,
+    )?;
+    np.add_tcp_b(server);
+
+    // Inject SYN without Timestamps option.
+    let isn_a = 0x3000_0000u32;
+    let syn = build_tcp_syn(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a, 0,
+        0x02,
+        Some(1460), None, None, false,
+    );
+    np.inject_to_b(syn);
+    np.transfer_one();
+
+    let cap = np.drain_captured();
+    let syn_ack = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::SYN)
+        .with_tcp_flags(TcpFlags::ACK)
+        .next()
+        .ok_or_else(|| TestFail::new("no SYN-ACK from B"))?;
+
+    let ack = build_tcp_data(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a + 1,
+        syn_ack.tcp.seq + 1,
+        &[],
+    );
+    np.inject_to_b(ack);
+    np.transfer_one();
+
+    assert_state(np.tcp_b(0), State::Established, "B state after handshake without peer TS")?;
+    np.clear_capture();
+
+    // Push data from B; data frames must not carry TS options.
+    let big = vec![0xabu8; 500];
+    np.tcp_b_mut(0).send(&big)?;
+
+    let cap = np.drain_captured();
+    let has_ts = cap.tcp().from_b().with_data().any(|f| f.tcp.opts.timestamps.is_some());
+    assert_ok!(
+        !has_ts,
+        "B sent data frames with Timestamps option despite peer omitting TS"
     );
 
     Ok(())
