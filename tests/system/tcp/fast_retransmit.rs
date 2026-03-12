@@ -417,3 +417,72 @@ fn fast_retransmit_with_sack() -> TestResult {
 
     Ok(())
 }
+
+// ── dupack_during_zero_window ───────────────────────────────────────────
+//
+// RFC 5681 §2: a duplicate ACK requires "outstanding data" (condition a:
+// snd_una != snd_nxt).  When the peer advertises zero window, new data
+// queued via send() cannot be transmitted (peer window gate in
+// flush_send_buf), so snd_nxt == snd_una — there is no outstanding data.
+// DUPACKs in this state fail condition (a) and do not trigger fast
+// retransmit.
+#[test]
+fn dupack_during_zero_window() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"x")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let data_frame = cap.tcp().from_a().with_data().next()
+        .ok_or_else(|| TestFail::new("no AtoB data"))?;
+    let a_snd_una = data_frame.tcp.seq + 1;
+    let b_snd_nxt = data_frame.tcp.ack;
+
+    // Inject zero-window ACK.
+    let mut zw = b_to_a(&pair, b_snd_nxt, a_snd_una, b"");
+    zw[48] = 0; zw[49] = 0;
+    recompute_frame_tcp_checksum(&mut zw);
+    pair.inject_to_a(zw);
+    pair.transfer_one();
+
+    // Verify A processed the zero-window ACK.
+    assert_ok!(
+        pair.tcp_a().snd_wnd() == 0,
+        "snd_wnd should be 0 after zero-window ACK, got {}", pair.tcp_a().snd_wnd()
+    );
+
+    pair.advance_both(1000);
+    pair.tcp_a_mut().send(b"world")?;
+
+    pair.clear_capture();
+
+    // Inject 3 DUPACKs with zero window.
+    for _ in 0..3u32 {
+        let mut dup = b_to_a(&pair, b_snd_nxt, a_snd_una, b"");
+        dup[48] = 0; dup[49] = 0;
+        recompute_frame_tcp_checksum(&mut dup);
+        pair.inject_to_a(dup);
+    }
+    pair.transfer_one();
+
+    // No outstanding data (snd_nxt == snd_una), so DUPACKs fail RFC 5681
+    // condition (a) and fast retransmit does not fire.
+    let cap = pair.drain_captured();
+    let data_retx = cap.all_tcp().from_a()
+        .filter(|f| f.payload_len > 0)
+        .count();
+    assert_ok!(
+        data_retx == 0,
+        "data sent during zero window ({data_retx} segments) — no outstanding data, so no retransmit"
+    );
+
+    assert_ok!(
+        pair.tcp_a().state == rawket::tcp::State::Established,
+        "A not Established: {:?}", pair.tcp_a().state
+    );
+
+    Ok(())
+}
