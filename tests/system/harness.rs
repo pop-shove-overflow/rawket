@@ -30,6 +30,7 @@ use rawket::{
 };
 
 use crate::capture::{CaptureBuffer, CapturedFrame, Dir};
+use crate::packet::build_tcp_data;
 
 // ── Transfer result types ────────────────────────────────────────────────────
 
@@ -814,9 +815,6 @@ fn test_network_config() -> NetworkConfig {
 /// Build a conformant A→B TCP data frame (timestamps filled in by patcher at injection).
 /// Ports: 12345 (client) → 80 (server).
 pub fn a_to_b(np: &NetworkPair, seq: u32, ack: u32, payload: &[u8]) -> Vec<u8> {
-    // Include TS option with zeroed values — the TcpSocketPair::inject_to_b
-    // patcher fills in valid TSval/TSecr.  Frames without TS are rejected
-    // by the PAWS guard once timestamps are negotiated (RFC 7323 §3.2).
     crate::packet::build_tcp_data_with_ts(
         np.mac_a, np.mac_b, np.ip_a, np.ip_b, 12345, 80, seq, ack, 0, 0, payload,
     )
