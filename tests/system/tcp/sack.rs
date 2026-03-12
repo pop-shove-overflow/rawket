@@ -522,3 +522,51 @@ fn sender_skips_sacked_on_retransmit() -> TestResult {
 
     Ok(())
 }
+
+// RFC 2018 §3: SACK blocks reflect currently held OOO data. After filling the
+// OOO gap, B's next ACK must have no SACK blocks.
+#[test]
+fn sack_hole_fill_clears_block() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"a")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let af = cap.tcp().from_a().with_data().next().ok_or_else(|| TestFail::new("no AtoB data"))?;
+    let b_rcv_nxt = af.tcp.seq + af.payload_len as u32;
+    let b_snd_nxt = af.tcp.ack;
+    pair.clear_capture();
+
+    // Inject OOO at b_rcv_nxt + 1 (gap at b_rcv_nxt).
+    let ooo = a_to_b(&pair, b_rcv_nxt + 1, b_snd_nxt, b"B");
+    pair.inject_to_b(ooo);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let has_sack = cap.tcp().from_b().any(|f| !f.tcp.opts.sack_blocks.is_empty());
+    assert_ok!(has_sack, "B did not send SACK after OOO");
+
+    pair.clear_capture();
+
+    // Fill the gap at b_rcv_nxt.
+    let fill = a_to_b(&pair, b_rcv_nxt, b_snd_nxt, b"A");
+    pair.inject_to_b(fill);
+    pair.transfer_one();
+
+    // B's ACK after gap fill must NOT have the OOO SACK block.
+    let cap = pair.drain_captured();
+    let still_ooo = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::ACK)
+        .flat_map(|f| f.tcp.opts.sack_blocks.iter().map(|&(l, _)| l).collect::<Vec<_>>())
+        .any(|l| l == b_rcv_nxt + 1);
+    assert_ok!(!still_ooo, "B still has SACK block for filled gap at {}", b_rcv_nxt + 1);
+
+    let max_ack = cap.tcp().from_b().map(|f| f.tcp.ack).max();
+    assert_ok!(max_ack >= Some(b_rcv_nxt + 2), "B's ACK did not advance past gap fill");
+
+    Ok(())
+}
