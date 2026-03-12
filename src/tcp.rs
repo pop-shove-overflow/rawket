@@ -1071,16 +1071,29 @@ impl TcpSocket {
         }
 
         // Update cwnd
-        let (_, cwnd_gain) = self.bbr_gains();
-        let bdp = if self.bbr.min_rtt_ns < u64::MAX {
-            self.bbr.max_bw * self.bbr.min_rtt_ns / 1_000_000_000 // bytes
+        let four_mss = 4 * self.cfg.mss as u32;
+        if self.bbr.phase == BbrPhase::ProbeRtt {
+            // ProbeRtt holds cwnd at BBRMinPipeCwnd = 4*MSS throughout.
+            // Do not grow cwnd on ACKs; bbr_check_probe_rtt already set it.
+            self.bbr.cwnd = four_mss;
         } else {
-            self.cfg.mss as u64 * self.cfg.initial_cwnd_pkts as u64
-        };
-        let four_mss      = 4 * self.cfg.mss as u32;
-        let cwnd_target   = cwnd_gain.apply(bdp) as u32 + four_mss;
-        let new_cwnd      = self.bbr.cwnd.saturating_add(acked_bytes as u32);
-        self.bbr.cwnd     = new_cwnd.min(cwnd_target).max(four_mss);
+            let old_cwnd = self.bbr.cwnd;
+            let (_, cwnd_gain) = self.bbr_gains();
+            let bdp = if self.bbr.min_rtt_ns < u64::MAX {
+                self.bbr.max_bw * self.bbr.min_rtt_ns / 1_000_000_000 // bytes
+            } else {
+                self.cfg.mss as u64 * self.cfg.initial_cwnd_pkts as u64
+            };
+            let cwnd_target = cwnd_gain.apply(bdp) as u32 + four_mss;
+            let new_cwnd    = self.bbr.cwnd.saturating_add(acked_bytes as u32);
+            self.bbr.cwnd   = new_cwnd.min(cwnd_target).max(four_mss);
+            // Startup: noisy early BDP measurements (few samples) must not shrink
+            // cwnd below where it was.  Cwnd only decreases in Startup on loss events
+            // (via bbr_on_loss → inflight_shortterm → bbr_bound_cwnd_for_model).
+            if self.bbr.phase == BbrPhase::Startup {
+                self.bbr.cwnd = self.bbr.cwnd.max(old_cwnd);
+            }
+        }
 
         // ── BBRBoundCwndForModel (spec §5.6.3) ─────────────────────────
         self.bbr_bound_cwnd_for_model();
@@ -1223,6 +1236,7 @@ impl TcpSocket {
                 }
             }
             BbrPhase::ProbeBwRefill => {
+                if self.bbr_check_probe_rtt(now) { return; }
                 // After one round of REFILL, start UP
                 if self.bbr.round_count > 0
                     && now.saturating_sub(self.bbr.cycle_stamp_ns) >= self.srtt_ns.max(1)
@@ -1231,6 +1245,7 @@ impl TcpSocket {
                 }
             }
             BbrPhase::ProbeBwUp => {
+                if self.bbr_check_probe_rtt(now) { return; }
                 // Stay UP for one round then go DOWN
                 if self.bbr.round_count > 0
                     && now.saturating_sub(self.bbr.cycle_stamp_ns) >= self.srtt_ns.max(1)
@@ -1311,7 +1326,7 @@ impl TcpSocket {
 
     fn on_ack(&mut self, new_ack: SeqNum, opts: &ParsedOpts) {
         let now          = self.clock.monotonic_ns();
-        let mut acked    = 0u64;
+        let mut acked_data = 0u64;  // payload bytes (SYN/FIN seq-space excluded; used for BBR)
         let mut rtt_sample: Option<u64> = None;
         // RFC 9438 §4.1: track oldest ACKed segment's delivery snapshot
         let mut oldest_delivered:      Option<u64> = None;
@@ -1327,9 +1342,7 @@ impl TcpSocket {
         while i < self.unacked.len() {
             let seg = &self.unacked[i];
             if seq_le(seg.end_seq, new_ack) {
-                let bytes = seg.data.len() as u64
-                    + if !(seg.flags & (TcpFlags::SYN | TcpFlags::FIN)).is_empty() { 1 } else { 0 };
-                acked += bytes;
+                acked_data += seg.data.len() as u64;
                 // Karn's: RTT only from non-retransmitted segments
                 if seg.retransmits == 0 && rtt_sample.is_none() {
                     rtt_sample = Some(now.saturating_sub(seg.first_sent_ns));
@@ -1411,13 +1424,16 @@ impl TcpSocket {
         // 5. BBRv3 bandwidth update (RFC 9438 §4.1 delivery rate)
         // Compute delivery rate before bbr_on_ack updates delivered counter.
         // C.delivered (after this ACK) - P.delivered / (now - P.delivered_time)
+        // BBR uses payload bytes only — SYN/FIN seq-space bytes are excluded so
+        // that the tiny delivery-rate sample from the handshake (1 byte / RTT)
+        // does not contaminate max_bw and collapse cwnd to 4 MSS.
         let delivery_rate = if let (Some(p_delivered), Some(p_time)) =
             (oldest_delivered, oldest_delivered_time) {
             let interval_ns = now.saturating_sub(p_time).max(1);
-            let c_delivered = self.bbr.delivered + acked;
+            let c_delivered = self.bbr.delivered + acked_data;
             c_delivered.saturating_sub(p_delivered) * 1_000_000_000 / interval_ns
         } else { 0 };
-        self.bbr_on_ack(acked, delivery_rate, rtt_sample, now);
+        self.bbr_on_ack(acked_data, delivery_rate, rtt_sample, now);
 
         // 6. RACK loss detection (RFC 8985 §7.2)
         let rack_rtt = if self.rack_rtt_ns > 0 { self.rack_rtt_ns } else { self.srtt_ns.max(1) };
