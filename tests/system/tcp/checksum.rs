@@ -2,7 +2,7 @@
 //
 // rawket has per-protocol RX checksum validation flags:
 //   - Enabled by `setup_tcp_pair()` → `test_network_config()`
-//   - Disabled by `setup_tcp_pair_no_csum()` → `NetworkConfig::default()`
+//   - Disabled by `.net_config(NetworkConfig::default)` → `NetworkConfig::default()`
 //
 // TCP checksum offset:
 //   Ethernet(14) + IPv4(20) + TCP_offset(16) = byte 50
@@ -70,6 +70,42 @@ fn tcp_bad_checksum_dropped() -> TestResult {
         rcv_nxt_after == rcv_nxt_before,
         "B accepted segment with bad TCP checksum low byte (rcv_nxt advanced {} → {})",
         rcv_nxt_before, rcv_nxt_after
+    );
+    Ok(())
+}
+
+// ── tcp_checksum_accepted_when_disabled ───────────────────────────────────────
+//
+// RFC 9293 §3.1: TCP checksum validation is mandatory per the spec, but our
+// stack exposes a config knob to disable it (e.g. for hardware offload paths).
+//
+// With checksum_validate_tcp=false, a corrupted checksum must still be accepted.
+#[test]
+fn tcp_checksum_accepted_when_disabled() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .net_config(NetworkConfig::default)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let rcv_nxt_before = pair.tcp_b().rcv_nxt();
+
+    let mut frame = make_data_frame(&pair);
+    frame[TCP_CSUM_BYTE] ^= 0xFF;
+    pair.inject_to_b(frame);
+    pair.transfer_one();
+
+    assert_state(
+        pair.tcp_b(),
+        State::Established,
+        "B still Established after accepting bad-checksum segment",
+    )?;
+    let rcv_nxt_after = pair.tcp_b().rcv_nxt();
+    let advanced = rcv_nxt_after.wrapping_sub(rcv_nxt_before) < 0x8000_0000;
+    assert_ok!(
+        advanced && rcv_nxt_after != rcv_nxt_before,
+        "B dropped segment with bad TCP checksum despite validation being disabled \
+         (rcv_nxt stayed at {})",
+        rcv_nxt_before
     );
     Ok(())
 }
