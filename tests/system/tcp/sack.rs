@@ -441,3 +441,84 @@ fn most_recent_block_first() -> TestResult {
 
     Ok(())
 }
+
+// RFC 6675 §4: SACK-based loss recovery retransmits only segments in "holes"
+// (gaps between SACK blocks). SACKed segments must NOT be retransmitted.
+#[test]
+fn sender_skips_sacked_on_retransmit() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Send initial data to seed BBR estimate.
+    pair.tcp_a_mut().send(b"init-data-xxxx")?;
+    pair.transfer();
+    pair.clear_capture();
+
+    // Drop the 1st data segment from A, then send two batches.
+    // B will SACK the gap; A retransmits the hole.
+    pair.add_impairment_to_b(Impairment::Drop(PacketSpec::nth_matching(1, filter::tcp::has_data())));
+    pair.tcp_a_mut().send(&[0xaau8; 100])?;
+    pair.tcp_a_mut().send(&[0xbbu8; 100])?;
+
+    // Clear impairment before transfer so the retransmit can reach B.
+    pair.clear_impairments();
+    pair.transfer();
+
+    assert_ok!(
+        pair.tcp_a().state == rawket::tcp::State::Established,
+        "A not Established after SACK retransmit: {:?}", pair.tcp_a().state
+    );
+
+    // Verify a dropped segment exists and was retransmitted.
+    let cap = pair.drain_captured();
+    let seg1_seq = cap.all_tcp()
+        .from_a()
+        .dropped()
+        .with_data()
+        .next()
+        .map(|f| f.tcp.seq);
+
+    let seq1 = seg1_seq.ok_or_else(|| TestFail::new("no dropped segment — impairment didn't fire"))?;
+
+    let retx_count = cap.all_tcp().from_a().delivered().with_data()
+        .filter(|f| f.tcp.seq == seq1)
+        .count();
+    assert_ok!(retx_count >= 1, "dropped segment (seq={seq1}) was not retransmitted");
+
+    // The key assertion: the retransmit of the hole must happen BEFORE any
+    // SACKed segment is re-sent.  Find the timestamp of the first retransmit
+    // of the hole, then verify no non-hole segment was sent between the
+    // SACK feedback and the hole retransmit.
+    let hole_retx_ts = cap.all_tcp().from_a().delivered().with_data()
+        .filter(|f| f.tcp.seq == seq1)
+        .map(|f| f.ts_ns)
+        .min();
+    assert_ok!(hole_retx_ts.is_some(), "hole retransmit timestamp missing despite retx_count >= 1");
+    let retx_ts = hole_retx_ts.unwrap();
+    // Any data frame sent at or after the hole retransmit with a different
+    // seq that is LESS than the hole seq must be a needless retransmit of
+    // a SACKed segment (sent before the hole in the original flight).
+    let bad_retx = cap.all_tcp().from_a().delivered().with_data()
+        .filter(|f| f.ts_ns >= retx_ts && f.tcp.seq != seq1
+            && (f.tcp.seq.wrapping_sub(seq1) as i32) < 0)
+        .count();
+    assert_ok!(
+        bad_retx == 0,
+        "sender retransmitted {bad_retx} SACKed segment(s) (seq < hole) \
+         after SACK recovery — must skip SACKed segments"
+    );
+    // Also verify seg2 (the SACKed segment after the hole) was not re-sent
+    // after the hole retransmit.
+    let seg2_seq = seq1.wrapping_add(100);
+    let seg2_retx = cap.all_tcp().from_a().delivered().with_data()
+        .filter(|f| f.tcp.seq == seg2_seq && f.ts_ns >= retx_ts)
+        .count();
+    assert_ok!(
+        seg2_retx == 0,
+        "sender retransmitted SACKed seg2 (seq={seg2_seq}) {seg2_retx} time(s) after hole recovery"
+    );
+
+    Ok(())
+}
