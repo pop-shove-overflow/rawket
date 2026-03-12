@@ -180,3 +180,46 @@ fn four_block_maximum() -> TestResult {
 
     Ok(())
 }
+
+// RFC 2883 §3: D-SACK — the first SACK block covers data below the cumulative
+// ACK, signalling a spurious retransmit. Inject duplicate data already ACKed —
+// B must respond with D-SACK.
+#[test]
+fn dsack_spurious_retransmit() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"hello")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let data_frame = cap.tcp().from_a().with_data().next()
+        .ok_or_else(|| TestFail::new("no AtoB data frame"))?;
+    let a_seq = data_frame.tcp.seq;
+    let b_snd_nxt = data_frame.tcp.ack;
+    pair.clear_capture();
+
+    let dup = a_to_b(&pair, a_seq, b_snd_nxt, b"hello");
+    pair.inject_to_b(dup);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let b_ack = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::ACK)
+        .find(|f| !f.tcp.opts.sack_blocks.is_empty())
+        .ok_or_else(|| TestFail::new("B did not send SACK ACK for duplicate segment"))?;
+
+    assert_dsack(&b_ack, "B's D-SACK for spurious retransmit")?;
+
+    // D-SACK block must exactly match the duplicated range [a_seq, a_seq+5).
+    let (dl, dr) = b_ack.tcp.opts.sack_blocks[0];
+    assert_ok!(
+        dl == a_seq && dr == a_seq + 5,
+        "D-SACK block [{dl}, {dr}) != expected [{}, {}) for 5-byte duplicate",
+        a_seq, a_seq + 5
+    );
+
+    Ok(())
+}
