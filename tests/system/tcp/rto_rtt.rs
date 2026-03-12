@@ -414,3 +414,37 @@ fn rto_armed_on_first_send() -> TestResult {
 
     Ok(())
 }
+
+// RFC 6298 §2: SRTT is updated via the exponential weighted moving average
+// α=1/8. After 10+ ACK rounds, SRTT should stabilize.
+//
+// Clock discipline: `setup_network_pair` pauses both virtual clocks.
+// `send()` immediately flushes the segment (TSval = now).  To measure a
+// predictable RTT we: send, drain B (gets ACK into A's queue instantly),
+// advance 50 ms, drain A (processes ACK; RTT = 50 ms).
+#[test]
+fn rto_update_convergence() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let mut srtts = Vec::new();
+    for _ in 0..10 {
+        pair.tcp_a_mut().send(b"converge")?;
+        pair.transfer();
+        srtts.push(pair.tcp_a().srtt_ms());
+    }
+
+    let last_3 = &srtts[srtts.len() - 3..];
+    let max_srtt = *last_3.iter().max().unwrap();
+    let min_srtt = *last_3.iter().min().unwrap();
+    assert_ok!(max_srtt < 100, "SRTT did not converge — last 3 values: {last_3:?}");
+    assert_ok!(min_srtt > 0, "SRTT still 0 after 10 rounds on a latency link — last 3: {last_3:?}");
+    assert_ok!(
+        max_srtt <= min_srtt * 2,
+        "SRTT not stable — last 3: {last_3:?} (ratio {max_srtt}/{min_srtt}={}×)",
+        max_srtt / min_srtt
+    );
+
+    Ok(())
+}
