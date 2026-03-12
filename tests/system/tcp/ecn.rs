@@ -8,7 +8,7 @@ use crate::{
     assert::{assert_ect0, assert_state, TestFail},
     assert_ok,
     capture::ParsedFrameExt,
-    harness::{fast_tcp_cfg, setup_network_pair, setup_tcp_pair},
+    harness::{setup_network_pair, setup_tcp_pair},
     packet::{build_tcp_data, build_tcp_syn, recompute_frame_tcp_checksum},
     TestResult,
 };
@@ -320,6 +320,72 @@ fn ect_bits_on_data_segments() -> TestResult {
     assert_ok!(!b_data.is_empty(), "no BtoA data frames");
     for f in &b_data {
         assert_ect0(f, "B→A data segment")?;
+    }
+
+    Ok(())
+}
+
+// ── no_ect_bits_when_disabled ───────────────────────────────────────────────
+//
+// RFC 3168 §6.1.1 (TCP Initialization): after receiving a non-ECN-setup
+// SYN-ACK, a host "SHOULD NOT set ECT on data packets."  Our implementation
+// enforces this as MUST NOT.
+#[test]
+fn no_ect_bits_when_disabled() -> TestResult {
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    // Drop all BtoA so A never gets SYN-ACK.
+    np.add_impairment_to_a(Impairment::Drop(PacketSpec::any()));
+
+    let client = TcpSocket::connect_now(
+        np.iface_a(),
+        "10.0.0.1:12345".parse().unwrap(),
+        "10.0.0.2:80".parse().unwrap(),
+        Ipv4Addr::from([10, 0, 0, 2]),
+        |_| {}, |_| {},
+        cfg,
+    )?;
+    np.add_tcp_a(client);
+
+    let cap = np.drain_captured();
+    let a_isn = cap.all_tcp().from_a().with_tcp_flags(TcpFlags::SYN).next()
+        .map(|f| f.tcp.seq)
+        .ok_or_else(|| TestFail::new("no SYN from A"))?;
+
+    // Inject SYN-ACK without ECE (non-ECN peer).
+    let isn_b = 0x6000_0000u32;
+    let syn_ack = build_tcp_syn(
+        np.mac_b, np.mac_a,
+        np.ip_b,  np.ip_a,
+        80, 12345,
+        isn_b, a_isn + 1,
+        0x12,       // SYN|ACK, no ECE
+        Some(1460), None, None, false,
+    );
+    np.clear_impairments();
+    np.inject_to_a(syn_ack);
+    np.transfer_one();
+
+    assert_state(np.tcp_a(0), State::Established, "A Established after non-ECN handshake")?;
+
+    np.clear_capture();
+    np.tcp_a_mut(0).send(b"hello")?;
+    np.transfer_one();
+
+    let cap = np.drain_captured();
+    let data_frames: Vec<_> = cap.tcp().from_a().with_data().collect();
+    assert_ok!(
+        !data_frames.is_empty(),
+        "no data frames captured — ECN bit check would be vacuous"
+    );
+
+    for f in &data_frames {
+        assert_ok!(
+            f.ip_ecn == etherparse::IpEcn::NotEct,
+            "data frame has ECN bits {:?} but ECN is disabled (expected NotEct)", f.ip_ecn
+        );
     }
 
     Ok(())
