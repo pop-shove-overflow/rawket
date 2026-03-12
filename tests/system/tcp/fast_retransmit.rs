@@ -219,3 +219,55 @@ fn dupack_count_resets() -> TestResult {
 
     Ok(())
 }
+
+// ── window_update_not_dupack ────────────────────────────────────────────────
+//
+// RFC 5681 §3.2: Window-update ACKs (same ack#, different window) SHOULD NOT
+// count as duplicate ACKs.  Verify that 3 injected window-update ACKs do NOT
+// trigger fast retransmit.
+#[test]
+fn window_update_not_dupack() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.blackhole_to_a();
+    pair.tcp_a_mut().send(b"hello")?;
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let data_frame = cap.all_tcp().from_a().with_data().next()
+        .ok_or_else(|| TestFail::new("no AtoB data frame"))?;
+    let a_snd_una = data_frame.tcp.seq;
+    let b_snd_nxt = data_frame.tcp.ack;
+    pair.clear_impairments();
+
+    // Inject 3 window-update ACKs: same ack number, different windows.
+    for win in [32000u16, 48000, 64000] {
+        let mut wup = b_to_a(&pair, b_snd_nxt, a_snd_una, b"");
+        wup[48..50].copy_from_slice(&win.to_be_bytes());
+        recompute_frame_tcp_checksum(&mut wup);
+        pair.inject_to_a(wup);
+    }
+    pair.transfer_one();
+
+    // Count AtoB data frames with a_snd_una: must be 0 (no retransmit).
+    // Window-update ACKs (same ack#, different window) are not duplicate ACKs
+    // per RFC 5681 §3.2 and must not trigger fast retransmit.
+    let cap = pair.drain_captured();
+    let retx_count = cap.all_tcp().from_a().with_data()
+        .filter(|f| f.tcp.seq == a_snd_una)
+        .count();
+    assert_ok!(
+        retx_count == 0,
+        "expected 0 data frames (no fast-retransmit from window-update ACKs), got {retx_count}"
+    );
+
+    // Connection must survive regardless.
+    assert_ok!(
+        pair.tcp_a().state == rawket::tcp::State::Established,
+        "A not Established after window-update ACKs: {:?}", pair.tcp_a().state
+    );
+
+    Ok(())
+}
