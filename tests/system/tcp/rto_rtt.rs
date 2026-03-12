@@ -1,7 +1,7 @@
 use rawket::{
     bridge::{Impairment, LinkProfile, PacketSpec},
     filter,
-    tcp::{State, TcpConfig, TcpError, TcpFlags, TcpSocket},
+    tcp::{State, TcpConfig, TcpError, TcpFlags, TcpSocket, CLOCK_GRANULARITY_NS},
 };
 use crate::{
     assert::{assert_error_fired, assert_gap_approx, assert_state, assert_timestamps_present, TestFail},
@@ -471,6 +471,53 @@ fn rttvar_tracks_jitter() -> TestResult {
     assert_ok!(
         rttvar <= srtt,
         "rttvar ({rttvar} ms) unreasonably large relative to srtt ({srtt} ms)"
+    );
+
+    Ok(())
+}
+
+// RFC 6298 §2: RTO = SRTT + max(G, K*RTTVAR) where K=4. Verify the exact
+// arithmetic with a leased line (RTT ~20ms).
+//
+// Paused clocks + drain_flight() ensure RTT samples reflect only the link
+// latency (10ms each way = 20ms RTT), not arbitrary advance() padding.
+#[test]
+fn rfc6298_arithmetic() -> TestResult {
+    let mut pair = setup_tcp_pair().rto_min_ms(10).profile(LinkProfile::leased_line_100m()).connect();
+
+    pair.tcp_a_mut().send(&[0xEEu8; 5000])?;
+    pair.transfer();
+
+    let srtt_ns   = pair.tcp_a().srtt_ns();
+    let rttvar_ns = pair.tcp_a().rttvar_ns();
+    let rto_ns    = pair.tcp_a().rto_ns();
+
+    let srtt   = srtt_ns / 1_000_000;
+    let rttvar = rttvar_ns / 1_000_000;
+
+    // Leased-line RTT is 20ms (10ms each way). SRTT should converge near 20ms.
+    assert_ok!(
+        (15..=30).contains(&srtt),
+        "SRTT ({srtt} ms) not in expected range 15-30 for leased line (20ms RTT)"
+    );
+
+    // Leased line has no jitter or loss — RTTVAR should stay ≤ SRTT.
+    assert_ok!(
+        rttvar_ns <= srtt_ns,
+        "RTTVAR ({rttvar} ms) > SRTT ({srtt} ms) on stable link"
+    );
+
+    // RFC 6298: RTO = SRTT + max(G, 4*RTTVAR), clamped to [rto_min, rto_max].
+    // Compute in nanoseconds — no truncation, exact match.
+    let cfg = pair.tcp_cfg.clone();
+    let expected_rto_ns = (srtt_ns + (4 * rttvar_ns).max(CLOCK_GRANULARITY_NS))
+        .max(cfg.rto_min_ms * 1_000_000)
+        .min(cfg.rto_max_ms * 1_000_000);
+    assert_ok!(
+        rto_ns == expected_rto_ns,
+        "RTO ({} ms) != SRTT + max(G, 4*RTTVAR) = {} ms \
+         (srtt={srtt} ms, rttvar={rttvar} ms)",
+        rto_ns / 1_000_000, expected_rto_ns / 1_000_000
     );
 
     Ok(())
