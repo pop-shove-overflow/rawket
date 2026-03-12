@@ -332,3 +332,44 @@ fn rto_min_floor() -> TestResult {
 
     Ok(())
 }
+
+// RFC 6298 rule (2.5): "A maximum value MAY be placed on RTO provided it is at
+// least 60 seconds." After 6+ RTO backoffs (all data dropped), RTO must not
+// exceed rto_max_ms. Uses max_retransmits=12 so socket stays alive long enough.
+#[test]
+fn rto_max_ceiling() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .rto_max_ms(500).max_retransmits(12)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let cfg = pair.tcp_cfg.clone();
+
+    // Drop all data from A.
+    pair.add_impairment_to_b(Impairment::Drop(PacketSpec::matching(filter::tcp::has_data())));
+
+    pair.tcp_a_mut().send(b"backoff-test")?;
+
+    // transfer_while checks RTO at each step for ceiling violations.
+    let mut reached_max = false;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).state == State::Closed { return false; }
+        let rto = p.tcp_a(0).rto_ms();
+        if rto >= cfg.rto_max_ms {
+            reached_max = true;
+            return false;
+        }
+        true
+    });
+
+    // Verify no overshoot occurred.
+    let rto = pair.tcp_a().rto_ms();
+    if pair.tcp_a().state != State::Closed {
+        assert_ok!(
+            rto <= cfg.rto_max_ms,
+            "RTO ({rto} ms) > rto_max_ms ({} ms)", cfg.rto_max_ms
+        );
+    }
+    assert_ok!(reached_max, "RTO never reached rto_max_ms — socket may have closed first");
+
+    Ok(())
+}
