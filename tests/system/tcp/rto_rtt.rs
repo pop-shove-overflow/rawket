@@ -256,3 +256,49 @@ fn rto_cleared_on_full_ack() -> TestResult {
 
     Ok(())
 }
+
+// RFC 7323 §4.3: With timestamps enabled, RTT measurement via TSecr overrides
+// Karn's algorithm — SRTT/RTO recover to normal values after a retransmit.
+#[test]
+fn timestamps_override_karn() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .rto_min_ms(10)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let cfg = pair.tcp_cfg.clone();
+
+    // Force a retransmit, then let ACK come back.
+    pair.add_impairment_to_b(Impairment::Drop(PacketSpec::nth_matching(1, filter::tcp::has_data())));
+    pair.tcp_a_mut().send(b"hello")?;
+    pair.transfer();
+
+    let rto  = pair.tcp_a().rto_ms();
+    let srtt = pair.tcp_a().srtt_ms();
+
+    // Precondition: timestamps must be enabled for this test to be meaningful.
+    // Without timestamps, Karn's algorithm would forbid RTT sampling from the
+    // retransmitted segment and SRTT/RTO would not recover.
+    assert_ok!(pair.tcp_a().ts_enabled(), "timestamps not enabled — test is meaningless");
+
+    // Verify the ACK for the retransmit echoed a valid timestamp.
+    let cap = pair.drain_captured();
+    let retx_ack = cap.tcp().from_b()
+        .filter(|f| f.tcp.opts.timestamps.is_some())
+        .last();
+    assert_ok!(retx_ack.is_some(), "no ACK with timestamps from B after retransmit");
+    let (_, tsecr) = retx_ack.unwrap().tcp.opts.timestamps.unwrap();
+    assert_ok!(tsecr > 0, "TSecr in retransmit ACK is 0 — timestamp echo not working");
+
+    // On a latency link (20ms RTT), recovered RTO ≈ SRTT + 4*RTTVAR ≈ 80-100ms.
+    // Verify it recovered below the backed-off value (not stuck at rto_max).
+    assert_ok!(
+        rto < cfg.rto_max_ms,
+        "RTO after TS-based retransmit recovery = {rto} ms, not recovered (rto_max = {} ms)",
+        cfg.rto_max_ms
+    );
+    assert_ok!(srtt > 0 && srtt < 100, "SRTT after TS recovery = {srtt} ms, expected 0 < srtt < 100");
+
+    assert_state(pair.tcp_a(), State::Established, "A Established after TS-based RTT recovery")?;
+
+    Ok(())
+}
