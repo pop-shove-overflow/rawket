@@ -433,3 +433,41 @@ fn in_window_syn_challenge_ack() -> TestResult {
 
     Ok(())
 }
+
+// RFC 5961 §3.2 (RST Robustness): RST with SEQ == RCV.NXT (exact match)
+// must immediately reset the connection.
+#[test]
+fn rst_exact_match_resets() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"x")?;
+    pair.transfer();
+
+    let b_snd_nxt = pair.drain_captured().tcp()
+        .find(|f| f.dir == Dir::AtoB && f.payload_len > 0)
+        .map(|f| f.tcp.ack)
+        .ok_or_else(|| crate::assert::TestFail::new("no AtoB data frame"))?;
+
+    let rst = build_tcp_rst(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        b_snd_nxt,
+    );
+    pair.clear_capture();
+    pair.inject_to_a(rst);
+    pair.transfer();
+
+    assert_state(pair.tcp_a(), State::Closed, "A Closed after exact RST")?;
+    assert_error_fired(pair.tcp_a(), TcpError::Reset, "A error = Reset")?;
+
+    // A must not send any response to an exact-match RST.
+    let cap = pair.drain_captured();
+    let a_sent = cap.tcp().direction(Dir::AtoB).count();
+    assert_ok!(a_sent == 0, "A sent {a_sent} frame(s) in response to exact RST — expected 0");
+
+    Ok(())
+}
