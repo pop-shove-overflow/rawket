@@ -566,3 +566,58 @@ fn drain_to_probe_bw() -> TestResult {
 
     Ok(())
 }
+
+// ── probe_rtt_exit_back_to_probe_bw ───────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.3.4.6: after probe_rtt_duration elapses,
+// BBR exits ProbeRTT and returns to ProbeBW.
+//
+// After triggering ProbeRtt and waiting past probe_rtt_duration, BBR
+// should eventually return to ProbeBw.
+#[test]
+fn probe_rtt_exit_back_to_probe_bw() -> TestResult {
+    let mut pair = setup_tcp_pair().profile(LinkProfile::leased_line_100m()).connect();
+
+    // Drive to ProbeBW first (ProbeRtt only entered from ProbeBW phases).
+    drive_to_probe_bw(&mut pair)?;
+
+    // Keep data flowing for a few more iterations.
+    for _ in 0..10 {
+        pair.tcp_a_mut().send(&vec![0x44u8; 5_000])?;
+        pair.transfer();
+    }
+
+    // Advance past probe_rtt_interval (5s) to trigger ProbeRtt entry.
+    pair.advance_both(6_000);
+
+    // Drive data through ProbeRtt; use bbr_history() to find ProbeRtt entry,
+    // then wait for a ProbeBW phase to appear after it.
+    let mut saw_probe_rtt = false;
+    let mut saw_exit = false;
+    let mut exit_phase = BbrPhase::Startup; // dummy
+    pair.tcp_a_mut().send(&vec![0x55u8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0x55u8; 2_000]);
+        }
+
+        for snap in p.tcp_a(0).bbr_history() {
+            if snap.phase == BbrPhase::ProbeRtt {
+                saw_probe_rtt = true;
+            } else if saw_probe_rtt && is_probe_bw(snap.phase) {
+                saw_exit = true;
+                exit_phase = snap.phase;
+            }
+        }
+        !saw_exit
+    });
+
+    assert_ok!(saw_probe_rtt, "never entered ProbeRtt after 5s advance");
+    assert_ok!(saw_exit, "BBR stuck in ProbeRtt — never exited to ProbeBW");
+    assert_ok!(
+        is_probe_bw(exit_phase),
+        "ProbeRtt exited to {exit_phase:?}, expected ProbeBW sub-phase"
+    );
+
+    Ok(())
+}
