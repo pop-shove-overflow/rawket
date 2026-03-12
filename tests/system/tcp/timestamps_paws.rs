@@ -4,7 +4,7 @@ use crate::{
     assert_ok,
     capture::ParsedFrameExt,
     harness::{setup_network_pair, setup_tcp_pair},
-    packet::{build_tcp_data, build_tcp_data_with_ts, build_tcp_syn},
+    packet::{build_tcp_data, build_tcp_data_with_ts, build_tcp_syn, recompute_frame_tcp_checksum},
     TestResult,
 };
 
@@ -309,6 +309,98 @@ fn wraparound_accepted() -> TestResult {
     assert_ok!(acked, "B dropped data after TSval wrap — PAWS not handling wraparound");
 
     assert_state(np.tcp_b(0), State::Established, "B Established after accepting wrapped TSval")?;
+
+    Ok(())
+}
+
+// RFC 7323 §5.2 states PAWS protects against "old duplicate non-<SYN>
+// segments", implying SYN is exempt.  However, §5.3 R1 only explicitly
+// exempts RST.  Our implementation follows §5.2's intent and exempts SYN
+// from PAWS to allow TIME-WAIT connection reuse (RFC 9293 §3.6.1 MAY-2).
+//
+// Step 1 proves PAWS is active (stale data dropped, rcv_nxt unchanged).
+// Step 2 injects a SYN with the same stale TSval and checks that
+// challenge_ack_count incremented — proving the SYN reached the state
+// machine (RFC 5961 §4.2) rather than being PAWS-dropped at R1.
+#[test]
+fn syn_bypasses_paws() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"warmup")?;
+    pair.transfer();
+
+    let ts_recent = pair.tcp_b().ts_recent();
+    assert_ok!(ts_recent > 0, "ts_recent not populated after handshake + data");
+
+    let stale_tsval = ts_recent.wrapping_sub(0x4000_0000); // ~1 billion behind
+    let b_rcv_nxt = pair.tcp_b().rcv_nxt();
+    let b_snd_nxt = pair.tcp_b().snd_nxt();
+
+    // Step 1: Prove PAWS is active by injecting a stale DATA segment.
+    // PAWS R1 drops it — rcv_nxt must NOT advance.
+    pair.clear_capture();
+    let stale_data = build_tcp_data_with_ts(
+        pair.mac_a, pair.mac_b,
+        pair.ip_a,  pair.ip_b,
+        12345, 80,
+        b_rcv_nxt, b_snd_nxt,
+        stale_tsval, 0,
+        b"stale",
+    );
+    pair.inject_to_b(stale_data);
+    pair.transfer_one();
+
+    assert_ok!(
+        pair.tcp_b().rcv_nxt() == b_rcv_nxt,
+        "stale DATA was accepted (rcv_nxt advanced) — PAWS not working"
+    );
+
+    // Step 2: Inject a SYN with the same stale TSval.  If our SYN
+    // exemption works, the SYN bypasses PAWS and reaches the state
+    // machine → challenge ACK (RFC 5961 §4.2), incrementing the
+    // challenge_ack_count.  A PAWS-drop would NOT increment it.
+    let chal_before = pair.tcp_b().challenge_ack_count();
+
+    pair.clear_capture();
+    let syn = build_tcp_syn(
+        pair.mac_a, pair.mac_b,
+        pair.ip_a,  pair.ip_b,
+        12345, 80,
+        b_rcv_nxt,
+        0,
+        0x02,
+        Some(1460), Some(4),
+        Some((stale_tsval, 0)),
+        true,
+    );
+    pair.inject_to_b(syn);
+    pair.transfer_one();
+
+    // The challenge ACK counter must have incremented — proving the SYN
+    // reached the state machine (RFC 5961 §4.2) rather than being
+    // PAWS-dropped at R1.
+    let chal_after = pair.tcp_b().challenge_ack_count();
+    assert_ok!(
+        chal_after > chal_before,
+        "challenge_ack_count did not increment ({chal_before} → {chal_after}) — \
+         SYN was PAWS-dropped instead of reaching the state machine"
+    );
+
+    let cap = pair.drain_captured();
+
+    // Must NOT be a SYN-ACK (B must not re-enter handshake).
+    let syn_ack = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::SYN)
+        .with_tcp_flags(TcpFlags::ACK)
+        .next()
+        .is_some();
+    assert_ok!(!syn_ack, "B sent SYN-ACK instead of challenge ACK");
+
+    // Connection must survive.
+    assert_state(pair.tcp_b(), State::Established, "B must stay Established after SYN bypass")?;
 
     Ok(())
 }
