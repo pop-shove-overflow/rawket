@@ -696,3 +696,36 @@ fn cwnd_target_includes_bdp() -> TestResult {
 
     Ok(())
 }
+
+// ── min_rtt_tracking ──────────────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.3.4: BBR tracks min_rtt as the minimum
+// observed round-trip time, used for BDP computation and ProbeRTT scheduling.
+//
+// After data exchange with simulated RTT, bbr_min_rtt_ns() should track
+// the minimum observed RTT.  LinkProfile::leased_line_100m() has 10ms latency each way = ~20ms RTT.
+#[test]
+fn min_rtt_tracking() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    for _ in 0..10 {
+        pair.tcp_a_mut().send(&vec![0x99u8; 1_000])?;
+        pair.transfer();
+    }
+
+    let min_rtt_ns = pair.tcp_a().bbr_min_rtt_ns();
+    let min_rtt_ms = min_rtt_ns / 1_000_000;
+    // With 10ms each way, measured RTT should be ~20ms. Allow 5–60ms range.
+    assert_ok!(
+        min_rtt_ns < u64::MAX,
+        "bbr_min_rtt_ns() not updated from u64::MAX sentinel"
+    );
+    assert_ok!(
+        min_rtt_ms >= 5 && min_rtt_ms <= 60,
+        "bbr_min_rtt_ms() = {min_rtt_ms} ms — expected ~20ms for simulated 20ms RTT"
+    );
+
+    Ok(())
+}
