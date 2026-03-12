@@ -726,3 +726,65 @@ fn oow_data_segment_dropped() -> TestResult {
 
     Ok(())
 }
+
+// RFC 9293 §3.10.2 (SEND Call): In SYN-SENT and SYN-RECEIVED, data is
+// queued for transmission after entering ESTABLISHED.  send() must succeed
+// (return Ok), and the queued data must be delivered once the handshake
+// completes.
+#[test]
+fn send_in_non_established() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    // Drop B→A so the handshake doesn't complete — A stays in SynSent.
+    np.add_impairment_to_a(Impairment::Drop(PacketSpec::any()));
+
+    let client = TcpSocket::connect_now(
+        np.iface_a(),
+        "10.0.0.1:12345".parse().unwrap(),
+        "10.0.0.2:80".parse().unwrap(),
+        Ipv4Addr::from([10, 0, 0, 2]),
+        |_| {}, |_| {}, cfg.clone(),
+    )?;
+    let ia = np.add_tcp_a(client);
+
+    assert_state(np.tcp_a(ia), State::SynSent, "A should be SynSent")?;
+
+    // RFC 9293 §3.10.2: SEND in SYN-SENT must queue data, not return error.
+    np.tcp_a_mut(ia).send(b"queued-in-syn-sent")?;
+
+    assert_ok!(
+        np.tcp_a(ia).send_buf_len() == 18,
+        "data not queued in SYN-SENT: send_buf_len={}", np.tcp_a(ia).send_buf_len()
+    );
+
+    // Complete the handshake — add server, clear impairments, transfer.
+    let server = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {}, cfg,
+    )?;
+    np.add_tcp_b(server);
+    np.clear_impairments();
+    np.transfer();
+
+    assert_state(np.tcp_a(ia), State::Established, "A should be Established")?;
+
+    // Queued data must have been transmitted after handshake.
+    let cap = np.drain_captured();
+    let total: usize = cap.tcp().from_a().with_data().map(|f| f.payload_len).sum();
+    assert_ok!(
+        total == 18,
+        "queued data not transmitted after handshake: {total} bytes sent, expected 18"
+    );
+
+    // Verify queued data was transmitted (send_buf drained after handshake).
+    assert_ok!(
+        np.tcp_a(ia).send_buf_len() == 0,
+        "send_buf not drained after handshake: {}", np.tcp_a(ia).send_buf_len()
+    );
+
+    Ok(())
+}
