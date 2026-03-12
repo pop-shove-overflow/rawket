@@ -4,8 +4,8 @@ use crate::{
     TestResult,
 };
 use rawket::{
-    bridge::{reseed_prng, LinkProfile},
-    tcp::{BbrPhase, TcpConfig},
+    bridge::LinkProfile,
+    tcp::BbrPhase,
 };
 
 /// TCP config for loss tests: tolerates sustained moderate packet loss.
@@ -996,6 +996,59 @@ fn round_count_increments() -> TestResult {
     assert_ok!(
         next_rd > 0,
         "next_round_delivered is 0 after 10+ rounds — round boundary tracking broken"
+    );
+
+    Ok(())
+}
+
+// ── shortterm_model_resets_at_refill_entry ────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §5.5: bbr_enter_probe_bw_refill() calls
+// bbr_reset_short_term_model() which resets inflight_shortterm and
+// bw_shortterm to their sentinel values (u32::MAX / u64::MAX).
+#[test]
+fn shortterm_model_resets_at_refill_entry() -> TestResult {
+    // 100 Mbps / 10 ms link with 10% loss.
+    let mut pair = setup_tcp_pair()
+        .rto_min_ms(10)
+        .max_retransmits(100)
+        .rto_max_ms(200)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Drive to ProbeBW losslessly first.
+    drive_to_probe_bw(&mut pair)?;
+
+    // Now add loss so bbr_loss_lower_bounds sets inflight_shortterm < MAX.
+    pair.loss_to_b(0.10);
+
+    // Use bbr_history() to find a ProbeBwRefill entry where
+    // inflight_shortterm == u32::MAX (reset by bbr_reset_short_term_model).
+    // This proves the model was reset at Refill entry.  It does not verify
+    // exclusivity (other phases could also reset — that's a separate check).
+    let mut refill_with_reset = false;
+
+    pair.tcp_a_mut().send(&vec![0x88u8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0x88u8; 2_000]);
+        }
+
+        for snap in p.tcp_a(0).bbr_history() {
+            if snap.phase == BbrPhase::ProbeBwRefill
+                && snap.inflight_shortterm == u32::MAX
+                && snap.bw_shortterm == u64::MAX
+            {
+                refill_with_reset = true;
+            }
+        }
+        !refill_with_reset
+    });
+
+    assert_ok!(
+        refill_with_reset,
+        "no ProbeBwRefill snapshot with inflight_shortterm==MAX and bw_shortterm==MAX \
+         — bbr_reset_short_term_model not called at Refill entry"
     );
 
     Ok(())
