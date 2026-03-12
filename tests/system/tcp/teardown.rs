@@ -46,3 +46,42 @@ fn active_close() -> TestResult {
 
     Ok(())
 }
+
+// ── passive_close ──────────────────────────────────────────────────────────────
+//
+// RFC 9293 §3.6 (Connection Close): Server-initiated close; client performs
+// the passive close.
+#[test]
+fn passive_close() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .time_wait_ms(100)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_b_mut().close()?;
+    assert_state(pair.tcp_b(), State::FinWait1, "B FinWait1 after close()")?;
+
+    pair.transfer();
+    assert_state(pair.tcp_b(), State::FinWait2, "B FinWait2")?;
+    assert_state(pair.tcp_a(), State::CloseWait, "A CloseWait")?;
+
+    pair.tcp_a_mut().close()?;
+
+    pair.transfer_while(|p| {
+        p.tcp_b(0).state != State::TimeWait || p.tcp_a(0).state != State::Closed
+    });
+    assert_state(pair.tcp_b(), State::TimeWait, "B TimeWait")?;
+    assert_state(pair.tcp_a(), State::Closed, "A Closed")?;
+
+    pair.transfer();
+    assert_state(pair.tcp_b(), State::Closed, "B Closed after TimeWait expiry")?;
+
+    let cap = pair.drain_captured();
+    let a_fins = cap.tcp().direction(Dir::AtoB).with_tcp_flags(TcpFlags::FIN).count();
+    let b_fins = cap.tcp().direction(Dir::BtoA).with_tcp_flags(TcpFlags::FIN).count();
+    assert_ok!(a_fins == 1, "expected exactly 1 FIN from A, got {a_fins}");
+    assert_ok!(b_fins == 1, "expected exactly 1 FIN from B, got {b_fins}");
+
+    Ok(())
+}
