@@ -1,7 +1,7 @@
 use rawket::{
-    bridge::{Impairment, LinkProfile, Loss, PacketSpec},
+    bridge::{Impairment, LinkProfile, PacketSpec},
     filter,
-    tcp::TcpSocket,
+    tcp::{TcpConfig, TcpSocket},
 };
 use crate::{
     assert::{TestFail, assert_timestamps_present},
