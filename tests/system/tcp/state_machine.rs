@@ -646,3 +646,83 @@ fn challenge_ack_rate_limit() -> TestResult {
 
     Ok(())
 }
+
+// RFC 9293 §3.10.7.4 (Out-of-Window Segments): Data with SEQ outside the
+// receive window must be dropped; an ACK with ACK=RCV.NXT is sent.
+#[test]
+fn oow_data_segment_dropped() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"x")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let (b_rcv_nxt, b_snd_nxt) = {
+        let af = cap.tcp()
+            .find(|f| f.dir == Dir::AtoB && f.payload_len > 0)
+            .ok_or_else(|| crate::assert::TestFail::new("no AtoB data"))?;
+        (af.tcp.seq + af.payload_len as u32, af.tcp.ack)
+    };
+
+    let oow = build_tcp_data(
+        pair.mac_a, pair.mac_b,
+        pair.ip_a,  pair.ip_b,
+        12345, 80,
+        b_rcv_nxt.wrapping_add(2_000_000),
+        b_snd_nxt,
+        b"out-of-window",
+    );
+    pair.clear_capture();
+    pair.inject_to_b(oow);
+    pair.transfer();
+
+    let cap2 = pair.drain_captured();
+    let ack_advanced = cap2.tcp()
+        .filter(|f| f.dir == Dir::BtoA && f.tcp.flags.has(TcpFlags::ACK))
+        .any(|f| f.tcp.ack > b_rcv_nxt);
+    assert_ok!(!ack_advanced, "B advanced ACK for out-of-window segment");
+
+    assert_state(pair.tcp_b(), State::Established, "B must stay Established")?;
+
+    // RFC 9293 §3.10.7.4: B must respond with an ACK carrying ACK=RCV.NXT.
+    let resp = cap2.tcp()
+        .find(|f| f.dir == Dir::BtoA && f.tcp.flags.has(TcpFlags::ACK));
+    assert_ok!(resp.is_some(), "B did not send ACK for out-of-window segment");
+    let resp = resp.unwrap();
+    assert_ok!(
+        resp.tcp.ack == b_rcv_nxt,
+        "response ACK={} != RCV.NXT={b_rcv_nxt}",
+        resp.tcp.ack
+    );
+
+    // Test below-RCV.NXT: segment with seq before the receive window.
+    pair.clear_capture();
+    let below = build_tcp_data(
+        pair.mac_a, pair.mac_b,
+        pair.ip_a,  pair.ip_b,
+        12345, 80,
+        b_rcv_nxt.wrapping_sub(100),
+        b_snd_nxt,
+        b"below-window",
+    );
+    pair.inject_to_b(below);
+    pair.transfer();
+
+    assert_state(pair.tcp_b(), State::Established, "B must stay Established after below-window segment")?;
+
+    let cap3 = pair.drain_captured();
+    let resp2 = cap3.tcp()
+        .find(|f| f.dir == Dir::BtoA && f.tcp.flags.has(TcpFlags::ACK));
+    assert_ok!(resp2.is_some(), "B did not send ACK for below-window segment");
+    let resp2 = resp2.unwrap();
+    assert_ok!(
+        resp2.tcp.ack == b_rcv_nxt,
+        "below-window response ACK={} != RCV.NXT={b_rcv_nxt}",
+        resp2.tcp.ack
+    );
+
+    Ok(())
+}
