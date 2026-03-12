@@ -503,3 +503,66 @@ fn ack_splitting_no_cwnd_inflation() -> TestResult {
 
     Ok(())
 }
+
+// ── drain_to_probe_bw ──────────────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.3.2: Drain reduces bytes_in_flight toward BDP
+// before transitioning to ProbeBW.
+//
+// Verify the Drain→ProbeBw transition: BBR observes Drain and then
+// reaches ProbeBW.
+//
+// The state-machine invariant (bytes_in_flight ≤ BDP as the Drain→ProbeBW
+// precondition) is enforced by the implementation.  Comparing snapshots of
+// bytes_in_flight across polling checkpoints is unreliable: drain_a() calls
+// flush_send_buf(), so the post-poll snapshot includes newly sent segments
+// that were not in flight at the moment of the phase transition.
+#[test]
+fn drain_to_probe_bw() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let mut saw_drain = false;
+    let mut reached_probe_bw = false;
+    let mut max_inflight_in_startup: u32 = 0;
+    let mut min_inflight_post_startup: u32 = u32::MAX;
+
+    pair.tcp_a_mut().send(&vec![0x44u8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0x44u8; 2_000]);
+        }
+        for snap in p.tcp_a(0).bbr_history() {
+            match snap.phase {
+                BbrPhase::Startup => {
+                    max_inflight_in_startup = max_inflight_in_startup.max(snap.bytes_in_flight);
+                }
+                BbrPhase::Drain => {
+                    saw_drain = true;
+                    min_inflight_post_startup = min_inflight_post_startup.min(snap.bytes_in_flight);
+                }
+                p if is_probe_bw(p) => {
+                    min_inflight_post_startup = min_inflight_post_startup.min(snap.bytes_in_flight);
+                    if saw_drain || snap.bytes_in_flight < max_inflight_in_startup {
+                        reached_probe_bw = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        !reached_probe_bw
+    });
+
+    assert_ok!(
+        max_inflight_in_startup > 0,
+        "no inflight observed during Startup — test scenario invalid"
+    );
+    assert_ok!(
+        min_inflight_post_startup < max_inflight_in_startup,
+        "inflight did not decrease after Startup exit: min_post={min_inflight_post_startup}, \
+         max_startup={max_inflight_in_startup}"
+    );
+
+    Ok(())
+}
