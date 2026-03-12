@@ -322,3 +322,39 @@ fn rto_does_not_fire_during_persist() -> TestResult {
 
     Ok(())
 }
+
+// ── persist_does_not_timeout_connection ──────────────────────────────────────
+//
+// RFC 1122 §4.2.2.17: TCP MUST NOT close a connection during persist probing.
+#[test]
+fn persist_does_not_timeout_connection() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    setup_zero_window(&mut pair)?;
+
+    pair.add_impairment_to_b(Impairment::Drop(PacketSpec::any()));
+
+    pair.tcp_a_mut().send(b"world")?;
+
+    // Advance 10 seconds with unanswered probes.
+    for _ in 0..100 {
+        pair.advance_both(100);
+        pair.transfer_one();
+    }
+
+    assert_state(pair.tcp_a(), State::Established, "persist must not timeout the connection")?;
+
+    let cap = pair.drain_captured();
+    let probe_count = cap.all_tcp()
+        .direction(Dir::AtoB)
+        .filter(|f| f.payload_len == 1)
+        .count();
+    assert_ok!(
+        probe_count >= 3,
+        "expected ≥3 unanswered persist probes, got {probe_count}"
+    );
+
+    Ok(())
+}
