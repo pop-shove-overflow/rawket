@@ -477,3 +477,31 @@ fn ece_triggers_cwnd_reduction() -> TestResult {
 
     Ok(())
 }
+
+// ── no_ect_on_syn ─────────────────────────────────────────────────────────
+//
+// RFC 3168 §6.1.1: SYN and SYN-ACK MUST NOT carry ECT bits in the IP
+// header (only TCP flags ECE/CWR are used for negotiation).
+#[test]
+fn no_ect_on_syn() -> TestResult {
+    let (_pair, cap) = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect_and_capture();
+
+    // Guard: at least 1 SYN and 1 SYN-ACK must be present.
+    let syns: Vec<_> = cap.tcp().with_tcp_flags(TcpFlags::SYN).collect();
+    let syn_count = syns.iter().filter(|f| !f.tcp.flags.has(TcpFlags::ACK)).count();
+    let syn_ack_count = syns.iter().filter(|f| f.tcp.flags.has(TcpFlags::ACK)).count();
+    assert_ok!(syn_count >= 1, "no SYN found — test would be vacuous");
+    assert_ok!(syn_ack_count >= 1, "no SYN-ACK found — test would be vacuous");
+
+    // Check all SYN and SYN-ACK frames for ECT bits.
+    for f in &syns {
+        assert_ok!(
+            f.ip_ecn == etherparse::IpEcn::NotEct,
+            "SYN/SYN-ACK IP ECN = {:?}, expected NotEct (no ECT on handshake)", f.ip_ecn
+        );
+    }
+
+    Ok(())
+}
