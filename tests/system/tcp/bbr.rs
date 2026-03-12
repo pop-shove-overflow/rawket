@@ -139,3 +139,58 @@ fn startup_to_drain_transition() -> TestResult {
 
     Ok(())
 }
+
+// ── probe_rtt_entry ────────────────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.3.4.4: BBR enters ProbeRTT when
+// probe_rtt_interval (5s) elapses without a new min_rtt sample.
+//
+// After 5s idle (probe_rtt_interval), BBR should enter ProbeRtt on next ACK.
+// Verify bbr_phase() == ProbeRtt after the trigger.
+#[test]
+fn probe_rtt_entry() -> TestResult {
+    let mut pair = setup_tcp_pair().profile(LinkProfile::leased_line_100m()).connect();
+
+    // Drive to ProbeBW phase first (ProbeRtt is only entered from ProbeBW phases).
+    drive_to_probe_bw(&mut pair)?;
+
+    // Keep data flowing so min_rtt_stamp is set.
+    for _ in 0..5 {
+        pair.tcp_a_mut().send(&vec![0x44u8; 2_000])?;
+        pair.transfer();
+    }
+
+    // Negative check: ProbeRtt must NOT be entered before the interval expires.
+    // Advance 4s (< 5s interval) and verify no ProbeRtt.
+    pair.advance_both(4_000);
+    pair.tcp_a_mut().send(&vec![0x44u8; 2_000])?;
+    pair.transfer();
+    let premature = pair.tcp_a().bbr_history().iter()
+        .any(|s| s.phase == BbrPhase::ProbeRtt);
+    assert_ok!(
+        !premature,
+        "ProbeRtt entered before probe_rtt_interval expired (at 4s < 5s)"
+    );
+
+    // Now advance past bbr_probe_rtt_interval_ms (5000 ms total = 4s + 2s).
+    pair.advance_both(2_000);
+
+    // Send data to trigger ProbeRtt entry via transfer_while.
+    let mut saw_probe_rtt = false;
+    pair.tcp_a_mut().send(&vec![0x55u8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0x55u8; 2_000]);
+        }
+        for snap in p.tcp_a(0).bbr_history() {
+            if snap.phase == BbrPhase::ProbeRtt {
+                saw_probe_rtt = true;
+            }
+        }
+        !saw_probe_rtt
+    });
+
+    assert_ok!(saw_probe_rtt, "expected ProbeRtt after 5s idle");
+
+    Ok(())
+}
