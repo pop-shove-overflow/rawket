@@ -1,3 +1,4 @@
+use rawket::bridge::LinkProfile;
 use crate::{
     assert::{assert_timestamps_present, TestFail},
     assert_ok,
@@ -69,5 +70,61 @@ fn three_dupacks() -> TestResult {
 
 // ── partial_ack ───────────────────────────────────────────────────────────────
 //
-// After fast retransmit fires, a partial ACK (acks only part of the segment)
-// must advance snd_una but leave the connection Established.
+// Partial ACK handling: a partial ACK (acks some but not all outstanding data)
+// must advance snd_una without disrupting the connection.  RFC 6582 §3.2
+// (NewReno) and RFC 6675 §5 (SACK) both describe partial ACK handling; our
+// SACK+BBR stack follows neither exactly.  The assertion (bif == 3 after
+// acking 2 of 5 bytes) is implementation-specific.
+#[test]
+fn partial_ack() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.blackhole_to_a();
+    pair.tcp_a_mut().send(b"hello")?;
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let data_frame = cap.all_tcp().from_a().with_data().next()
+        .ok_or_else(|| TestFail::new("no AtoB data frame"))?;
+    let a_snd_una = data_frame.tcp.seq;
+    let b_snd_nxt = data_frame.tcp.ack;
+
+    let snd_una_before = pair.tcp_a().snd_una();
+    pair.clear_impairments();
+
+    // 3 DUPACKs → fast retransmit.
+    for _ in 0..3u32 {
+        let frame = b_to_a(&pair, b_snd_nxt, a_snd_una, b"");
+        pair.inject_to_a(frame);
+    }
+    pair.transfer_one();
+
+    // Inject partial ACK: acks first 2 of the 5 bytes.
+    let frame = b_to_a(&pair, b_snd_nxt, a_snd_una + 2, b"");
+    pair.inject_to_a(frame);
+    pair.transfer_one();
+
+    // snd_una must advance by exactly 2 (partial ACK).
+    let snd_una_after = pair.tcp_a().snd_una();
+    assert_ok!(
+        snd_una_after == snd_una_before.wrapping_add(2),
+        "snd_una did not advance by 2: before={snd_una_before}, after={snd_una_after}"
+    );
+
+    // Connection must survive (Established).
+    assert_ok!(
+        pair.tcp_a().state == rawket::tcp::State::Established,
+        "A not Established after partial ACK: {:?}", pair.tcp_a().state
+    );
+
+    // bytes_in_flight must reflect the partial ACK: 3 bytes still unacked.
+    let bif = pair.tcp_a().bytes_in_flight();
+    assert_ok!(
+        bif == 3,
+        "bytes_in_flight after partial ACK should be 3 (5 sent - 2 acked), got {bif}"
+    );
+
+    Ok(())
+}
