@@ -271,3 +271,81 @@ fn window_update_not_dupack() -> TestResult {
 
     Ok(())
 }
+
+// ── triggers_bbr_loss ───────────────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §5.5: loss triggers BBRAdaptLowerBounds with
+// Beta=0.7.  RFC 5681 §3.2 mandates ssthresh = FlightSize/2, but BBR
+// uses its own cwnd reduction algorithm.  This test validates BBR behavior.
+//
+// Phase 1: grow cwnd with a lossless transfer.
+// Phase 2: drop one segment via bridge impairment → B generates DUPACKs →
+//          fast retransmit fires → BBR reduces cwnd via Beta=0.7 (§5.5).
+#[test]
+fn triggers_bbr_loss() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Phase 1: lossless incremental transfers to drive BBR past Startup
+    // into ProbeBW, where cwnd growth is BDP-bounded (not additive).
+    for _ in 0..20 {
+        pair.tcp_a_mut().send(&vec![0xAAu8; 50_000])?;
+        pair.transfer();
+        if pair.tcp_a().bbr_filled_pipe() {
+            break;
+        }
+    }
+
+    let cwnd_before = pair.tcp_a().bbr_cwnd();
+    let mss = pair.tcp_a().peer_mss() as u32;
+    assert_ok!(
+        cwnd_before > 4 * mss,
+        "cwnd ({cwnd_before}) at floor after warmup — cannot verify reduction"
+    );
+
+    // Phase 2: drop the first data segment → B receives subsequent
+    // segments out-of-order → B generates DUPACKs → fast retransmit.
+    pair.clear_capture();
+    pair.drop_next_data_to_b();
+    pair.tcp_a_mut().send(&vec![0xBBu8; 10_000])?;
+    pair.transfer();
+
+    // Verify the dropped segment was actually retransmitted (not just cwnd
+    // reduction from RTO or other path).
+    let cap = pair.drain_captured();
+    let dropped = cap.all_tcp().from_a().dropped().with_data().next()
+        .ok_or_else(|| TestFail::new("no dropped segment — impairment didn't fire"))?;
+    let retx_count = cap.all_tcp().from_a().delivered().with_data()
+        .filter(|f| f.tcp.seq == dropped.tcp.seq)
+        .count();
+    assert_ok!(
+        retx_count >= 1,
+        "dropped segment seq={} was never retransmitted", dropped.tcp.seq
+    );
+
+    // BBR §5.5: on first loss, BBRInitLowerBounds snapshots cwnd into
+    // inflight_shortterm, then BBRLossLowerBounds applies Beta=0.7.
+    // BBRBoundCwndForModel caps cwnd to inflight_shortterm.
+    let cwnd_after = pair.tcp_a().bbr_cwnd();
+    assert_ok!(
+        cwnd_after < cwnd_before,
+        "cwnd must strictly decrease after loss: before={cwnd_before}, after={cwnd_after}"
+    );
+    // Beta=0.7 → expect ~68-70% of pre-loss cwnd.  Allow 65-75% for
+    // BBRModulateCwndForRecovery's newly_lost subtraction on top.
+    let lo = cwnd_before * 65 / 100;
+    let hi = cwnd_before * 75 / 100;
+    assert_ok!(
+        cwnd_after >= lo && cwnd_after <= hi,
+        "cwnd after loss not in Beta=0.7 range: before={cwnd_before}, after={cwnd_after}, \
+         expected {lo}..{hi} (65-75%)"
+    );
+
+    assert_ok!(
+        pair.tcp_a().state == rawket::tcp::State::Established,
+        "A not Established after recovery: {:?}", pair.tcp_a().state
+    );
+
+    Ok(())
+}
