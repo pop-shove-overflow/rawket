@@ -123,3 +123,42 @@ fn simultaneous_close() -> TestResult {
 
     Ok(())
 }
+
+// ── rst_abortive_close ─────────────────────────────────────────────────────────
+//
+// RFC 9293 §3.6 (Connection Close): Server calls abort(): RST sent
+// immediately, client observes Closed + Reset.  No FIN should appear.
+#[test]
+fn rst_abortive_close() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let b_snd_nxt = pair.tcp_b().snd_nxt();
+
+    pair.tcp_b_mut().abort()?;
+    assert_state(pair.tcp_b(), State::Closed, "B Closed after abort")?;
+
+    pair.transfer();
+    assert_state(pair.tcp_a(), State::Closed, "A Closed after RST")?;
+    assert_error_fired(pair.tcp_a(), TcpError::Reset, "A error = Reset")?;
+
+    let cap = pair.drain_captured();
+    let fins = cap.tcp().with_tcp_flags(TcpFlags::FIN).count();
+    assert_ok!(fins == 0, "expected no FIN frames after abort, got {fins}");
+
+    let rst_frames: Vec<_> = cap.tcp()
+        .direction(Dir::BtoA)
+        .with_tcp_flags(TcpFlags::RST)
+        .collect();
+    assert_ok!(rst_frames.len() == 1, "expected 1 RST from B, got {}", rst_frames.len());
+
+    let rst_seq = rst_frames[0].tcp.seq;
+    assert_ok!(
+        rst_seq == b_snd_nxt,
+        "RST seq ({rst_seq}) != B's snd_nxt ({b_snd_nxt})"
+    );
+
+    Ok(())
+}
