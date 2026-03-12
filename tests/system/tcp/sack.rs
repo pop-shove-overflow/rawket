@@ -223,3 +223,30 @@ fn dsack_spurious_retransmit() -> TestResult {
 
     Ok(())
 }
+
+// RFC 2018 §2: SACK-Permitted is negotiated during the three-way handshake.
+// SYN and SYN-ACK must carry SACK-Permitted option.
+#[test]
+fn sack_permitted_negotiation() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let (_pair, cap) = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect_and_capture();
+
+    let syn = cap.tcp().from_a()
+        .with_tcp_flags(TcpFlags::SYN)
+        .without_tcp_flags(TcpFlags::ACK)
+        .next()
+        .ok_or_else(|| TestFail::new("no SYN from A"))?;
+
+    let syn_ack = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::SYN)
+        .with_tcp_flags(TcpFlags::ACK)
+        .next()
+        .ok_or_else(|| TestFail::new("no SYN-ACK from B"))?;
+
+    assert_sack_permitted(&syn,     "SYN SACK-Permitted")?;
+    assert_sack_permitted(&syn_ack, "SYN-ACK SACK-Permitted")?;
+
+    Ok(())
+}
