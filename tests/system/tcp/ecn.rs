@@ -505,3 +505,86 @@ fn no_ect_on_syn() -> TestResult {
 
     Ok(())
 }
+
+// ── ece_persists_until_cwr ────────────────────────────────────────────
+//
+// RFC 3168 §6.1.3: the receiver MUST set ECE on every ACK until it
+// receives a segment with the CWR flag from the sender.
+//
+// Inject a CE-marked frame to B so B starts echoing ECE.  Drop all
+// A→B data (so CWR never reaches B).  Verify B's subsequent ACKs
+// continue to carry ECE.
+#[test]
+fn ece_persists_until_cwr() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"hello")?;
+    pair.transfer();
+
+    // Use live socket state for seq numbers (captures may not reflect final state).
+    let b_rcv_nxt = pair.tcp_b().rcv_nxt();
+    let b_snd_nxt = pair.tcp_b().snd_nxt();
+
+    pair.clear_capture();
+    let (mac_a, mac_b, ip_a, ip_b) = (pair.mac_a, pair.mac_b, pair.ip_a, pair.ip_b);
+
+    // Inject a CE-marked data frame to B (ECN bits = 0x03 = CE).
+    let mut ce_frame = build_tcp_data(
+        mac_a, mac_b, ip_a, ip_b,
+        12345, 80,
+        b_rcv_nxt,
+        b_snd_nxt,
+        b"X",
+    );
+    ce_frame[15] = (ce_frame[15] & 0xFC) | 0x03; // Set CE in IP ECN field
+    recompute_ip_checksum(&mut ce_frame);
+    recompute_frame_tcp_checksum(&mut ce_frame);
+    pair.inject_to_b(ce_frame);
+    pair.transfer_one();
+
+    // B's ACK should have ECE set.
+    let cap = pair.drain_captured();
+    let first_ece = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::ACK)
+        .any(|f| f.tcp.flags.has(TcpFlags::ECE));
+    assert_ok!(first_ece, "B did not set ECE after receiving CE-marked frame");
+
+    // Now drop all A→B data so CWR never reaches B.
+    pair.add_impairment_to_b(Impairment::Drop(PacketSpec::matching(filter::tcp::has_data())));
+
+    // Inject more data to B to elicit additional ACKs.
+    pair.clear_capture();
+    for i in 0..3u8 {
+        let data = build_tcp_data(
+            mac_a, mac_b, ip_a, ip_b,
+            12345, 80,
+            b_rcv_nxt + 1 + i as u32,
+            b_snd_nxt,
+            &[0x60 + i],
+        );
+        pair.inject_to_b(data);
+        pair.transfer_one();
+    }
+
+    // All of B's ACKs must still carry ECE (CWR was never received).
+    let cap = pair.drain_captured();
+    let acks: Vec<bool> = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::ACK)
+        .map(|f| f.tcp.flags.has(TcpFlags::ECE))
+        .collect();
+    assert_ok!(
+        !acks.is_empty(),
+        "no ACKs from B after injecting data"
+    );
+    let all_ece = acks.iter().all(|&has_ece| has_ece);
+    assert_ok!(
+        all_ece,
+        "B stopped echoing ECE before receiving CWR — \
+         RFC 3168 §6.1.3 requires ECE on every ACK until CWR; \
+         ECE flags: {acks:?}"
+    );
+
+    Ok(())
+}
