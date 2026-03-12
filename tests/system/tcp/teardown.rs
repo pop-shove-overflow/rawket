@@ -162,3 +162,54 @@ fn rst_abortive_close() -> TestResult {
 
     Ok(())
 }
+
+// ── data_after_fin_ignored ─────────────────────────────────────────────────────
+//
+// RFC 9293 §3.10.7.4 (Seventh step, CLOSE-WAIT): "This should not occur since
+// a FIN has been received from the remote side.  Ignore the segment text."
+// After B sends FIN and A enters CloseWait, data at B's FIN seq + 1 passes
+// the acceptability test but the segment text is ignored.  A remains in
+// CloseWait.
+#[test]
+fn data_after_fin_ignored() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_b_mut().close()?;
+    pair.transfer();
+    assert_state(pair.tcp_a(), State::CloseWait, "A CloseWait")?;
+
+    // Find B's FIN seq from captures.
+    let cap0 = pair.drain_captured();
+    let fin_frame = cap0.tcp()
+        .direction(Dir::BtoA)
+        .with_tcp_flags(TcpFlags::FIN)
+        .next()
+        .ok_or_else(|| TestFail::new("no BtoA FIN in capture after B.close()"))?;
+    let fin_seq = fin_frame.tcp.seq;
+
+    let a_snd_nxt = pair.tcp_a().snd_nxt();
+    let rcv_nxt_before = pair.tcp_a().rcv_nxt();
+    let data_frame = crate::harness::b_to_a(
+        &pair, fin_seq.wrapping_add(1), a_snd_nxt, b"spurious data",
+    );
+    pair.clear_capture();
+    pair.inject_to_a(data_frame);
+    pair.transfer_one();
+    assert_state(pair.tcp_a(), State::CloseWait, "A still CloseWait")?;
+
+    // RFC 9293 §3.10.7.4 seventh step: segment text is ignored in CLOSE-WAIT.
+    // rcv_nxt must not advance and no data should be delivered.
+    assert_ok!(
+        pair.tcp_a().rcv_nxt() == rcv_nxt_before,
+        "rcv_nxt advanced after data past FIN: {} → {}",
+        rcv_nxt_before, pair.tcp_a().rcv_nxt()
+    );
+    let cap = pair.drain_captured();
+    let a_sent = cap.tcp().direction(Dir::AtoB).count();
+    assert_ok!(a_sent == 0, "A sent {a_sent} frame(s) in response to data past FIN");
+
+    Ok(())
+}
