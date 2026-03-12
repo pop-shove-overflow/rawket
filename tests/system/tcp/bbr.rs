@@ -264,3 +264,43 @@ fn loss_reduces_bw_shortterm() -> TestResult {
 
     Ok(())
 }
+
+// ── startup_exit_on_loss ───────────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §5.3.1.3: Exit Startup when sustained loss > 2%.
+// Use ~10% loss; verify connection survives and BBR exits Startup.
+#[test]
+fn startup_exit_on_loss() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .rto_min_ms(10).max_retransmits(100).rto_max_ms(200)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    pair.loss_to_b(0.10);
+
+    let mut exited_startup = false;
+    pair.tcp_a_mut().send(&vec![0x77u8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0x77u8; 2_000]);
+        }
+        for snap in p.tcp_a(0).bbr_history() {
+            if snap.phase != BbrPhase::Startup {
+                exited_startup = true;
+            }
+        }
+        !exited_startup
+    });
+
+    assert_ok!(
+        exited_startup,
+        "BBR should have exited Startup due to sustained loss"
+    );
+
+    let state = pair.tcp_a().state;
+    assert_ok!(
+        state == rawket::tcp::State::Established,
+        "A not Established after lossy Startup exit: {state:?}"
+    );
+
+    Ok(())
+}
