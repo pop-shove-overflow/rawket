@@ -213,3 +213,80 @@ fn ecn_disabled_if_not_supported() -> TestResult {
 
     Ok(())
 }
+
+// ── cwr_sent_only_once ────────────────────────────────────────────────────────
+//
+// RFC 3168 §6.1.2 (The TCP Sender): The sender sets CWR on the first new data
+// segment after receiving ECE, then clears it — CWR is sent only once per
+// congestion event.
+//
+// After A receives an ECE-flagged ACK from B (B signals congestion), A sets
+// ecn_cwr_needed.  A's first new data segment must carry CWR.  The second
+// data segment must NOT carry CWR (flag sent only once per congestion event).
+#[test]
+fn cwr_sent_only_once() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"hello")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let af = cap.tcp().from_a().with_data().next()
+        .ok_or_else(|| TestFail::new("no AtoB data frame"))?;
+    let a_snd_nxt = af.tcp.seq + af.payload_len as u32;
+    let b_seq = cap.tcp().from_b().next().map(|f| f.tcp.seq).unwrap_or(0);
+
+    pair.clear_capture();
+    let (mac_b, mac_a, ip_b, ip_a) = (pair.mac_b, pair.mac_a, pair.ip_b, pair.ip_a);
+
+    // Inject ACK from B with ECE flag set (B signals network congestion).
+    let mut ece_ack = crate::packet::build_tcp_data_with_ts(
+        mac_b, mac_a, ip_b, ip_a,
+        80, 12345,
+        b_seq, a_snd_nxt,
+        0, 0, // patched by inject_to_a
+        b"",
+    );
+    ece_ack[47] |= 0x40; // set ECE bit
+    recompute_frame_tcp_checksum(&mut ece_ack);
+    pair.inject_to_a(ece_ack);
+    pair.transfer_one();
+
+    // Prove ECE was accepted (ecn_cwr_needed should be set).
+    assert_ok!(
+        pair.tcp_a().ecn_enabled(),
+        "ECN not enabled — ECE ACK may have been rejected"
+    );
+
+    // A now has ecn_cwr_needed = true.  First data segment must have CWR.
+    pair.advance_both(1000);
+    pair.tcp_a_mut().send(b"x")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let first_data_cwr = cap.tcp().from_a().with_data().next()
+        .map(|f| f.tcp.flags.has(TcpFlags::CWR));
+    assert_ok!(
+        first_data_cwr == Some(true),
+        "first data segment from A after ECE should have CWR flag"
+    );
+
+    pair.clear_capture();
+
+    // Second data segment must NOT have CWR (flag cleared after first send).
+    pair.advance_both(1000);
+    pair.tcp_a_mut().send(b"y")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let second_data_cwr = cap.tcp().from_a().with_data().next()
+        .map(|f| f.tcp.flags.has(TcpFlags::CWR));
+    assert_ok!(
+        second_data_cwr == Some(false),
+        "second data segment from A should NOT have CWR flag (sent only once)"
+    );
+
+    Ok(())
+}
