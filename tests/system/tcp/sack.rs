@@ -570,3 +570,45 @@ fn sack_hole_fill_clears_block() -> TestResult {
 
     Ok(())
 }
+
+// RFC 2883 §3: D-SACK reports duplicate data. RTO retransmit of already-ACKed
+// data: B must respond with D-SACK.
+#[test]
+fn dsack_rto_retransmit() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"dsack-test")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let af = cap.tcp().from_a().with_data().next().ok_or_else(|| TestFail::new("no AtoB data"))?;
+    let a_seq = af.tcp.seq;
+    let b_snd_nxt = af.tcp.ack;
+    pair.clear_capture();
+
+    let dup = a_to_b(&pair, a_seq, b_snd_nxt, b"dsack-test");
+    pair.inject_to_b(dup);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let dsack_frame = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::ACK)
+        .find(|f| !f.tcp.opts.sack_blocks.is_empty())
+        .ok_or_else(|| TestFail::new(
+            "B did not send D-SACK for RTO retransmit duplicate"
+        ))?;
+    assert_dsack(&dsack_frame, "RTO retransmit duplicate")?;
+
+    // D-SACK block must exactly match the duplicated range [a_seq, a_seq+10).
+    let (dl, dr) = dsack_frame.tcp.opts.sack_blocks[0];
+    assert_ok!(
+        dl == a_seq && dr == a_seq + 10,
+        "D-SACK block [{dl}, {dr}) != expected [{}, {}) for 10-byte duplicate",
+        a_seq, a_seq + 10
+    );
+
+    Ok(())
+}
