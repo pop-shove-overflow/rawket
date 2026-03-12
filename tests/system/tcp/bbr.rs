@@ -729,3 +729,89 @@ fn min_rtt_tracking() -> TestResult {
 
     Ok(())
 }
+
+// ── pacing_gain_per_phase ──────────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.3.1 (Startup gain 2.89), §4.3.3.9
+// (ProbeBW_UP gain 1.25), §4.3.3.6 (ProbeBW_DOWN gain 0.90).
+//
+// Verify exact pacing gains: pacing_rate = max_bw * gain.
+//   Startup ~2.89 (§4.3.1), ProbeBW_UP 1.25, ProbeBW_DOWN 0.90 (§4.3.3.6).
+#[test]
+fn pacing_gain_per_phase() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let mut saw_startup = false;
+    let mut startup_gain = 0u64;
+    let mut saw_up = false;
+    let mut up_gain = 0u64;
+    let mut saw_down = false;
+    let mut down_gain = 0u64;
+    let mut saw_drain = false;
+    let mut drain_gain = 0u64;
+
+    pair.tcp_a_mut().send(&vec![0x11u8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0x11u8; 2_000]);
+        }
+
+        for snap in p.tcp_a(0).bbr_history() {
+            if snap.max_bw == 0 { continue; }
+            let ratio = snap.pacing_rate_bps * 100 / snap.max_bw;
+
+            match snap.phase {
+                BbrPhase::Startup if !saw_startup => {
+                    saw_startup = true;
+                    startup_gain = ratio;
+                }
+                BbrPhase::Drain if !saw_drain => {
+                    saw_drain = true;
+                    drain_gain = ratio;
+                }
+                BbrPhase::ProbeBwUp if !saw_up => {
+                    saw_up = true;
+                    up_gain = ratio;
+                }
+                BbrPhase::ProbeBwDown if !saw_down => {
+                    saw_down = true;
+                    down_gain = ratio;
+                }
+                _ => {}
+            }
+        }
+        !(saw_startup && saw_drain && saw_up && saw_down)
+    });
+
+    assert_ok!(saw_startup, "never observed Startup phase");
+    // Startup gain: 2.89 per BBRv3 spec §5.1.  Allow ±5 for rounding.
+    assert_ok!(
+        (284..=294).contains(&startup_gain),
+        "Startup pacing gain {startup_gain}% not ≈289 (expected 2.89×)"
+    );
+
+    assert_ok!(saw_drain, "never observed Drain phase");
+    // Drain gain: ln(2)/2 ≈ 0.347 → ratio ~35.  Allow [30, 40].
+    assert_ok!(
+        (30..=40).contains(&drain_gain),
+        "Drain pacing gain {drain_gain}% not ≈35 (expected 0.347× = ln(2)/2)"
+    );
+
+    assert_ok!(saw_up, "never observed ProbeBW_UP phase");
+    // UP gain: 1.25 → ratio ~125.
+    assert_ok!(
+        (120..=130).contains(&up_gain),
+        "ProbeBW_UP pacing gain {up_gain}% not ≈125 (expected 1.25×)"
+    );
+
+    assert_ok!(saw_down, "never observed ProbeBW_DOWN phase");
+    // DOWN gain: 0.90 → ratio ~90.
+    assert_ok!(
+        (85..=95).contains(&down_gain),
+        "ProbeBW_DOWN pacing gain {down_gain}% not ≈90 (expected 0.90×)"
+    );
+
+    Ok(())
+}
