@@ -880,3 +880,66 @@ fn prior_cwnd_restored_after_probe_rtt() -> TestResult {
 
     Ok(())
 }
+
+// ── drain_exits_at_bdp ────────────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.3.2: Drain → ProbeBW transition occurs when
+// bytes_in_flight ≤ BDP.
+#[test]
+fn drain_exits_at_bdp() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .rto_min_ms(10)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(&vec![0x66u8; 1_000_000])?;
+
+    // Use transfer() + bbr_history() to find the Drain→ProbeBwDown transition
+    // and verify inflight ≤ BDP at that transition point.
+    let mut drain_snap = None;
+    let mut down_snap = None;
+
+    pair.tcp_a_mut().send(&vec![0x66u8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0x66u8; 2_000]);
+        }
+
+        for snap in p.tcp_a(0).bbr_history() {
+            if snap.phase == BbrPhase::Drain && drain_snap.is_none() {
+                drain_snap = Some(snap.clone());
+            }
+            if snap.phase == BbrPhase::ProbeBwDown && drain_snap.is_some() && down_snap.is_none() {
+                down_snap = Some(snap.clone());
+            }
+        }
+        down_snap.is_none()
+    });
+
+    let drain = drain_snap.ok_or_else(|| crate::assert::TestFail::new(
+        "no Drain entry in bbr_history — Startup never exited"
+    ))?;
+    assert_ok!(
+        drain.filled_pipe,
+        "Drain snapshot has filled_pipe=false — Startup exit condition wrong"
+    );
+
+    let down = down_snap.ok_or_else(|| crate::assert::TestFail::new(
+        "no ProbeBwDown entry after Drain — Drain never completed"
+    ))?;
+
+    // At ProbeBwDown entry (= Drain exit), inflight must be ≤ BDP + 1 MSS.
+    let mss = pair.tcp_a().peer_mss() as u64;
+    let bdp = if down.max_bw > 0 && down.min_rtt_ns < u64::MAX {
+        down.max_bw * down.min_rtt_ns / 1_000_000_000
+    } else {
+        0
+    };
+    assert_ok!(
+        (down.bytes_in_flight as u64) <= bdp + mss,
+        "at Drain exit, inflight ({}) > BDP+MSS ({}); bdp={bdp}, mss={mss}",
+        down.bytes_in_flight, bdp + mss
+    );
+
+    Ok(())
+}
