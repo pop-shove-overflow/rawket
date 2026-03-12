@@ -255,3 +255,46 @@ fn keepalive_disabled_by_default() -> TestResult {
 
     Ok(())
 }
+
+// ── keepalive_probe_content ───────────────────────────────────────────────────
+//
+// Keepalive probe: seq = snd_una - 1, payload_len = 0, TSopt present.
+// RFC 1122 §4.2.3.6 DISCUSSION: "generally contains SEG.SEQ = SND.NXT-1"
+// (descriptive, not normative).
+#[test]
+fn keepalive_probe_content() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .keepalive_idle_ms(50)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let idle = pair.tcp_cfg.keepalive_idle_ms as i64;
+
+    let snd_una = pair.tcp_a().snd_una();
+
+    pair.advance_both(idle + 10);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let probe = cap.tcp()
+        .direction(Dir::AtoB)
+        .filter(|f| f.payload_len == 0
+            && f.tcp.flags.has(TcpFlags::ACK)
+            && !f.tcp.flags.has(TcpFlags::SYN)
+            && !f.tcp.flags.has(TcpFlags::RST)
+            && !f.tcp.flags.has(TcpFlags::FIN))
+        .next()
+        .ok_or_else(|| crate::assert::TestFail::new("no keepalive probe"))?;
+
+    // Implementation choice: seq = SND.NXT-1 (= snd_una-1 when no data in flight).
+    // RFC 1122 §4.2.3.6 DISCUSSION says "generally contains" this value (non-normative).
+    assert_ok!(
+        probe.tcp.seq == snd_una.wrapping_sub(1),
+        "keepalive probe seq ({}) should be snd_una-1 ({})",
+        probe.tcp.seq, snd_una.wrapping_sub(1)
+    );
+
+    assert_timestamps_present(&probe, "keepalive probe")?;
+
+    Ok(())
+}
