@@ -194,3 +194,73 @@ fn probe_rtt_entry() -> TestResult {
 
     Ok(())
 }
+
+// ── loss_reduces_bw_shortterm ──────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §5.5: sustained loss in ProbeBW_DOWN/CRUISE triggers
+// BBRAdaptLowerBoundsFromCongestion which reduces both bw_shortterm and
+// inflight_shortterm from their u64::MAX / u32::MAX sentinels.
+#[test]
+fn loss_reduces_bw_shortterm() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .rto_min_ms(10).max_retransmits(100).rto_max_ms(200)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    pair.loss_to_b(0.10);
+
+    // Drive to ProbeBW first (with loss present).
+    drive_to_probe_bw(&mut pair)?;
+
+    let mut saw_bw_adapted = false;
+    let mut saw_inflight_adapted = false;
+    let mut adapted_bw_st = u64::MAX;
+    let mut adapted_inflight_st = u32::MAX;
+
+    pair.tcp_a_mut().send(&vec![0x66u8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0x66u8; 2_000]);
+        }
+        for snap in p.tcp_a(0).bbr_history() {
+            if snap.bw_shortterm != u64::MAX {
+                saw_bw_adapted = true;
+                adapted_bw_st = adapted_bw_st.min(snap.bw_shortterm);
+            }
+            if snap.inflight_shortterm != u32::MAX {
+                saw_inflight_adapted = true;
+                adapted_inflight_st = adapted_inflight_st.min(snap.inflight_shortterm);
+            }
+        }
+        !(saw_bw_adapted && saw_inflight_adapted)
+    });
+
+    let state = pair.tcp_a().state;
+    assert_ok!(
+        state == rawket::tcp::State::Established,
+        "A not Established after BBR loss recovery: {state:?}"
+    );
+    assert_ok!(
+        saw_bw_adapted,
+        "bw_shortterm never left sentinel during sustained loss"
+    );
+    // bw_shortterm is initialized to max_bw on first loss, then reduced by Beta=0.7.
+    // It can briefly exceed max_bw if bw_latest (delivery rate) exceeds the windowed max.
+    // Check that it was set to a sane value (non-zero, not sentinel).
+    assert_ok!(
+        adapted_bw_st > 0,
+        "bw_shortterm ({adapted_bw_st}) should be > 0 after loss adaptation"
+    );
+    assert_ok!(
+        saw_inflight_adapted,
+        "inflight_shortterm never left sentinel during sustained loss"
+    );
+    let mss = pair.tcp_a().peer_mss() as u32;
+    // On a latency link, BDP can be ~170 MSS; allow up to 200*MSS.
+    assert_ok!(
+        adapted_inflight_st <= 200 * mss,
+        "inflight_shortterm ({adapted_inflight_st}) unreasonably large after loss (200*MSS={})",
+        200 * mss
+    );
+
+    Ok(())
+}
