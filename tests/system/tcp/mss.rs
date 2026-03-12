@@ -104,3 +104,71 @@ fn negotiation_smaller_peer() -> TestResult {
     Ok(())
 }
 
+// RFC 9293 §3.7.1: if the MSS option is absent from the peer's SYN, the
+// default MSS of 536 must be assumed; SYN-ACK SHOULD still carry MSS.
+#[test]
+fn mss_option_absent() -> TestResult {
+    let mut np = setup_network_pair();
+    let cfg = TcpConfig::default();
+
+    let server = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {}, cfg,
+    ).expect("accept");
+    let ib = np.add_tcp_b(server);
+
+    let isn_a = 0x1000_0000u32;
+    let syn = build_tcp_syn(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a, 0,
+        0x02,
+        None,   // no MSS option
+        None, None, false,
+    );
+    // Drop RSTs from A (no A-side socket, so A would RST B's SYN-ACK).
+    np.add_impairment_to_b(Impairment::Drop(PacketSpec::matching(filter::tcp::rst())));
+
+    np.inject_to_b(syn);
+    np.transfer_one();
+
+    let syn_ack = np.drain_captured().tcp()
+        .find(|f| f.dir == Dir::BtoA && f.tcp.flags.has(TcpFlags::SYN) && f.tcp.flags.has(TcpFlags::ACK))
+        .ok_or_else(|| crate::assert::TestFail::new("no SYN-ACK from B"))?;
+
+    // RFC 9293 §3.7.1: SYN-ACK SHOULD carry MSS option even when peer SYN omitted it.
+    assert_ok!(
+        syn_ack.tcp.opts.mss.is_some(),
+        "SYN-ACK missing MSS option (RFC 9293 §3.7.1 SHOULD)"
+    );
+
+    let ack = build_tcp_data(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a + 1,
+        syn_ack.tcp.seq + 1,
+        &[],
+    );
+    np.inject_to_b(ack);
+    np.transfer_one();
+
+    assert_state(np.tcp_b(ib), State::Established, "B state after handshake")?;
+    np.clear_impairments();
+    np.clear_capture();
+
+    let big = vec![0xabu8; 2000];
+    np.tcp_b_mut(ib).send(&big)?;
+    np.transfer_one();
+
+    let cap = np.drain_captured();
+    let oversized = cap.tcp().filter(|f| f.dir == Dir::BtoA && f.payload_len > 536).count();
+    assert_ok!(oversized == 0, "B sent {oversized} segments > 536 bytes despite peer advertising no MSS");
+
+    let sent = cap.tcp().filter(|f| f.dir == Dir::BtoA && f.payload_len > 0).count();
+    assert_ok!(sent > 0, "B sent no data segments");
+
+    Ok(())
+}
