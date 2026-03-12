@@ -788,3 +788,78 @@ fn send_in_non_established() -> TestResult {
 
     Ok(())
 }
+
+// RFC 9293 §3.5.3 (Reset Processing): In SynSent, a bare RST (no ACK) and a
+// RST+ACK with invalid ack must both be silently dropped.
+#[test]
+fn rst_bare_in_syn_sent_dropped() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    np.add_impairment_to_a(Impairment::Drop(PacketSpec::any()));
+
+    let client = TcpSocket::connect_now(
+        np.iface_a(),
+        "10.0.0.1:12345".parse().unwrap(),
+        "10.0.0.2:80".parse().unwrap(),
+        Ipv4Addr::from([10, 0, 0, 2]),
+        |_| {}, |_| {}, cfg,
+    )?;
+    let ia = np.add_tcp_a(client);
+
+    assert_state(np.tcp_a(ia), State::SynSent, "A in SynSent")?;
+
+    np.clear_impairments();
+
+    // Capture A's ISN from the (dropped) SYN before clearing capture.
+    let a_isn = np.drain_captured().all_tcp()
+        .find(|f| f.dir == Dir::AtoB && f.tcp.flags.has(TcpFlags::SYN))
+        .map(|f| f.tcp.seq)
+        .ok_or_else(|| crate::assert::TestFail::new("no SYN from A"))?;
+
+    // Test 1: bare RST (no ACK) — must be silently dropped.
+    let bare_rst = build_tcp_data_with_flags(
+        np.mac_b, np.mac_a,
+        np.ip_b,  np.ip_a,
+        80, 12345,
+        0, 0,
+        0x04, // RST only
+        0,
+        &[],
+    );
+    np.clear_capture();
+    np.inject_to_a(bare_rst);
+    np.transfer_one();
+
+    assert_state(np.tcp_a(ia), State::SynSent, "A should stay SynSent after bare RST")?;
+    assert_ok!(np.tcp_a(ia).last_error.is_none(), "bare RST should not set error");
+
+    let cap = np.drain_captured();
+    let a_sent = cap.tcp().filter(|f| f.dir == Dir::AtoB).count();
+    assert_ok!(a_sent == 0, "A sent {a_sent} frame(s) in response to bare RST — expected 0");
+
+    // Test 2: RST+ACK with wrong ack — must be silently dropped.
+    np.clear_capture();
+    let bad_ack_rst = build_tcp_data_with_flags(
+        np.mac_b, np.mac_a,
+        np.ip_b,  np.ip_a,
+        80, 12345,
+        0,
+        a_isn + 999,
+        0x14, // RST|ACK
+        0,
+        &[],
+    );
+    np.inject_to_a(bad_ack_rst);
+    np.transfer_one();
+
+    assert_state(np.tcp_a(ia), State::SynSent, "A should stay SynSent after RST+ACK with wrong ack")?;
+
+    let cap2 = np.drain_captured();
+    let a_sent2 = cap2.tcp().filter(|f| f.dir == Dir::AtoB).count();
+    assert_ok!(a_sent2 == 0, "A sent {a_sent2} frame(s) in response to bad-ack RST — expected 0");
+
+    Ok(())
+}
