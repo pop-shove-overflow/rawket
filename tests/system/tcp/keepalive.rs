@@ -119,3 +119,63 @@ fn timeout_triggers_error() -> TestResult {
 
     Ok(())
 }
+
+// ── data_resets_timer ─────────────────────────────────────────────────────────
+//
+// RFC 1122 §4.2.3.6: the keepalive timer resets on any data exchange.
+//
+// Advancing 40 ms then sending data (ACKed by B) resets A's timer.
+// Another 40 ms must leave A still Established (40 < 50 ms idle).
+#[test]
+fn data_resets_timer() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .keepalive_idle_ms(500)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let idle = pair.tcp_cfg.keepalive_idle_ms as i64;
+
+    // Advance to near keepalive deadline, then send data to reset the timer.
+    pair.advance_both(idle - 10);
+    pair.transfer_one();
+    assert_state(pair.tcp_a(), State::Established, "A still Established before data")?;
+
+    pair.tcp_a_mut().send(b"hello")?;
+    // transfer_while stops once B has ACKed the data (snd_una advances).
+    let snd_una_before = pair.tcp_a().snd_una();
+    pair.transfer_while(|p| p.tcp_a(0).snd_una() == snd_una_before);
+
+    let snd_una = pair.tcp_a().snd_una();
+
+    // Keepalive timer was reset by the data exchange. Advance to
+    // 1ms before the idle period — no probe should fire.
+    pair.clear_capture();
+    pair.clock_a.advance_ns((idle - 1) * 1_000_000);
+    pair.clock_b.advance_ns((idle - 1) * 1_000_000);
+    pair.transfer_one();
+
+    let is_probe = |f: &crate::capture::ParsedFrame| {
+        f.payload_len == 0
+            && f.tcp.flags.has(TcpFlags::ACK)
+            && !f.tcp.flags.has(TcpFlags::SYN)
+            && !f.tcp.flags.has(TcpFlags::RST)
+            && !f.tcp.flags.has(TcpFlags::FIN)
+            && f.tcp.seq == snd_una.wrapping_sub(1)
+    };
+
+    let cap = pair.drain_captured();
+    let probes_before = cap.tcp().from_a().filter(|f| is_probe(f)).count();
+    assert_ok!(probes_before == 0, "probe fired before reset idle period expired ({probes_before})");
+
+    assert_state(pair.tcp_a(), State::Established, "A Established after data reset timer")?;
+
+    // Now advance 2ms past the deadline — probe should fire.
+    pair.advance_both(2);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let probes_after = cap.tcp().from_a().filter(|f| is_probe(f)).count();
+    assert_ok!(probes_after >= 1, "no probe fired after full reset idle period");
+
+    Ok(())
+}
