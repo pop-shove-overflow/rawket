@@ -1,24 +1,12 @@
 use crate::{
     assert_ok,
-    harness::{fast_tcp_cfg, setup_tcp_pair},
+    harness::setup_tcp_pair,
     TestResult,
 };
 use rawket::{
     bridge::LinkProfile,
     tcp::BbrPhase,
 };
-
-/// TCP config for loss tests: tolerates sustained moderate packet loss.
-///
-/// Key changes from fast_tcp_cfg():
-/// - `max_retransmits` = 100 — prevents connection death under high retransmit counts
-/// - `rto_max_ms` = 200 — caps exponential backoff so RTO doesn't stall tests
-fn lossy_tcp_cfg() -> TcpConfig {
-    let mut cfg = fast_tcp_cfg();
-    cfg.max_retransmits = 100;
-    cfg.rto_max_ms = 200;
-    cfg
-}
 
 fn is_probe_bw(phase: BbrPhase) -> bool {
     matches!(
@@ -1213,6 +1201,90 @@ fn beta_070_multiplicative_decrease() -> TestResult {
         min_ratio_pct >= 20 && min_ratio_pct <= 75,
         "bw_shortterm/max_bw min ratio {min_ratio_pct}% outside [20%, 75%] — \
          expected Beta=0.7 (0.7^1=70%, 0.7^2=49%, 0.7^3=34%)"
+    );
+
+    Ok(())
+}
+
+// ── startup_loss_exit_requires_6_ranges ───────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §5.3.1.3: Startup loss exit requires all three:
+//   1. loss_in_round = true
+//   2. loss_rate > 2%
+//   3. ≥6 discontiguous lost sequence ranges (BBRStartupFullLossCnt=6)
+//
+// Use deterministic packet drops via bridge impairments to avoid PRNG
+// non-determinism killing the connection or dropping handshake packets.
+#[test]
+fn startup_loss_exit_requires_6_ranges() -> TestResult {
+    use rawket::bridge::{Impairment, PacketSpec, PortDir};
+
+    // Use a latency link so many packets are in flight per round — this
+    // ensures the 8 deterministic drops produce ≥6 discontiguous loss ranges
+    // within a single round (the spec's unit of measurement).
+    //
+    // Set initial_cwnd_pkts high so the first unpaced burst sends 200+
+    // segments before pacing kicks in.  This simulates late Startup where
+    // cwnd has grown exponentially to allow many segments per round.
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .max_retransmits(100);
+    pair.tcp_cfg.initial_cwnd_pkts = 200;
+    let mut pair = pair.connect();
+
+    // Confirm we're in Startup.
+    let phase = pair.tcp_a().bbr_phase();
+    assert_ok!(phase == BbrPhase::Startup, "not in Startup: {phase:?}");
+
+    // Drop 8 consecutive data segments (10-17) on A's egress.  This creates
+    // a single large gap followed by a large delivered region.  The receiver's
+    // OOO buffer holds a single merged range (segments 18+), and the sender
+    // gets SACK blocks covering everything after the gap.  RACK then detects
+    // the 8 contiguous dropped segments.
+    //
+    // However, 8 contiguous drops form 1 range, not 6.  Instead, drop every
+    // OTHER segment to create 8 discontiguous single-segment gaps.  Each gap
+    // has a delivered segment between it, creating 8 separate loss ranges.
+    use rawket::filter::tcp as tcp_filter;
+    let port_a = pair.net.port_a;
+    for n in [10, 12, 14, 16, 18, 20, 22, 24] {
+        pair.net.bridge.add_impairment(port_a, PortDir::Ingress,
+            Impairment::Drop(PacketSpec::nth_matching(n, tcp_filter::has_data())));
+    }
+
+    let mut peak_loss_events: u32 = 0;
+    let mut exited_startup = false;
+
+    pair.tcp_a_mut().send(&vec![0x99u8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0x99u8; 2_000]);
+        }
+        let le = p.tcp_a(0).bbr_loss_events_in_round();
+        if le > peak_loss_events {
+            peak_loss_events = le;
+        }
+        for snap in p.tcp_a(0).bbr_history() {
+            if snap.phase != BbrPhase::Startup {
+                exited_startup = true;
+            }
+        }
+        !exited_startup
+    });
+
+    // Must have exited Startup — the 12 deterministic drops produce ≥6
+    // discontiguous loss ranges in a single round, satisfying the
+    // BBRStartupFullLossCnt=6 threshold (spec §5.3.1.3).
+    assert_ok!(exited_startup, "never exited Startup despite 12 deterministic loss ranges");
+
+    // Verify the loss-exit path was exercised: peak loss_events must have
+    // reached ≥6 in at least one round during Startup.  Do NOT accept
+    // filled_pipe as an alternative — this test specifically validates the
+    // BBRStartupFullLossCnt=6 exit criterion.
+    assert_ok!(
+        peak_loss_events >= 6,
+        "peak loss_events_in_round={peak_loss_events} (<6) — \
+         loss-exit path was not confirmed (8 deterministic drops should produce ≥6 ranges)"
     );
 
     Ok(())
