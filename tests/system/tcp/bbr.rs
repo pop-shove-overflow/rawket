@@ -943,3 +943,60 @@ fn drain_exits_at_bdp() -> TestResult {
 
     Ok(())
 }
+
+// ── round_count_increments ────────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §5.1: BBROnACK updates round_count when
+// delivered exceeds next_round_delivered, marking a new round trip.
+//
+// BBR round counting: round_count increments after approximately 1 RTT of
+// delivered data.
+#[test]
+fn round_count_increments() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let mut prev_round = 0u64;
+    let mut increments = 0u32;
+
+    pair.tcp_a_mut().send(&vec![0x77u8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0x77u8; 2_000]);
+        }
+        let rc = p.tcp_a(0).bbr_round_count();
+        if rc > prev_round {
+            increments += 1;
+            prev_round = rc;
+        }
+        // Run until we've seen at least 10 round increments.
+        increments < 10
+    });
+
+    assert_ok!(
+        increments >= 10,
+        "round_count incremented only {increments} times — expected at least 10"
+    );
+    assert_ok!(
+        prev_round >= 10,
+        "round_count only reached {prev_round} after {increments} increments — expected at least 10"
+    );
+
+    // After 10+ rounds, delivered must be substantial (not stuck at 0).
+    let delivered = pair.tcp_a().bbr_delivered();
+    assert_ok!(
+        delivered > 10_000,
+        "delivered ({delivered}) too low after 10+ BBR rounds — round counting may be broken"
+    );
+
+    // next_round_delivered is the threshold for the NEXT round.
+    // It's set to delivered at round start, so it should be <= delivered + 1 flight.
+    let next_rd = pair.tcp_a().bbr_next_round_delivered();
+    assert_ok!(
+        next_rd > 0,
+        "next_round_delivered is 0 after 10+ rounds — round boundary tracking broken"
+    );
+
+    Ok(())
+}
