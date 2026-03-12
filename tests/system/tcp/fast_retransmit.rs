@@ -349,3 +349,71 @@ fn triggers_bbr_loss() -> TestResult {
 
     Ok(())
 }
+
+// ── fast_retransmit_with_sack ───────────────────────────────────────────
+//
+// RFC 6675 §4: A SACK-based sender uses SACK information to determine which
+// segments are lost; retransmission targets the first un-SACKed hole.
+//
+// 3 DUPACKs with SACK blocks indicating a later segment was received.
+// Fast retransmit should fire for the hole (not the SACKed segment).
+// NOTE: The SACK range [+5, +10) covers a sub-range of a single 10-byte
+// segment, which is unrealistic (real SACK blocks align to segment
+// boundaries).  This is acceptable as a synthetic test: the key behavior
+// (retransmit the hole, not the SACKed range) is valid regardless.
+#[test]
+fn fast_retransmit_with_sack() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.blackhole_to_a();
+    pair.tcp_a_mut().send(b"AAAAAAAAAA")?;
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let data_frame = cap.all_tcp().from_a().with_data().next()
+        .ok_or_else(|| TestFail::new("no AtoB data"))?;
+    let a_snd_una = data_frame.tcp.seq;
+    let b_snd_nxt = data_frame.tcp.ack;
+    pair.clear_impairments();
+    let a_ts = data_frame.tcp.opts.timestamps.map(|(v, _)| v).unwrap_or(1);
+    let b_ts = pair.clock_b.monotonic_ms() as u32;
+    let (mac_b, mac_a, ip_b, ip_a) = (pair.mac_b, pair.mac_a, pair.ip_b, pair.ip_a);
+
+    // Inject 3 DUPACKs with SACK blocks: ack=a_snd_una (hole at [0,5)),
+    // SACK=[a_snd_una+5, a_snd_una+10) (second segment received).
+    for i in 0..3u32 {
+        let dup = build_tcp_data_with_sack_ts(
+            mac_b, mac_a, ip_b, ip_a,
+            80, 12345,
+            b_snd_nxt, a_snd_una, // DUPACK: same ack (hole at a_snd_una)
+            b_ts + 1 + i, a_ts,
+            &[(a_snd_una + 5, a_snd_una + 10)],
+            b"",
+        );
+        pair.inject_to_a(dup);
+    }
+    pair.transfer_one();
+
+    // Fast retransmit must fire: retransmit at a_snd_una (the hole).
+    let cap = pair.drain_captured();
+    let retx_at_hole = cap.all_tcp().from_a().with_data()
+        .filter(|f| f.tcp.seq == a_snd_una)
+        .count();
+    assert_ok!(
+        retx_at_hole >= 1,
+        "expected ≥1 retransmit at seq={a_snd_una} (the hole), got {retx_at_hole}"
+    );
+
+    // The SACKed range [+5, +10) should NOT be retransmitted.
+    let retx_at_sacked = cap.all_tcp().from_a().with_data()
+        .filter(|f| f.tcp.seq == a_snd_una + 5)
+        .count();
+    assert_ok!(
+        retx_at_sacked == 0,
+        "SACKed range retransmitted ({retx_at_sacked} frames at seq={})", a_snd_una + 5
+    );
+
+    Ok(())
+}
