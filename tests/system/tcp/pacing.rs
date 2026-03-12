@@ -447,3 +447,47 @@ fn probe_rtt_cwnd_during_phase() -> TestResult {
 
     Ok(())
 }
+
+// ── probe_bw_up_increases_rate ────────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.3.3.9: ProbeBwUp pacing_gain = 1.25.
+//
+// Drive BBR into ProbeBwUp; verify pacing_rate > max_bw at that time
+// (probe-up gain > 1.0).
+#[test]
+fn probe_bw_up_increases_rate() -> TestResult {
+    let mut pair = setup_tcp_pair().profile(LinkProfile::leased_line_100m()).connect();
+
+    let mut found_up = false;
+    pair.tcp_a_mut().send(&vec![0x22u8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0x22u8; 2_000]);
+        }
+
+        for snap in p.tcp_a(0).bbr_history() {
+            if snap.phase == BbrPhase::ProbeBwUp && snap.max_bw > 0 {
+                found_up = true;
+            }
+        }
+        !found_up
+    });
+
+    assert_ok!(found_up, "never observed ProbeBwUp entry with measurable BW in bbr_history()");
+    for snap in pair.tcp_a().bbr_history() {
+        if snap.phase == BbrPhase::ProbeBwUp && snap.max_bw > 0 {
+            let rate = snap.pacing_rate_bps;
+            let bw = snap.max_bw;
+            // BBRv3 §4.4.8: ProbeBwUp pacing_gain = 1.25.
+            // Verify rate/bw ∈ [1.20, 1.30] (±4% around 1.25).
+            assert_ok!(
+                rate >= bw * 120 / 100 && rate <= bw * 130 / 100,
+                "ProbeBwUp pacing_rate/max_bw not in [1.20, 1.30]: rate={rate}, bw={bw}, \
+                 ratio={:.2}", rate as f64 / bw as f64
+            );
+            return Ok(());
+        }
+    }
+    assert_ok!(false, "ProbeBwUp found during transfer but not in final history");
+    Ok(())
+}
