@@ -185,3 +185,28 @@ fn simultaneous_open() -> TestResult {
 
     Ok(())
 }
+
+// RFC 9293 §3.5.3 (Reset Processing): RST in Established aborts the connection.
+#[test]
+fn rst_in_established() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_b_mut().abort()?;
+    pair.transfer();
+
+    assert_state(pair.tcp_a(), State::Closed, "A Closed after RST from B")?;
+    assert_state(pair.tcp_b(), State::Closed, "B Closed after abort()")?;
+    assert_error_fired(pair.tcp_a(), TcpError::Reset, "A error after RST")?;
+
+    let cap = pair.drain_captured();
+    let rst_count = cap.tcp()
+        .direction(Dir::BtoA)
+        .with_tcp_flags(TcpFlags::RST)
+        .count();
+    assert_ok!(rst_count == 1, "expected 1 RST from B, got {rst_count}");
+
+    Ok(())
+}
