@@ -13,3 +13,4 @@ mod pacing;
 mod persist;
 mod keepalive;
 mod ooo;
+mod teardown;
