@@ -8,18 +8,6 @@ use rawket::{
     tcp::{BbrPhase, TcpConfig},
 };
 
-fn broadband_link() -> LinkProfile {
-    LinkProfile::leased_line_100m()
-}
-
-fn lossy_instant() -> LinkProfile {
-    LinkProfile::instant().loss_to_b(0.10)
-}
-
-fn broadband_lossy() -> LinkProfile {
-    LinkProfile::leased_line_100m().loss_to_b(0.10)
-}
-
 /// TCP config for loss tests: tolerates sustained moderate packet loss.
 ///
 /// Key changes from fast_tcp_cfg():
@@ -116,5 +104,38 @@ fn startup_phase_grows_cwnd() -> TestResult {
 
 // ── startup_to_drain_transition ────────────────────────────────────────────
 //
+// draft-ietf-ccwg-bbr-04 §4.3.1, §4.3.2, §4.3.3: BBR progresses through
+// Startup → Drain → ProbeBW as it discovers link capacity.
+//
 // Track bbr_phase() during a 1MiB transfer and verify we observe
 // Startup → Drain → ProbeBw transitions.
+#[test]
+fn startup_to_drain_transition() -> TestResult {
+    let mut pair = setup_tcp_pair().profile(LinkProfile::leased_line_100m()).connect();
+
+    let mut saw_startup = false;
+    let mut saw_drain = false;
+    let mut saw_probe_bw = false;
+
+    pair.tcp_a_mut().send(&vec![0x22u8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0x22u8; 2_000]);
+        }
+        for snap in p.tcp_a(0).bbr_history() {
+            match snap.phase {
+                BbrPhase::Startup => saw_startup = true,
+                BbrPhase::Drain => saw_drain = true,
+                p if is_probe_bw(p) => saw_probe_bw = true,
+                _ => {}
+            }
+        }
+        !(saw_startup && saw_drain && saw_probe_bw)
+    });
+
+    assert_ok!(saw_startup, "never observed Startup phase");
+    assert_ok!(saw_drain, "never observed Drain phase");
+    assert_ok!(saw_probe_bw, "never observed ProbeBw phase");
+
+    Ok(())
+}
