@@ -88,6 +88,13 @@ pub enum Loss {
     GilbertElliott { p: f64, r: f64, h: f64, k: f64 },
 }
 
+impl From<f64> for Loss {
+    /// `0.10` → `Loss::Rate(0.10)`.
+    fn from(rate: f64) -> Self {
+        Loss::Rate(rate)
+    }
+}
+
 // ── Jitter ────────────────────────────────────────────────────────────────────
 
 /// Jitter model for a directional link profile.
@@ -101,6 +108,13 @@ pub enum Jitter {
     Normal { mean_ns: f64, std_dev_ns: f64 },
     /// Pareto type-II (heavy-tailed) jitter.
     Pareto { mean_ns: f64, std_dev_ns: f64 },
+}
+
+impl From<u64> for Jitter {
+    /// `5` → `Jitter::Uniform(5)`.
+    fn from(half_ns: u64) -> Self {
+        Jitter::Uniform(half_ns)
+    }
 }
 
 // ── Reorder ───────────────────────────────────────────────────────────────────
@@ -218,14 +232,14 @@ impl DirectionProfile {
         self.bandwidth_bps(gbps * 1_000_000_000)
     }
 
-    /// Set jitter model.
-    pub fn jitter(self, j: Jitter) -> Self {
-        DirectionProfile { jitter: j, ..self }
+    /// Set jitter model.  Accepts `Jitter` or `u64` (→ `Jitter::Uniform`).
+    pub fn jitter(self, j: impl Into<Jitter>) -> Self {
+        DirectionProfile { jitter: j.into(), ..self }
     }
 
-    /// Set loss model.
-    pub fn loss(self, l: Loss) -> Self {
-        DirectionProfile { loss: l, ..self }
+    /// Set loss model.  Accepts `Loss` or `f64` (→ `Loss::Rate`).
+    pub fn loss(self, l: impl Into<Loss>) -> Self {
+        DirectionProfile { loss: l.into(), ..self }
     }
 
     /// Set reorder model.
@@ -331,22 +345,75 @@ impl LinkProfile {
         LinkProfile { a_to_b, b_to_a }
     }
 
-    /// Transform the A→B direction.
-    pub fn map_a_to_b(mut self, f: impl Fn(DirectionProfile) -> DirectionProfile) -> Self {
-        self.a_to_b = f(self.a_to_b);
+    // ── Directional impairment builders (chainable) ─────────────────────────
+
+    /// Set loss model on A→B direction.
+    pub fn loss_to_b(mut self, l: impl Into<Loss>) -> Self {
+        self.a_to_b.loss = l.into(); self
+    }
+
+    /// Set loss model on B→A direction.
+    pub fn loss_to_a(mut self, l: impl Into<Loss>) -> Self {
+        self.b_to_a.loss = l.into(); self
+    }
+
+    /// Set loss model on both directions.
+    pub fn loss_both(mut self, l: impl Into<Loss>) -> Self {
+        let l = l.into();
+        self.a_to_b.loss = l.clone();
+        self.b_to_a.loss = l;
         self
     }
 
-    /// Transform the B→A direction.
-    pub fn map_b_to_a(mut self, f: impl Fn(DirectionProfile) -> DirectionProfile) -> Self {
-        self.b_to_a = f(self.b_to_a);
+    /// Set jitter model on A→B direction.
+    pub fn jitter_to_b(mut self, j: impl Into<Jitter>) -> Self {
+        self.a_to_b.jitter = j.into(); self
+    }
+
+    /// Set jitter model on B→A direction.
+    pub fn jitter_to_a(mut self, j: impl Into<Jitter>) -> Self {
+        self.b_to_a.jitter = j.into(); self
+    }
+
+    /// Set jitter model on both directions.
+    pub fn jitter_both(mut self, j: impl Into<Jitter>) -> Self {
+        let j = j.into();
+        self.a_to_b.jitter = j.clone();
+        self.b_to_a.jitter = j;
         self
     }
 
-    /// Transform both directions with the same function.
-    pub fn map_both(mut self, f: impl Fn(DirectionProfile) -> DirectionProfile) -> Self {
-        self.a_to_b = f(self.a_to_b);
-        self.b_to_a = f(self.b_to_a);
+    /// Set reorder model on A→B direction.
+    pub fn reorder_to_b(mut self, r: Reorder) -> Self {
+        self.a_to_b.reorder = r; self
+    }
+
+    /// Set reorder model on B→A direction.
+    pub fn reorder_to_a(mut self, r: Reorder) -> Self {
+        self.b_to_a.reorder = r; self
+    }
+
+    /// Set reorder model on both directions.
+    pub fn reorder_both(mut self, r: Reorder) -> Self {
+        self.a_to_b.reorder = r.clone();
+        self.b_to_a.reorder = r;
+        self
+    }
+
+    /// Set duplicate rate on A→B direction.
+    pub fn duplicate_to_b(mut self, rate: f64) -> Self {
+        self.a_to_b.duplicate_rate = rate; self
+    }
+
+    /// Set duplicate rate on B→A direction.
+    pub fn duplicate_to_a(mut self, rate: f64) -> Self {
+        self.b_to_a.duplicate_rate = rate; self
+    }
+
+    /// Set duplicate rate on both directions.
+    pub fn duplicate_both(mut self, rate: f64) -> Self {
+        self.a_to_b.duplicate_rate = rate;
+        self.b_to_a.duplicate_rate = rate;
         self
     }
 
@@ -650,6 +717,18 @@ impl LinkProfile {
     }
 
     // ── Preset: Leased Lines / WAN ────────────────────────────────────────────
+
+    pub fn leased_line_100m() -> Self {
+        Self::symmetric(DirectionProfile::instant().latency(10).bandwidth_bps(100_000_000))
+    }
+
+    pub fn leased_line_1g() -> Self {
+        Self::symmetric(DirectionProfile::instant().latency(10).bandwidth_bps(1_000_000_000))
+    }
+
+    pub fn leased_line_10g() -> Self {
+        Self::symmetric(DirectionProfile::instant().latency(10).bandwidth_bps(10_000_000_000))
+    }
 
     pub fn t1() -> Self {
         Self::symmetric(
@@ -1074,6 +1153,59 @@ impl Bridge {
     pub fn flush_fdb(&self) {
         self.inner.borrow_mut().fdb.clear();
     }
+
+    /// Connect two network interfaces through this bridge using a
+    /// [`LinkProfile`].  Loss is applied on ingress (before bridging) and
+    /// delay on egress (during delivery), matching real-world semantics.
+    ///
+    /// Returns `(port_a, port_b)`.
+    pub fn add_link<'a>(
+        &self,
+        net_a:     &'a mut Network,
+        iface_a:   usize,
+        net_b:     &'a mut Network,
+        iface_b:   usize,
+        link:      &LinkProfile,
+    ) -> (usize, usize) {
+        // A→B: loss on port_a ingress, delay on port_b egress.
+        // B→A: loss on port_b ingress, delay on port_a egress.
+        let a_ingress = DirectionProfile {
+            loss: link.a_to_b.loss.clone(),
+            ..DirectionProfile::instant()
+        };
+        let a_egress = DirectionProfile {
+            latency_ns:    link.b_to_a.latency_ns,
+            bandwidth_bps: link.b_to_a.bandwidth_bps,
+            jitter:        link.b_to_a.jitter.clone(),
+            reorder:       link.b_to_a.reorder.clone(),
+            duplicate_rate: link.b_to_a.duplicate_rate,
+            queue_limit:   link.b_to_a.queue_limit,
+            loss:          Loss::None,
+        };
+        let b_ingress = DirectionProfile {
+            loss: link.b_to_a.loss.clone(),
+            ..DirectionProfile::instant()
+        };
+        let b_egress = DirectionProfile {
+            latency_ns:    link.a_to_b.latency_ns,
+            bandwidth_bps: link.a_to_b.bandwidth_bps,
+            jitter:        link.a_to_b.jitter.clone(),
+            reorder:       link.a_to_b.reorder.clone(),
+            duplicate_rate: link.a_to_b.duplicate_rate,
+            queue_limit:   link.a_to_b.queue_limit,
+            loss:          Loss::None,
+        };
+
+        let port_a = self.add_port(net_a, iface_a)
+            .ingress(a_ingress)
+            .egress(a_egress)
+            .finish();
+        let port_b = self.add_port(net_b, iface_b)
+            .ingress(b_ingress)
+            .egress(b_egress)
+            .finish();
+        (port_a, port_b)
+    }
 }
 
 // ── Internal helper ───────────────────────────────────────────────────────────
@@ -1402,6 +1534,9 @@ mod tests {
         let _ = LinkProfile::satellite_starlink();
         let _ = LinkProfile::satellite_starlink_premium();
         let _ = LinkProfile::satellite_oneweb();
+        let _ = LinkProfile::leased_line_100m();
+        let _ = LinkProfile::leased_line_1g();
+        let _ = LinkProfile::leased_line_10g();
         let _ = LinkProfile::t1();
         let _ = LinkProfile::e1();
         let _ = LinkProfile::t3();
@@ -1498,5 +1633,112 @@ mod tests {
         assert!(f2.is_some());
         assert!(f3.is_none());
         let _ = net_a;
+    }
+
+    #[test]
+    fn from_f64_produces_loss_rate() {
+        let l: Loss = 0.10.into();
+        assert!(matches!(l, Loss::Rate(r) if (r - 0.10).abs() < f64::EPSILON));
+    }
+
+    #[test]
+    fn from_u64_produces_jitter_uniform() {
+        let j: Jitter = 5u64.into();
+        assert!(matches!(j, Jitter::Uniform(5)));
+    }
+
+    #[test]
+    fn direction_profile_loss_accepts_f64() {
+        let p = DirectionProfile::instant().loss(0.05);
+        assert!(matches!(p.loss, Loss::Rate(r) if (r - 0.05).abs() < f64::EPSILON));
+    }
+
+    #[test]
+    fn direction_profile_jitter_accepts_u64() {
+        let p = DirectionProfile::instant().jitter(10u64);
+        assert!(matches!(p.jitter, Jitter::Uniform(10)));
+    }
+
+    #[test]
+    fn loss_to_b_sets_only_a_to_b() {
+        let link = LinkProfile::instant().loss_to_b(0.10);
+        assert!(matches!(link.a_to_b.loss, Loss::Rate(_)));
+        assert!(matches!(link.b_to_a.loss, Loss::None));
+    }
+
+    #[test]
+    fn loss_to_a_sets_only_b_to_a() {
+        let link = LinkProfile::instant().loss_to_a(0.10);
+        assert!(matches!(link.a_to_b.loss, Loss::None));
+        assert!(matches!(link.b_to_a.loss, Loss::Rate(_)));
+    }
+
+    #[test]
+    fn loss_both_sets_both_directions() {
+        let link = LinkProfile::instant().loss_both(0.05);
+        assert!(matches!(link.a_to_b.loss, Loss::Rate(_)));
+        assert!(matches!(link.b_to_a.loss, Loss::Rate(_)));
+    }
+
+    #[test]
+    fn jitter_to_b_sets_only_a_to_b() {
+        let link = LinkProfile::instant().jitter_to_b(5u64);
+        assert!(matches!(link.a_to_b.jitter, Jitter::Uniform(5)));
+        assert!(matches!(link.b_to_a.jitter, Jitter::None));
+    }
+
+    #[test]
+    fn directional_builders_chain() {
+        let link = LinkProfile::leased_line_100m()
+            .loss_to_b(0.10)
+            .jitter_to_b(5u64)
+            .reorder_to_a(Reorder::rate(0.05));
+        assert!(matches!(link.a_to_b.loss, Loss::Rate(_)));
+        assert!(matches!(link.a_to_b.jitter, Jitter::Uniform(5)));
+        assert!(matches!(link.b_to_a.loss, Loss::None));
+        assert!(link.b_to_a.reorder.rate > 0.0);
+    }
+
+    #[test]
+    fn leased_line_100m_is_symmetric_10ms_no_impairments() {
+        let link = LinkProfile::leased_line_100m();
+        assert_eq!(link.a_to_b.latency_ns, 10_000_000);
+        assert_eq!(link.b_to_a.latency_ns, 10_000_000);
+        assert_eq!(link.a_to_b.bandwidth_bps, 100_000_000);
+        assert_eq!(link.b_to_a.bandwidth_bps, 100_000_000);
+        assert!(matches!(link.a_to_b.loss, Loss::None));
+        assert!(matches!(link.a_to_b.jitter, Jitter::None));
+        assert!(matches!(link.b_to_a.loss, Loss::None));
+        assert!(matches!(link.b_to_a.jitter, Jitter::None));
+    }
+
+    #[test]
+    fn leased_line_presets_bandwidth() {
+        assert_eq!(LinkProfile::leased_line_1g().a_to_b.bandwidth_bps, 1_000_000_000);
+        assert_eq!(LinkProfile::leased_line_10g().a_to_b.bandwidth_bps, 10_000_000_000);
+    }
+
+    #[test]
+    fn add_link_decomposes_loss_to_ingress_delay_to_egress() {
+        let mut net_a = Network::new();
+        let mut net_b = Network::new();
+        let idx_a = net_a.add_interface().mac(mac(1)).finish();
+        let idx_b = net_b.add_interface().mac(mac(2)).finish();
+
+        let link = LinkProfile::leased_line_100m().loss_to_b(1.0);
+        let bridge = Bridge::new();
+        let (port_a, port_b) = bridge.add_link(&mut net_a, idx_a, &mut net_b, idx_b, &link);
+
+        // A→B has loss=1.0, so port_a ingress should drop everything.
+        let frame = make_broadcast_frame([0x02, 0, 0, 0, 0, 1]);
+        bridge.inject(port_a, &frame);
+        // Frame should be dropped — never reaches B.
+        assert!(net_b.interfaces()[idx_b].rx_queue.is_empty());
+
+        // B→A has no loss, so port_b ingress should pass.
+        let frame_b = make_broadcast_frame([0x02, 0, 0, 0, 0, 2]);
+        bridge.inject(port_b, &frame_b);
+        // Frame should reach A (no delay since inject bypasses delay queue).
+        assert!(!net_a.interfaces()[idx_a].rx_queue.is_empty());
     }
 }
