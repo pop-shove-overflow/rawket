@@ -1586,10 +1586,11 @@ impl TcpSocket {
 
             // Arm/re-arm TLP (RFC 8985 §7.4): deadline depends on
             // FlightSize, so re-compute each time a new segment is sent.
+            // When SRTT is unknown (no RTT sample yet), skip TLP — a
+            // meaningful PTO cannot be computed and RTO already covers
+            // retransmission.
             if self.srtt_ns > 0 {
                 self.tlp_deadline.arm_from_now_ns(self.tlp_deadline_ns(), now);
-            } else if !self.tlp_deadline.is_armed() {
-                self.tlp_deadline.arm_from_now_ms(10, now); // fallback 10 ms
             }
 
             // Arm RTO
@@ -2526,4 +2527,72 @@ pub fn dispatch(
     }
     let _ = iface.send_tcp_rst(raw);
     Ok(())
+}
+
+// ── Unit tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::rc::Rc;
+    use crate::timers::Clock;
+
+    fn noop_recv(_: TcpPacket<'_>) {}
+    fn noop_error(_: TcpError) {}
+
+    /// Build a TcpSocket in Established state with a no-op TX closure.
+    /// The peer window and cwnd are set large enough for flush_send_buf
+    /// to actually send data.
+    fn established_socket(clock: Clock, cfg: TcpConfig) -> TcpSocket {
+        let tx: crate::IpTxFn = Rc::new(|_, _, _, _| Ok(()));
+        let src = core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::new(10, 0, 0, 1), 5000,
+        );
+        let mut s = TcpSocket::new_raw(tx, clock, src, noop_recv, noop_error, cfg);
+        s.state = State::Established;
+        s.dst = core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::new(10, 0, 0, 2), 8080,
+        );
+        // Open peer window so flush_send_buf can proceed.
+        s.snd_wnd_raw = 65535;
+        s
+    }
+
+    #[test]
+    fn tlp_not_armed_when_srtt_is_zero() {
+        let clock = Clock::default();
+        let cfg = TcpConfig::default();
+        let mut s = established_socket(clock, cfg);
+
+        // Precondition: SRTT is unknown (no RTT sample yet).
+        assert_eq!(s.srtt_ns, 0, "srtt_ns should be 0 before any RTT sample");
+        assert!(!s.tlp_deadline.is_armed(), "TLP should not be armed initially");
+
+        // Send data — this calls flush_send_buf which is where TLP arming lives.
+        s.send(b"hello").unwrap();
+
+        // TLP must NOT be armed because SRTT == 0 — we cannot compute a
+        // meaningful PTO.  RTO covers retransmission instead.
+        assert!(!s.tlp_deadline.is_armed(),
+            "TLP deadline must not be armed when SRTT is 0");
+        // RTO should be armed (it covers retransmission when TLP is skipped).
+        assert!(s.rto_deadline.is_armed(),
+            "RTO deadline should be armed after sending data");
+    }
+
+    #[test]
+    fn tlp_armed_when_srtt_is_nonzero() {
+        let clock = Clock::default();
+        let cfg = TcpConfig::default();
+        let mut s = established_socket(clock, cfg);
+
+        // Simulate having an RTT sample.
+        s.srtt_ns = 50_000_000; // 50 ms
+
+        s.send(b"hello").unwrap();
+
+        // With a valid SRTT, TLP should be armed.
+        assert!(s.tlp_deadline.is_armed(),
+            "TLP deadline should be armed when SRTT > 0");
+    }
 }
