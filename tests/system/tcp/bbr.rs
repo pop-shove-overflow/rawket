@@ -1362,3 +1362,38 @@ fn probe_bw_cycle_phase_ordering() -> TestResult {
 
     Ok(())
 }
+
+// ── syn_does_not_contaminate_max_bw ────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §5.1: delivery rate samples feed max_bw.
+// Regression test: the SYN seq-space byte (1 byte / RTT) must not be fed to
+// BBR's bandwidth estimator.  Before the fix, bbr_on_ack received acked=1
+// from the SYN removal, which set max_bw ≈ 50 B/s on a 20 ms link and
+// collapsed cwnd to 4 MSS immediately after the handshake.
+//
+// After connect():
+//   • max_bw must be 0 (no real data has been ACKed yet)
+//   • cwnd must be initial_cwnd (10 * MSS = 14 600 bytes by default)
+#[test]
+fn syn_does_not_contaminate_max_bw() -> TestResult {
+    let pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let max_bw    = pair.tcp_a().bbr_max_bw();
+    let cwnd      = pair.tcp_a().bbr_cwnd();
+    let mss       = 1460u32;
+    let init_cwnd = 10 * mss;
+
+    assert_ok!(
+        max_bw == 0,
+        "max_bw contaminated by SYN delivery rate: {} B/s (expected 0 before any data ACK)",
+        max_bw
+    );
+    assert_ok!(
+        cwnd >= init_cwnd,
+        "cwnd collapsed after handshake: {cwnd} < initial {init_cwnd} — SYN may have set a tiny max_bw"
+    );
+
+    Ok(())
+}
