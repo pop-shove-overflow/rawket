@@ -177,6 +177,41 @@ impl Default for TcpConfig {
     }
 }
 
+impl TcpConfig {
+    /// Set minimum RTO in milliseconds (default: 200).
+    pub fn rto_min_ms(mut self, ms: u64) -> Self { self.rto_min_ms = ms; self }
+
+    /// Set maximum RTO in milliseconds (default: 60_000).
+    pub fn rto_max_ms(mut self, ms: u64) -> Self { self.rto_max_ms = ms; self }
+
+    /// Set maximum retransmit attempts (default: 15).
+    pub fn max_retransmits(mut self, n: u8) -> Self { self.max_retransmits = n; self }
+
+    /// Set TIME_WAIT linger duration in milliseconds (default: 120_000).
+    pub fn time_wait_ms(mut self, ms: u64) -> Self { self.time_wait_ms = ms; self }
+
+    /// Set keep-alive idle time in milliseconds (default: 0 = disabled).
+    pub fn keepalive_idle_ms(mut self, ms: u64) -> Self { self.keepalive_idle_ms = ms; self }
+
+    /// Set interval between keep-alive probes in milliseconds (default: 75_000).
+    pub fn keepalive_interval_ms(mut self, ms: u64) -> Self { self.keepalive_interval_ms = ms; self }
+
+    /// Set number of unanswered keep-alive probes before timeout (default: 9).
+    pub fn keepalive_count(mut self, n: u8) -> Self { self.keepalive_count = n; self }
+
+    /// Set maximum send buffer size in bytes (default: 1 MiB).
+    pub fn send_buf_max(mut self, n: usize) -> Self { self.send_buf_max = n; self }
+
+    /// Set maximum out-of-order segments buffered (default: 8).
+    pub fn rx_ooo_max(mut self, n: usize) -> Self { self.rx_ooo_max = n; self }
+
+    /// Set MSS in bytes (default: 1460).
+    pub fn mss(mut self, n: u16) -> Self { self.mss = n; self }
+
+    /// Set initial congestion window in packets (default: 10).
+    pub fn initial_cwnd_pkts(mut self, n: u32) -> Self { self.initial_cwnd_pkts = n; self }
+}
+
 // ── State machine ─────────────────────────────────────────────────────────────
 
 #[repr(i32)]
