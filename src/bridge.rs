@@ -159,6 +159,32 @@ pub struct LossState {
     ge_in_bad:  bool,
 }
 
+/// Evaluate a [`Loss`] model and return `true` if the frame should be dropped.
+fn loss_should_drop(model: &Loss, state: &mut LossState) -> bool {
+    match model {
+        Loss::None => false,
+        Loss::Rate(p) => rand_f64() < *p,
+        Loss::Correlated { rate, correlation } => {
+            let in_loss = state.in_loss;
+            let drop = if in_loss {
+                rand_f64() < *correlation || rand_f64() < *rate
+            } else {
+                rand_f64() < *rate
+            };
+            state.in_loss = drop;
+            drop
+        }
+        Loss::GilbertElliott { p, r, h, k } => {
+            state.ge_in_bad = if state.ge_in_bad {
+                rand_f64() >= *r
+            } else {
+                rand_f64() < *p
+            };
+            if state.ge_in_bad { rand_f64() < *h } else { rand_f64() < *k }
+        }
+    }
+}
+
 // ── DirectionProfile ──────────────────────────────────────────────────────────
 
 /// One-way link characteristics.
@@ -298,28 +324,7 @@ impl DirectionProfile {
 
     /// Returns `true` if the frame should be dropped.
     pub fn should_drop(&self, loss_state: &mut LossState) -> bool {
-        match &self.loss {
-            Loss::None => false,
-            Loss::Rate(p) => rand_f64() < *p,
-            Loss::Correlated { rate, correlation } => {
-                let in_loss = loss_state.in_loss;
-                let drop = if in_loss {
-                    rand_f64() < *correlation || rand_f64() < *rate
-                } else {
-                    rand_f64() < *rate
-                };
-                loss_state.in_loss = drop;
-                drop
-            }
-            Loss::GilbertElliott { p, r, h, k } => {
-                loss_state.ge_in_bad = if loss_state.ge_in_bad {
-                    rand_f64() >= *r
-                } else {
-                    rand_f64() < *p
-                };
-                if loss_state.ge_in_bad { rand_f64() < *h } else { rand_f64() < *k }
-            }
-        }
+        loss_should_drop(&self.loss, loss_state)
     }
 }
 
@@ -904,9 +909,26 @@ pub enum Impairment {
         byte_idx: usize,
         xor_mask: u8,
     },
+    /// Probabilistic loss using a [`Loss`] model.  Carries its own
+    /// [`LossState`] for stateful models (Correlated, GilbertElliott).
+    Loss {
+        model: Loss,
+        state: LossState,
+    },
+    /// Probabilistic frame duplication.  The original always passes; with
+    /// probability `rate` a copy is also emitted.
+    Duplicate(f64),
 }
 
 impl Impairment {
+    /// Create a probabilistic loss impairment.
+    pub fn loss(model: impl Into<Loss>) -> Self {
+        Impairment::Loss { model: model.into(), state: LossState::default() }
+    }
+
+    /// Apply this impairment to a frame.  Returns `Some(data)` if the frame
+    /// survives, `None` if dropped.  Duplicate is handled separately in
+    /// [`PortDirection::process`].
     fn apply(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
         match self {
             Impairment::Drop(spec) => {
@@ -923,6 +945,12 @@ impl Impairment {
                     Some(frame.to_vec())
                 }
             }
+            Impairment::Loss { model, state } => {
+                if loss_should_drop(model, state) { None } else { Some(frame.to_vec()) }
+            }
+            // Duplicate pass-through: the original always survives.
+            // The copy is emitted by PortDirection::process().
+            Impairment::Duplicate(_) => Some(frame.to_vec()),
         }
     }
 }
@@ -981,15 +1009,28 @@ impl PortDirection {
         }
     }
 
-    /// Apply impairments and profile loss to a frame.  Returns `Some(data)` if
-    /// the frame survives, `None` if dropped.
-    fn process(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
+    /// Apply impairments and profile loss to a frame.  Returns `Some((data, duplicates))`
+    /// if the frame survives, `None` if dropped.  `duplicates` contains any copies
+    /// produced by [`Impairment::Duplicate`].
+    fn process(&mut self, frame: &[u8]) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
         // Apply impairments chain.
         let mut data: Option<Vec<u8>> = Some(frame.to_vec());
+        let mut duplicates: Vec<Vec<u8>> = Vec::new();
         for imp in &mut self.impairments {
-            data = data.and_then(|f| imp.apply(&f));
-            if data.is_none() {
-                break;
+            match imp {
+                Impairment::Duplicate(rate) => {
+                    if let Some(ref d) = data {
+                        if rand_f64() < *rate {
+                            duplicates.push(d.clone());
+                        }
+                    }
+                }
+                _ => {
+                    data = data.and_then(|f| imp.apply(&f));
+                    if data.is_none() {
+                        break;
+                    }
+                }
             }
         }
         let data = data?;
@@ -999,7 +1040,7 @@ impl PortDirection {
             return None;
         }
 
-        Some(data)
+        Some((data, duplicates))
     }
 
     /// Drain all delay-queue frames whose deadline has passed.
@@ -1087,11 +1128,14 @@ impl Bridge {
     /// sender is not a real interface TX closure.
     pub fn inject(&self, port: usize, frame: &[u8]) {
         let mut inner = self.inner.borrow_mut();
-        let Some(data) = inner.ports[port].profile_in.process(frame) else {
+        let Some((data, dups)) = inner.ports[port].profile_in.process(frame) else {
             inner.captured.push(CapturedFrame { ingress: port, egress: None, data: frame.to_vec(), ts_ns: 0 });
             return;
         };
         // Deliver immediately (deliver_at = 0 ≤ any clock value).
+        for dup in dups {
+            forward_frame(&mut inner, port, dup, 0);
+        }
         forward_frame(&mut inner, port, data, 0);
     }
 
@@ -1251,13 +1295,23 @@ fn forward_frame(inner: &mut BridgeInner, ingress_idx: usize, data: Vec<u8>, sen
 
     for &egress_idx in &egress_ports {
         // Apply egress impairments.
-        let Some(eg_data) = inner.ports[egress_idx].profile_eg.process(&data) else {
+        let Some((eg_data, dups)) = inner.ports[egress_idx].profile_eg.process(&data) else {
             inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: None, data: data.clone(), ts_ns: sender_now_ns });
             continue;
         };
 
         let delay_ns = inner.ports[egress_idx].profile_eg.profile.delay_ns(eg_data.len());
         inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: Some(egress_idx), data: eg_data.clone(), ts_ns: sender_now_ns });
+
+        // Deliver duplicates with the same delay as the original.
+        for dup in dups {
+            inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: Some(egress_idx), data: dup.clone(), ts_ns: sender_now_ns });
+            if delay_ns == 0 || sender_now_ns == 0 {
+                inner.ports[egress_idx].egress.push(&dup);
+            } else {
+                inner.ports[egress_idx].profile_eg.delay_queue.push(sender_now_ns + delay_ns, dup);
+            }
+        }
 
         if delay_ns == 0 || sender_now_ns == 0 {
             // Deliver immediately.
@@ -1347,10 +1401,13 @@ impl<'a, 'b> PortBuilder<'a, 'b> {
         iface.set_tx(Rc::new(move |frame: &[u8]| -> crate::Result<()> {
             let mut inner = tx_inner.borrow_mut();
             let now_ns = sender_clock.monotonic_ns();
-            let Some(data) = inner.ports[port_idx].profile_in.process(frame) else {
+            let Some((data, dups)) = inner.ports[port_idx].profile_in.process(frame) else {
                 inner.captured.push(CapturedFrame { ingress: port_idx, egress: None, data: frame.to_vec(), ts_ns: now_ns });
                 return Ok(());
             };
+            for dup in dups {
+                forward_frame(&mut inner, port_idx, dup, now_ns);
+            }
             forward_frame(&mut inner, port_idx, data, now_ns);
             Ok(())
         }));
