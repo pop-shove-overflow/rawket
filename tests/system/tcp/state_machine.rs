@@ -863,3 +863,53 @@ fn rst_bare_in_syn_sent_dropped() -> TestResult {
 
     Ok(())
 }
+
+// ── send_after_close ────────────────────────────────────────────────────────
+//
+// RFC 9293 §3.10.2: send() after close() must return error.
+// After A calls close() (FinWait1), send() must fail with NotConnected.
+#[test]
+fn send_after_close() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().close()?;
+    assert_ok!(
+        pair.tcp_a().state == State::FinWait1,
+        "A not in FinWait1 after close: {:?}", pair.tcp_a().state
+    );
+
+    let result = pair.tcp_a_mut().send(b"after-close");
+    match result {
+        Err(rawket::Error::NotConnected) => {}
+        Err(e) => return Err(crate::assert::TestFail::new(
+            format!("send() in FinWait1 returned wrong error: {e:?} (expected NotConnected)")
+        )),
+        Ok(()) => return Err(crate::assert::TestFail::new(
+            "send() in FinWait1 should return NotConnected, got Ok"
+        )),
+    }
+
+    // Progress to FinWait2.
+    pair.transfer();
+    assert_state(pair.tcp_a(), State::FinWait2, "A should reach FinWait2")?;
+    let result2 = pair.tcp_a_mut().send(b"in-finwait2");
+    assert_ok!(
+        matches!(result2, Err(rawket::Error::NotConnected)),
+        "send() in FinWait2 should return NotConnected, got {:?}", result2
+    );
+
+    // Progress to TimeWait.
+    pair.tcp_b_mut().close()?;
+    pair.transfer_while(|p| p.tcp_a(0).state != State::TimeWait);
+    assert_state(pair.tcp_a(), State::TimeWait, "A should reach TimeWait")?;
+    let result3 = pair.tcp_a_mut().send(b"in-timewait");
+    assert_ok!(
+        matches!(result3, Err(rawket::Error::NotConnected)),
+        "send() in TimeWait should return NotConnected, got {:?}", result3
+    );
+
+    Ok(())
+}
