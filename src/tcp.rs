@@ -2405,7 +2405,9 @@ impl TcpSocket {
     /// Returns [`Error::WouldBlock`] when the send buffer would exceed
     /// [`TcpConfig::send_buf_max`].
     pub fn send(&mut self, data: &[u8]) -> Result<()> {
-        if self.state != State::Established {
+        // RFC 9293 §3.10.2: send() is valid in Established and CloseWait
+        // (half-open: peer closed, we can still send).
+        if self.state != State::Established && self.state != State::CloseWait {
             return Err(Error::NotConnected);
         }
         if self.send_buf.len() + data.len() > self.cfg.send_buf_max {
