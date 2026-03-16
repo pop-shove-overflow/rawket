@@ -655,3 +655,63 @@ fn cumulative_ack_clears_sacked_segments() -> TestResult {
 
     Ok(())
 }
+
+// RFC 6675 §4: SACK-based recovery walks the scoreboard and retransmits only
+// holes. With 2 non-adjacent holes in the SACK map, sender must retransmit
+// only the holes and skip SACKed segments.  Drop segments 1 and 3 of 4, let B
+// SACK segments 2 and 4, verify retransmits of 1 and 3 only.
+#[test]
+fn multi_hole_retransmit_ordering() -> TestResult {
+    // Leased-line gives RTT for RACK to detect both holes via SACK feedback.
+    // rto_min_ms(10) ensures RTO can catch any hole RACK misses within budget.
+    let mut pair = setup_tcp_pair()
+        .rto_min_ms(10)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Seed BBR so cwnd and pacing allow 4+ segments.
+    pair.tcp_a_mut().send(&[0xAAu8; 50_000])?;
+    pair.transfer();
+    pair.clear_capture();
+
+    // Drop segments 1 and 3 (nth_matching pipeline: first drops #1,
+    // second sees remaining stream and drops its #2 = original #3).
+    pair.add_impairment_to_b(Impairment::Drop(PacketSpec::nth_matching(1, filter::tcp::has_data())));
+    pair.add_impairment_to_b(Impairment::Drop(PacketSpec::nth_matching(2, filter::tcp::has_data())));
+
+    // Send data with drops active — transfer drives segments through the link.
+    pair.tcp_a_mut().send(&[0xBBu8; 20_000])?;
+    pair.transfer();
+
+    // Clear impairments and send more data to drive SACK recovery.
+    // New segments advance rack_end_seq past both holes, triggering retransmits.
+    pair.clear_impairments();
+    pair.tcp_a_mut().send(&[0xCCu8; 50_000])?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+
+    // Collect dropped seqs from the full capture.
+    let dropped_seqs: Vec<u32> = cap.all_tcp().from_a().dropped().with_data()
+        .map(|f| f.tcp.seq)
+        .collect();
+    assert_ok!(
+        dropped_seqs.len() >= 2,
+        "expected ≥2 dropped segments, got {}: {:?}", dropped_seqs.len(), dropped_seqs
+    );
+
+    // Both dropped segments must be retransmitted.
+    for &seq in &dropped_seqs {
+        let retx = cap.all_tcp().from_a().delivered().with_data()
+            .filter(|f| f.tcp.seq == seq)
+            .count();
+        assert_ok!(retx >= 1, "hole at seq={seq} was not retransmitted");
+    }
+
+    assert_ok!(
+        pair.tcp_a().state == rawket::tcp::State::Established,
+        "A not Established after multi-hole recovery: {:?}", pair.tcp_a().state
+    );
+
+    Ok(())
+}
