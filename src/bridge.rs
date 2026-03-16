@@ -918,12 +918,21 @@ pub enum Impairment {
     /// Probabilistic frame duplication.  The original always passes; with
     /// probability `rate` a copy is also emitted.
     Duplicate(f64),
+    /// Probabilistic congestion marking.  With probability `rate`, set IP ECN
+    /// field to CE (0x03) and recompute IP header checksum.  Simulates a
+    /// congested router marking frames instead of dropping them.
+    Congestion(f64),
 }
 
 impl Impairment {
     /// Create a probabilistic loss impairment.
     pub fn loss(model: impl Into<Loss>) -> Self {
         Impairment::Loss { model: model.into(), state: LossState::default() }
+    }
+
+    /// Create a probabilistic congestion marking impairment.
+    pub fn congestion(rate: f64) -> Self {
+        Impairment::Congestion(rate)
     }
 
     /// Apply this impairment to a frame.  Returns `Some(data)` if the frame
@@ -951,6 +960,24 @@ impl Impairment {
             // Duplicate pass-through: the original always survives.
             // The copy is emitted by PortDirection::process().
             Impairment::Duplicate(_) => Some(frame.to_vec()),
+            Impairment::Congestion(rate) => {
+                let mut data = frame.to_vec();
+                if rand_f64() < *rate {
+                    // Ethernet(14) + IP byte 1 = offset 15 is DSCP/ECN.
+                    // Set ECN field (low 2 bits) to CE = 0b11.
+                    if data.len() > 15 {
+                        data[15] = (data[15] & 0xFC) | 0x03;
+                        // Recompute IP header checksum (bytes 14..34).
+                        if data.len() >= 34 {
+                            data[24] = 0; data[25] = 0;
+                            let acc = crate::ip::checksum_add(0, &data[14..34]);
+                            let csum = crate::ip::checksum_finish(acc).to_be_bytes();
+                            data[24] = csum[0]; data[25] = csum[1];
+                        }
+                    }
+                }
+                Some(data)
+            }
         }
     }
 }
@@ -1797,5 +1824,51 @@ mod tests {
         bridge.inject(port_b, &frame_b);
         // Frame should reach A (no delay since inject bypasses delay queue).
         assert!(!net_a.interfaces()[idx_a].rx_queue.is_empty());
+    }
+
+    #[test]
+    fn congestion_impairment_sets_ce_bits() {
+        // Build a minimal IPv4 frame: Ethernet(14) + IPv4(20) = 34 bytes.
+        let mut frame = vec![0u8; 34];
+        // Ethernet: dst=broadcast, src=00:00:00:00:00:01, type=IPv4
+        frame[0..6].copy_from_slice(&[0xFF; 6]);
+        frame[6..12].copy_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        frame[12] = 0x08; frame[13] = 0x00;
+        // IPv4: version/IHL=0x45, DSCP/ECN=0x00 (no ECN), total_len=20
+        frame[14] = 0x45;
+        frame[15] = 0x00; // DSCP=0, ECN=0
+        frame[16] = 0x00; frame[17] = 20;
+        // TTL=64, proto=TCP
+        frame[22] = 64; frame[23] = 6;
+        // Compute IP checksum
+        let acc = crate::ip::checksum_add(0, &frame[14..34]);
+        let csum = crate::ip::checksum_finish(acc).to_be_bytes();
+        frame[24] = csum[0]; frame[25] = csum[1];
+
+        // Congestion at 100% rate — always marks.
+        let mut imp = Impairment::Congestion(1.0);
+        let result = imp.apply(&frame).unwrap();
+
+        // ECN field (low 2 bits of byte 15) should be CE = 0b11.
+        assert_eq!(result[15] & 0x03, 0x03, "CE bits not set");
+
+        // IP checksum should be valid after patching.
+        let acc = crate::ip::checksum_add(0, &result[14..34]);
+        let csum = crate::ip::checksum_finish(acc);
+        assert_eq!(csum, 0, "IP checksum invalid after CE marking");
+    }
+
+    #[test]
+    fn congestion_zero_rate_no_marking() {
+        let mut frame = vec![0u8; 34];
+        frame[12] = 0x08; frame[13] = 0x00;
+        frame[14] = 0x45;
+        frame[15] = 0x02; // ECN = ECT(0)
+
+        let mut imp = Impairment::Congestion(0.0);
+        let result = imp.apply(&frame).unwrap();
+
+        // ECN field should be unchanged (ECT(0) = 0x02).
+        assert_eq!(result[15] & 0x03, 0x02, "CE bits changed at rate=0.0");
     }
 }
