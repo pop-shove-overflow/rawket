@@ -2166,8 +2166,19 @@ impl TcpSocket {
                 }
             }
 
-            // ── TIME_WAIT / CLOSED ──────────────────────────────────────────
-            State::TimeWait | State::Closed => {}
+            // ── TIME_WAIT ────────────────────────────────────────────────────
+            //
+            // RFC 9293 §3.6.1: a retransmitted FIN restarts the 2MSL timer.
+            State::TimeWait => {
+                if seg.has_flag(TcpFlags::FIN) {
+                    let now = self.clock.monotonic_ns();
+                    self.rto_deadline.arm_from_now_ms(self.cfg.time_wait_ms, now);
+                    let _ = self.send_ctrl(TcpFlags::ACK);
+                }
+            }
+
+            // ── CLOSED ──────────────────────────────────────────────────────
+            State::Closed => {}
         }
         Ok(())
     }
