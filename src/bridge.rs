@@ -850,6 +850,10 @@ impl DelayQueue {
     fn next_deadline(&self) -> Option<u64> {
         self.heap.peek().map(|f| f.deliver_at_ns)
     }
+
+    fn last_deadline(&self) -> Option<u64> {
+        self.heap.iter().map(|f| f.deliver_at_ns).max()
+    }
 }
 
 // ── PacketSpec ────────────────────────────────────────────────────────────────
@@ -1020,10 +1024,14 @@ impl CapturedFrame {
 // ── PortDirection ─────────────────────────────────────────────────────────────
 
 struct PortDirection {
-    profile:     DirectionProfile,
-    loss_state:  LossState,
-    impairments: Vec<Impairment>,
-    delay_queue: DelayQueue,
+    profile:        DirectionProfile,
+    loss_state:     LossState,
+    impairments:    Vec<Impairment>,
+    delay_queue:    DelayQueue,
+    /// When the link finishes transmitting the previous frame (ns).
+    /// Used to model proper serialization: the next frame cannot begin
+    /// transmitting until the previous one completes.
+    last_depart_ns: u64,
 }
 
 impl PortDirection {
@@ -1033,7 +1041,26 @@ impl PortDirection {
             loss_state:  LossState::default(),
             impairments: Vec::new(),
             delay_queue: DelayQueue::new(),
+            last_depart_ns: 0,
         }
+    }
+
+    /// Compute the delivery deadline for a frame of `len` bytes entering
+    /// this direction at `sender_now_ns`.  Models proper link serialization:
+    /// consecutive frames queue behind each other on the wire.
+    fn schedule(&mut self, sender_now_ns: u64, len: usize) -> u64 {
+        let serial_ns = if self.profile.bandwidth_bps > 0 {
+            (len as u64 * 8 * 1_000_000_000) / self.profile.bandwidth_bps
+        } else {
+            0
+        };
+        let jitter_ns = self.profile.sample_jitter_ns();
+        // Frame begins transmitting after both: (a) sender is ready, and
+        // (b) the link is free from the previous frame.
+        let tx_start = sender_now_ns.max(self.last_depart_ns);
+        let depart = tx_start + serial_ns;
+        self.last_depart_ns = depart;
+        depart + self.profile.latency_ns + jitter_ns
     }
 
     /// Apply impairments and profile loss to a frame.  Returns `Some((data, duplicates))`
@@ -1194,6 +1221,14 @@ impl Bridge {
         inner.ports.iter().filter_map(|p| p.profile_eg.delay_queue.next_deadline()).min()
     }
 
+    /// Return the latest pending egress delivery deadline across all ports,
+    /// in nanoseconds (sender's monotonic clock domain).  Useful for advancing
+    /// test clocks far enough to drain an entire batch of serialized frames.
+    pub fn last_deadline_ns(&self) -> Option<u64> {
+        let inner = self.inner.borrow();
+        inner.ports.iter().filter_map(|p| p.profile_eg.delay_queue.last_deadline()).max()
+    }
+
     /// Return `true` if all delay queues are empty.
     pub fn is_idle(&self) -> bool {
         self.next_deadline_ns().is_none()
@@ -1327,26 +1362,29 @@ fn forward_frame(inner: &mut BridgeInner, ingress_idx: usize, data: Vec<u8>, sen
             continue;
         };
 
-        let delay_ns = inner.ports[egress_idx].profile_eg.profile.delay_ns(eg_data.len());
         inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: Some(egress_idx), data: eg_data.clone(), ts_ns: sender_now_ns });
 
-        // Deliver duplicates with the same delay as the original.
+        let has_delay = inner.ports[egress_idx].profile_eg.profile.latency_ns > 0
+            || inner.ports[egress_idx].profile_eg.profile.bandwidth_bps > 0;
+
+        // Deliver duplicates with the same schedule as an additional frame.
         for dup in dups {
             inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: Some(egress_idx), data: dup.clone(), ts_ns: sender_now_ns });
-            if delay_ns == 0 || sender_now_ns == 0 {
+            if !has_delay || sender_now_ns == 0 {
                 inner.ports[egress_idx].egress.push(&dup);
             } else {
-                inner.ports[egress_idx].profile_eg.delay_queue.push(sender_now_ns + delay_ns, dup);
+                let deadline = inner.ports[egress_idx].profile_eg.schedule(sender_now_ns, dup.len());
+                inner.ports[egress_idx].profile_eg.delay_queue.push(deadline, dup);
             }
         }
 
-        if delay_ns == 0 || sender_now_ns == 0 {
-            // Deliver immediately.
+        if !has_delay || sender_now_ns == 0 {
+            // Deliver immediately (instant link or inject path).
             inner.ports[egress_idx].egress.push(&eg_data);
         } else {
-            // Stamp with sender clock + delay; receiver's deliver closure will
-            // drain when receiver's clock reaches deliver_at.
-            inner.ports[egress_idx].profile_eg.delay_queue.push(sender_now_ns + delay_ns, eg_data);
+            // Schedule with proper serialization delay.
+            let deadline = inner.ports[egress_idx].profile_eg.schedule(sender_now_ns, eg_data.len());
+            inner.ports[egress_idx].profile_eg.delay_queue.push(deadline, eg_data);
         }
     }
 }
