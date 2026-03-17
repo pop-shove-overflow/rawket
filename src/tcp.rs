@@ -1356,10 +1356,91 @@ impl TcpSocket {
         self.bbr.loss_in_round = true;
         // Count discontiguous lost sequence ranges: if this segment is not
         // contiguous with the previous lost segment, it starts a new range.
-        if self.bbr.loss_events_in_round == 0 || seq.0 != self.bbr.last_loss_end_seq {
+        let new_range = self.bbr.loss_events_in_round == 0 || seq.0 != self.bbr.last_loss_end_seq;
+        if new_range {
             self.bbr.loss_events_in_round += 1;
         }
         self.bbr.last_loss_end_seq = end_seq.0;
+    }
+
+    // ── SACK processing (runs on ALL ACKs — advancing and duplicate) ────────
+
+    /// Mark unacked segments covered by SACK blocks and update RACK state.
+    fn mark_sack_blocks(&mut self, opts: &ParsedOpts) {
+        let now = self.clock.monotonic_ns();
+        for k in 0..opts.sack_count as usize {
+            if let Some((left, right)) = opts.sack_blocks[k] {
+                let (left, right) = (SeqNum::new(left), SeqNum::new(right));
+                for seg in &mut self.unacked {
+                    if !seg.sacked && seq_ge(seg.seq, left) && seq_le(seg.end_seq, right) {
+                        seg.sacked = true;
+                        if seq_gt(seg.end_seq, self.rack_end_seq) {
+                            self.rack_end_seq = seg.end_seq;
+                            self.rack_xmit_ns = seg.last_sent_ns;
+                            self.rack_rtt_ns  = now.saturating_sub(seg.last_sent_ns).max(1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// RACK loss detection (RFC 8985 §7.2): retransmit segments that are
+    /// past the reorder window relative to the most-recently-SACKed segment.
+    ///
+    /// Two loss criteria (both from RFC 8985 §7.2):
+    ///  1. **Time-based**: `seg.xmit_ts < rack.xmit_ts - reo_wnd`
+    ///  2. **Packet-count**: ≥ dup_ack_thresh (3) segments SACKed *after*
+    ///     this one  — equivalent to "3 packets have been delivered after
+    ///     this one was sent, yet it remains unacknowledged."
+    fn rack_detect_losses(&mut self) {
+        let now = self.clock.monotonic_ns();
+        let rack_rtt = if self.rack_rtt_ns > 0 { self.rack_rtt_ns } else { self.srtt_ns.max(1) };
+        let min_rtt  = if self.bbr.min_rtt_ns < u64::MAX { self.bbr.min_rtt_ns } else { rack_rtt };
+        let reorder_window = (min_rtt / 4).max(1) + self.rack_reo_wnd_ns;
+        let mut retx: Vec<(SeqNum, TcpFlags, Vec<u8>)> = Vec::new();
+        for seg in &self.unacked {
+            if seg.sacked { continue; }
+            if !seq_le(seg.end_seq, self.rack_end_seq) { continue; }
+            // Criterion 1: time-based (applies to retransmits too)
+            let time_lost = now >= seg.last_sent_ns + rack_rtt + reorder_window;
+            // Criterion 2: packet-count (dup_ack_thresh = 3)
+            // Only for original transmissions — retransmitted segments use
+            // the time-based criterion to avoid re-detecting the same loss.
+            let pkt_lost = seg.retransmits == 0 && {
+                let sacked_after = self.unacked.iter()
+                    .filter(|s| s.sacked && seq_gt(s.seq, seg.end_seq))
+                    .count();
+                sacked_after >= 3
+            };
+            if time_lost || pkt_lost {
+                retx.push((seg.seq, seg.flags, seg.data.clone()));
+            }
+        }
+        for (seq, flags, data) in retx {
+            let now = self.clock.monotonic_ns();
+            for s in &mut self.unacked {
+                if s.seq == seq {
+                    s.retransmits += 1;
+                    s.last_sent_ns = now;
+                }
+            }
+            let syn_fin_bytes = if !(flags & (TcpFlags::SYN | TcpFlags::FIN)).is_empty() { 1 } else { 0 };
+            let end_seq = seq + data.len() as u32 + syn_fin_bytes;
+            self.bbr_on_loss(data.len() as u64 + syn_fin_bytes as u64, seq, end_seq);
+            let opts_arr;
+            let ts_arr;
+            let opts_slice: &[u8] = if flags.has(TcpFlags::SYN) {
+                opts_arr = self.syn_opts();
+                &opts_arr
+            } else if self.ts_enabled {
+                ts_arr = self.ts_opt();
+                &ts_arr
+            } else {
+                &[]
+            };
+            let _ = self.send_segment(seq, flags, &data, opts_slice);
+        }
     }
 
     // ── Core ACK processing ──────────────────────────────────────────────────
@@ -1404,23 +1485,9 @@ impl TcpSocket {
             }
         }
 
-        // 2. Mark SACK-covered segments
-        for k in 0..opts.sack_count as usize {
-            if let Some((left, right)) = opts.sack_blocks[k] {
-                let (left, right) = (SeqNum::new(left), SeqNum::new(right));
-                for seg in &mut self.unacked {
-                    if !seg.sacked && seq_ge(seg.seq, left) && seq_le(seg.end_seq, right) {
-                        seg.sacked = true;
-                        // Also update RACK from SACK
-                        if seq_gt(seg.end_seq, self.rack_end_seq) {
-                            self.rack_end_seq = seg.end_seq;
-                            self.rack_xmit_ns = seg.last_sent_ns;
-                            self.rack_rtt_ns  = now.saturating_sub(seg.last_sent_ns).max(1);
-                        }
-                    }
-                }
-            }
-        }
+        // 2. Mark SACK-covered segments (may already have been called from
+        //    the Established handler, but idempotent — sacked=true is sticky).
+        self.mark_sack_blocks(opts);
 
         // 3. Advance snd_una
         self.snd_una = new_ack;
@@ -1473,46 +1540,14 @@ impl TcpSocket {
             let c_delivered = self.bbr.delivered + acked_data;
             c_delivered.saturating_sub(p_delivered) * 1_000_000_000 / interval_ns
         } else { 0 };
-        self.bbr_on_ack(acked_data, delivery_rate, rtt_sample, now);
 
-        // 6. RACK loss detection (RFC 8985 §7.2)
-        let rack_rtt = if self.rack_rtt_ns > 0 { self.rack_rtt_ns } else { self.srtt_ns.max(1) };
-        let min_rtt  = if self.bbr.min_rtt_ns < u64::MAX { self.bbr.min_rtt_ns } else { rack_rtt };
-        let reorder_window = (min_rtt / 4).max(1) + self.rack_reo_wnd_ns;
-        // Collect segments to retransmit to avoid borrow conflict
-        let mut retx: Vec<(SeqNum, TcpFlags, Vec<u8>)> = Vec::new();
-        for seg in &self.unacked {
-            if !seg.sacked
-                && seq_le(seg.end_seq, self.rack_end_seq)
-                && now >= seg.last_sent_ns + rack_rtt + reorder_window
-            {
-                retx.push((seg.seq, seg.flags, seg.data.clone()));
-            }
-        }
-        for (seq, flags, data) in retx {
-            // Update the segment's retransmit metadata
-            for s in &mut self.unacked {
-                if s.seq == seq {
-                    s.retransmits += 1;
-                    s.last_sent_ns = now;
-                }
-            }
-            let syn_fin_bytes = if !(flags & (TcpFlags::SYN | TcpFlags::FIN)).is_empty() { 1 } else { 0 };
-            let end_seq = seq + data.len() as u32 + syn_fin_bytes;
-            self.bbr_on_loss(data.len() as u64 + syn_fin_bytes as u64, seq, end_seq);
-            let opts_arr;
-            let ts_arr;
-            let opts_slice: &[u8] = if flags.has(TcpFlags::SYN) {
-                opts_arr = self.syn_opts();
-                &opts_arr
-            } else if self.ts_enabled {
-                ts_arr = self.ts_opt();
-                &ts_arr
-            } else {
-                &[]
-            };
-            let _ = self.send_segment(seq, flags, &data, opts_slice);
-        }
+        // 5b. RACK loss detection (RFC 8985 §7.2)
+        // RACK must run BEFORE bbr_on_ack so that loss_events_in_round is
+        // populated before the Startup filled_pipe exit check evaluates it.
+        self.rack_detect_losses();
+
+        // 5c. BBRv3 congestion control update (after RACK, so loss info is current)
+        self.bbr_on_ack(acked_data, delivery_rate, rtt_sample, now);
 
         // 7. Timer management
         if self.unacked.is_empty() {
@@ -1894,6 +1929,10 @@ impl TcpSocket {
                 if seg.has_flag(TcpFlags::ACK) {
                     let prev_wnd = self.snd_wnd_raw;
                     self.snd_wnd_raw = seg.window;
+                    // Process SACK blocks on ALL ACKs (RFC 2018) — advancing
+                    // and duplicate — so the sender accumulates full SACK
+                    // coverage across multiple dup ACKs.
+                    self.mark_sack_blocks(&opts);
                     if seq_gt(seg.ack, self.snd_una) {
                         self.dupack_count = 0;
                         self.on_ack(seg.ack, &opts);
@@ -1903,6 +1942,9 @@ impl TcpSocket {
                            && seg.window == prev_wnd
                     {
                         self.dupack_count = self.dupack_count.saturating_add(1);
+                        // RACK loss detection on dup ACKs — SACK blocks
+                        // accumulated above may now satisfy the time condition.
+                        self.rack_detect_losses();
                         if self.dupack_count >= 3 {
                             self.dupack_count = 0;
                             let now = self.clock.monotonic_ns();
