@@ -17,7 +17,8 @@ use crate::{
     TestResult,
 };
 
-const TCP_CSUM_BYTE: usize = 50;
+const IP_CSUM_BYTE: usize = 24;  // Ethernet(14) + IP header checksum offset(10)
+const TCP_CSUM_BYTE: usize = 50; // Ethernet(14) + IPv4(20) + TCP checksum offset(16)
 
 fn make_data_frame(pair: &crate::harness::TcpSocketPair) -> Vec<u8> {
     let a_snd_nxt = pair.tcp_a().snd_nxt();
@@ -106,6 +107,35 @@ fn tcp_checksum_accepted_when_disabled() -> TestResult {
         "B dropped segment with bad TCP checksum despite validation being disabled \
          (rcv_nxt stayed at {})",
         rcv_nxt_before
+    );
+    Ok(())
+}
+
+// ── ip_bad_checksum_dropped ─────────────────────────────────────────────────
+//
+// RFC 791 §3.1: The IP header checksum covers only the header; datagrams with
+// invalid header checksums MUST be discarded.
+//
+// With checksum_validate_ip=true, a corrupted IP header checksum must cause
+// the frame to be silently dropped.
+#[test]
+fn ip_bad_checksum_dropped() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let rcv_nxt_before = pair.tcp_b().rcv_nxt();
+
+    let mut frame = make_data_frame(&pair);
+    frame[IP_CSUM_BYTE] ^= 0xFF;
+    pair.inject_to_b(frame);
+    pair.transfer_one();
+
+    let rcv_nxt_after = pair.tcp_b().rcv_nxt();
+    assert_ok!(
+        rcv_nxt_after == rcv_nxt_before,
+        "B accepted segment with bad IP checksum (rcv_nxt advanced {} → {})",
+        rcv_nxt_before, rcv_nxt_after
     );
     Ok(())
 }
