@@ -1067,11 +1067,12 @@ impl TcpSocket {
             self.bbr.round_count          += 1;
             let bytes_in_flight           = (self.snd_nxt - self.snd_una) as u64;
             self.bbr.next_round_delivered = self.bbr.delivered + bytes_in_flight.max(1);
-            // Reset per-round Startup loss tracking at new round
+            // Per-round acked/loss bytes reset for Startup loss-exit check.
+            // loss_events_in_round and last_loss_end_seq are reset in
+            // bbr_phase_update (BBRCheckStartupHighLoss) to ensure RACK
+            // losses from the current ACK are visible before the reset.
             self.bbr.loss_bytes_round     = 0;
             self.bbr.acked_bytes_round    = 0;
-            self.bbr.loss_events_in_round = 0;
-            self.bbr.last_loss_end_seq    = 0;
         }
 
         // ── BBRUpdateMaxBw — windowed max BW ────────────────────────────
@@ -1234,8 +1235,10 @@ impl TcpSocket {
                             self.bbr.filled_pipe = true;
                         }
                     }
-                    // Loss-based exit (spec §5.3.1.3): all three must hold:
-                    // 1. loss_in_round (at least one full round in recovery)
+                    // BBRCheckStartupHighLoss (spec §5.3.1.3):
+                    // Evaluate accumulated loss_events_in_round BEFORE resetting.
+                    // All three must hold:
+                    // 1. loss_in_round (at least one loss this round)
                     // 2. loss rate > 2% (BBR.LossThresh)
                     // 3. ≥ 6 discontiguous lost sequence ranges (BBRStartupFullLossCnt)
                     if self.bbr.loss_in_round && self.bbr.acked_bytes_round > 0 {
@@ -1247,6 +1250,9 @@ impl TcpSocket {
                             self.bbr.inflight_longterm = bdp.max(self.bbr.inflight_latest as u32);
                         }
                     }
+                    // Reset loss counter for the new round (spec §5.3.1.3)
+                    self.bbr.loss_events_in_round = 0;
+                    self.bbr.last_loss_end_seq    = 0;
                 }
                 if self.bbr.filled_pipe {
                     self.bbr.phase = BbrPhase::Drain;
