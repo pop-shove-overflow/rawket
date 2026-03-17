@@ -141,6 +141,37 @@ fn ip_bad_checksum_dropped() -> TestResult {
     Ok(())
 }
 
+// ── ip_checksum_accepted_when_disabled ───────────────────────────────────────
+//
+// RFC 791 §3.1: IP header checksum validation is mandatory per the spec, but
+// our stack exposes a config knob to disable it (e.g. for hardware offload).
+//
+// With checksum_validate_ip=false, a corrupted IP checksum must still be accepted.
+#[test]
+fn ip_checksum_accepted_when_disabled() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .net_config(NetworkConfig::default)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let rcv_nxt_before = pair.tcp_b().rcv_nxt();
+
+    let mut frame = make_data_frame(&pair);
+    frame[IP_CSUM_BYTE] ^= 0xFF;
+    pair.inject_to_b(frame);
+    pair.transfer_one();
+
+    let rcv_nxt_after = pair.tcp_b().rcv_nxt();
+    let advanced = rcv_nxt_after.wrapping_sub(rcv_nxt_before) < 0x8000_0000;
+    assert_ok!(
+        advanced && rcv_nxt_after != rcv_nxt_before,
+        "B dropped segment with bad IP checksum despite validation being disabled \
+         (rcv_nxt stayed at {})",
+        rcv_nxt_before
+    );
+    Ok(())
+}
+
 // ── udp_bad_checksum_dropped ────────────────────────────────────────────────
 //
 // RFC 1122 §4.1.3.4: "A UDP datagram received with an invalid checksum

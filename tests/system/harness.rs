@@ -836,7 +836,7 @@ pub fn setup_network_pair() -> NetworkPair {
     build_network_pair(LinkProfile::instant(), test_network_config)
 }
 
-fn build_network_pair(link: LinkProfile, make_cfg: fn() -> NetworkConfig) -> NetworkPair {
+pub(crate) fn build_network_pair(link: LinkProfile, make_cfg: fn() -> NetworkConfig) -> NetworkPair {
     let mac_a  = MacAddr::from([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
     let mac_b  = MacAddr::from([0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
     let ip_a   = Ipv4Addr::from([10, 0, 0, 1]);
