@@ -12,13 +12,14 @@ use rawket::{network::NetworkConfig, tcp::State};
 use crate::{
     assert::assert_state,
     assert_ok,
-    harness::setup_tcp_pair,
-    packet::build_tcp_data,
+    harness::{setup_network_pair, setup_tcp_pair},
+    packet::{build_tcp_data, build_udp_data},
     TestResult,
 };
 
 const IP_CSUM_BYTE: usize = 24;  // Ethernet(14) + IP header checksum offset(10)
 const TCP_CSUM_BYTE: usize = 50; // Ethernet(14) + IPv4(20) + TCP checksum offset(16)
+const UDP_CSUM_BYTE: usize = 40; // Ethernet(14) + IPv4(20) + UDP checksum offset(6)
 
 fn make_data_frame(pair: &crate::harness::TcpSocketPair) -> Vec<u8> {
     let a_snd_nxt = pair.tcp_a().snd_nxt();
@@ -137,5 +138,39 @@ fn ip_bad_checksum_dropped() -> TestResult {
         "B accepted segment with bad IP checksum (rcv_nxt advanced {} → {})",
         rcv_nxt_before, rcv_nxt_after
     );
+    Ok(())
+}
+
+// ── udp_bad_checksum_dropped ────────────────────────────────────────────────
+//
+// RFC 1122 §4.1.3.4: "A UDP datagram received with an invalid checksum
+// MUST be silently discarded."  (RFC 768 defines the checksum but does
+// not specify discard behavior.)
+//
+// With checksum_validate_udp=true, a corrupted UDP checksum must cause
+// the frame to be silently dropped (no ICMP Port Unreachable reply).
+#[test]
+fn udp_bad_checksum_dropped() -> TestResult {
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+
+    let mut frame = build_udp_data(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 9999,
+        b"bad-udp-cksum",
+    );
+    frame[UDP_CSUM_BYTE] ^= 0xFF;
+
+    np.inject_to_b(frame);
+    np.transfer_one();
+
+    // No ICMP reply should be generated for a frame with bad checksum.
+    let cap = np.drain_captured();
+    let icmp_sent = cap.raw().any(|f| {
+        f.raw.len() > 37 && f.raw[12] == 0x08 && f.raw[13] == 0x00 && f.raw[23] == 1
+    });
+    assert_ok!(!icmp_sent, "ICMP sent for UDP frame with bad checksum — should be silently dropped");
+
     Ok(())
 }
