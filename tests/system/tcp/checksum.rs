@@ -8,11 +8,11 @@
 //   Ethernet(14) + IPv4(20) + TCP_offset(16) = byte 50
 //   (same whether or not timestamps are present)
 
-use rawket::{network::NetworkConfig, tcp::State};
+use rawket::{bridge::LinkProfile, network::NetworkConfig, tcp::State};
 use crate::{
     assert::assert_state,
     assert_ok,
-    harness::{setup_network_pair, setup_tcp_pair},
+    harness::{build_network_pair, setup_network_pair, setup_tcp_pair},
     packet::{build_tcp_data, build_udp_data},
     TestResult,
 };
@@ -202,6 +202,42 @@ fn udp_bad_checksum_dropped() -> TestResult {
         f.raw.len() > 37 && f.raw[12] == 0x08 && f.raw[13] == 0x00 && f.raw[23] == 1
     });
     assert_ok!(!icmp_sent, "ICMP sent for UDP frame with bad checksum — should be silently dropped");
+
+    Ok(())
+}
+
+// ── udp_checksum_accepted_when_disabled ──────────────────────────────────────
+//
+// RFC 768: UDP checksum validation is mandatory per the spec, but our stack
+// exposes a config knob to disable it (e.g. for hardware offload paths).
+//
+// With checksum_validate_udp=false, a corrupted UDP checksum must still be
+// processed (ICMP Port Unreachable sent for closed port).
+#[test]
+fn udp_checksum_accepted_when_disabled() -> TestResult {
+    let mut np = setup_network_pair()
+        .net_config(NetworkConfig::default)
+        .profile(LinkProfile::leased_line_100m());
+
+    let mut frame = build_udp_data(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 9999,
+        b"bad-udp-cksum",
+    );
+    frame[UDP_CSUM_BYTE] ^= 0xFF;
+
+    np.inject_to_b(frame);
+    np.transfer_one();
+
+    // With validation disabled, the frame should be accepted and trigger
+    // ICMP Port Unreachable (port 9999 is closed).
+    let cap = np.drain_captured();
+    let icmp_sent = cap.raw().any(|f| {
+        f.raw.len() > 37 && f.raw[12] == 0x08 && f.raw[13] == 0x00 && f.raw[23] == 1
+    });
+    assert_ok!(icmp_sent,
+        "no ICMP sent for UDP frame with bad checksum when validation disabled — frame was dropped");
 
     Ok(())
 }
