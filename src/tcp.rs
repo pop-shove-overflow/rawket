@@ -2400,6 +2400,9 @@ impl TcpSocket {
     /// RX is now handled by the uplink's poll loop, which calls
     /// [`process_segment`] directly.
     pub fn poll(&mut self) -> Result<()> {
+        if self.state == State::Closed {
+            return Ok(());
+        }
         let now = self.clock.monotonic_ns();
 
         // ── TLP ──
