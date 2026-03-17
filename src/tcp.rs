@@ -830,9 +830,14 @@ impl TcpSocket {
             buf[off + 4..off + 8].copy_from_slice(&right.as_u32().to_be_bytes());
             slot = 1;
         }
-        for (i, ooo) in self.rx_ooo.iter().enumerate() {
+        // RFC 2018 §4: remaining blocks "from most recent to least recent".
+        // Since OOO is sorted by seq and segments generally arrive in order,
+        // iterate in reverse to report the highest (most recent) ranges first.
+        // This maximises the sender's rack_end_seq advancement.
+        for i in (0..self.rx_ooo.len()).rev() {
             if slot >= max_blocks { break; }
             if Some(i) == last_idx { continue; }
+            let ooo = &self.rx_ooo[i];
             let off = 4 + slot * 8;
             buf[off..off + 4].copy_from_slice(&ooo.seq.as_u32().to_be_bytes());
             let right = ooo.seq + ooo.data.len() as u32;
