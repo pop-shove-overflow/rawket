@@ -1724,7 +1724,7 @@ impl TcpSocket {
             && !matches!(self.state, State::Listen | State::SynSent | State::Closed | State::TimeWait)
         {
             if let Some(tsv) = opts.ts_val {
-                if tsv.wrapping_sub(self.ts_recent) > 0x8000_0000 {
+                if tsv.wrapping_sub(self.ts_recent) >= 0x8000_0000 {
                     // Timestamp is older than ts_recent — PAWS violation.
                     // RFC 7323 §5.2: send a duplicate ACK and discard.
                     let _ = self.send_ctrl(TcpFlags::ACK);
