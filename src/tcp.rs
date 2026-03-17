@@ -2087,23 +2087,82 @@ impl TcpSocket {
                         pdu,
                     });
                 } else if seq_gt(seg_seq, self.rcv_nxt) {
-                    // Out-of-order: buffer and SACK
-                    let dup = self.rx_ooo.iter().any(|s| s.seq == seg_seq);
-                    if !dup && self.rx_ooo.len() < self.cfg.rx_ooo_max {
-                        self.rx_ooo_last = Some(seg_seq);
+                    // Out-of-order: buffer and SACK.
+                    let seg_end = seg_seq + pdu.len() as u32;
+                    // D-SACK: check if segment is fully contained in existing
+                    // OOO range BEFORE any merge/insert attempt (RFC 2883 §3.2).
+                    let is_dup = self.rx_ooo.iter().any(|s| {
+                        let s_end = s.seq + s.data.len() as u32;
+                        seq_ge(seg_seq, s.seq) && seq_le(seg_end, s_end)
+                    });
+                    // Try to merge with an existing OOO range first, then fall
+                    // back to inserting a new entry if capacity allows.
+                    let mut merged = false;
+                    for s in &mut self.rx_ooo {
+                        let s_end = s.seq + s.data.len() as u32;
+                        // Check if new segment is contiguous/overlapping with this range
+                        if seq_ge(seg_end, s.seq) && seq_ge(s_end, seg_seq) {
+                            // Extend left if new segment starts before
+                            if seq_lt(seg_seq, s.seq) {
+                                let prepend = (s.seq - seg_seq) as usize;
+                                let mut new_data = pdu[..prepend].to_vec();
+                                new_data.extend_from_slice(&s.data);
+                                s.data = new_data;
+                                s.seq = seg_seq;
+                            }
+                            // Extend right if new segment ends after
+                            if seq_gt(seg_end, s_end) {
+                                let overlap = (s_end - seg_seq) as usize;
+                                if overlap < pdu.len() {
+                                    s.data.extend_from_slice(&pdu[overlap..]);
+                                }
+                            }
+                            merged = true;
+                            break;
+                        }
+                    }
+                    let inserted = if !merged && self.rx_ooo.len() < self.cfg.rx_ooo_max {
                         self.rx_ooo.push(RxOooSegment { seq: seg_seq, data: pdu.to_vec() });
+                        true
+                    } else { false };
+                    if merged || inserted {
                         // Sort by seq
                         self.rx_ooo.sort_by(|a, b| {
                             if seq_lt(a.seq, b.seq) { core::cmp::Ordering::Less }
                             else if a.seq == b.seq  { core::cmp::Ordering::Equal }
                             else                    { core::cmp::Ordering::Greater }
                         });
+                        // Merge adjacent/overlapping ranges after sort
+                        let mut i = 0;
+                        while i + 1 < self.rx_ooo.len() {
+                            let a_end = self.rx_ooo[i].seq + self.rx_ooo[i].data.len() as u32;
+                            let b_seq = self.rx_ooo[i + 1].seq;
+                            if seq_ge(a_end, b_seq) {
+                                let b_end = self.rx_ooo[i + 1].seq
+                                    + self.rx_ooo[i + 1].data.len() as u32;
+                                if seq_gt(b_end, a_end) {
+                                    let overlap = (a_end - b_seq) as usize;
+                                    let tail: Vec<u8> = self.rx_ooo[i + 1].data[overlap..].to_vec();
+                                    self.rx_ooo[i].data.extend_from_slice(&tail);
+                                }
+                                self.rx_ooo.remove(i + 1);
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        // After sort+merge, set rx_ooo_last to the containing range
+                        self.rx_ooo_last = self.rx_ooo.iter()
+                            .find(|s| {
+                                let s_end = s.seq + s.data.len() as u32;
+                                seq_ge(seg_seq, s.seq) && seq_le(seg_seq, s_end)
+                            })
+                            .map(|s| s.seq)
+                            .or(Some(seg_seq));
                     }
-                    // Send ACK with SACK (or D-SACK for OOO duplicates per RFC 2883 §3.2)
                     let mut sack_buf = [0u8; 40];
                     let max = self.max_sack_blocks();
                     let sack_len = if self.sack_ok {
-                        if dup && !pdu.is_empty() {
+                        if is_dup && !pdu.is_empty() {
                             let dsack_right = seg_seq + pdu.len() as u32;
                             self.build_dsack_opts(&mut sack_buf, seg_seq, dsack_right, max)
                         } else {
