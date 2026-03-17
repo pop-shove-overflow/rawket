@@ -1220,8 +1220,10 @@ impl TcpSocket {
     fn bbr_phase_update(&mut self, now: u64) {
         match self.bbr.phase {
             BbrPhase::Startup => {
-                // Exit STARTUP if pipe filled (BW not growing for 3 rounds)
-                if !self.bbr.filled_pipe {
+                // BBRCheckStartupFullBandwidth (spec §5.3.1.2):
+                // Only evaluate at round boundaries, per spec:
+                //   "if filled_pipe or !round_start: return"
+                if !self.bbr.filled_pipe && self.bbr.loss_round_start {
                     let max = self.bbr.max_bw;
                     if max > 0 && max >= ScaledFloat::new(125).apply(self.bbr.full_bw_at_round) {
                         self.bbr.full_bw_at_round = max;
