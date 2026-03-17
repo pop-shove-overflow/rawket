@@ -890,12 +890,12 @@ impl TcpSocket {
     fn max_sack_blocks(&self) -> usize { if self.ts_enabled { 3 } else { 4 } }
 
     /// TLP deadline: RFC 8985 §7.4.
-    /// FlightSize > 1 → max(2*SRTT, 1.5*SRTT + WCDelAckT).
-    /// FlightSize == 1 → 2*SRTT.
+    /// FlightSize == 1 → max(2*SRTT, 1.5*SRTT + WCDelAckT).
+    /// FlightSize > 1  → 2*SRTT.
     fn tlp_deadline_ns(&self) -> u64 {
         const WC_DEL_ACK_NS: u64 = 25_000_000; // 25 ms in ns, per RFC 8985 §7.4.1
         let two_srtt = 2 * self.srtt_ns;
-        if self.unacked.len() > 1 {
+        if self.unacked.len() <= 1 {
             two_srtt.max(3 * self.srtt_ns / 2 + WC_DEL_ACK_NS)
         } else {
             two_srtt
