@@ -2495,6 +2495,9 @@ impl TcpSocket {
             }
             self.rto_count += 1;
             if self.rto_count >= self.cfg.max_retransmits {
+                // RFC 793 §3.8: "If the retransmission timeout is exceeded [...]
+                // the connection is aborted."  Send RST to notify the peer.
+                let _ = self.send_ctrl(TcpFlags::RST | TcpFlags::ACK);
                 self.state      = State::Closed;
                 self.last_error = Some(TcpError::Timeout);
                 let on_error    = self.on_error;
