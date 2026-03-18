@@ -416,3 +416,41 @@ fn effective_mss_accounts_for_ts_options() -> TestResult {
 
     Ok(())
 }
+
+// RFC 9293 §3.7.1: the MSS value advertised in SYN-ACK reflects the
+// receive capability, not the effective send size after option overhead.
+#[test]
+fn syn_ack_mss_not_reduced_by_options() -> TestResult {
+    let mut np = setup_network_pair();
+    let cfg = TcpConfig::default();
+
+    let server = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {}, cfg.clone(),
+    ).expect("accept");
+    np.add_tcp_b(server);
+
+    let syn = build_tcp_syn(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        0x1000_0000, 0,
+        0x02,
+        Some(1460), Some(4), Some((1000, 0)), true,
+    );
+    // Drop RSTs from A (no A-side socket, so A would RST B's SYN-ACK).
+    np.add_impairment_to_b(Impairment::Drop(PacketSpec::matching(filter::tcp::rst())));
+
+    np.inject_to_b(syn);
+    np.transfer_one();
+
+    let cap = np.drain_captured();
+    let syn_ack = cap.tcp()
+        .find(|f| f.dir == Dir::BtoA && f.tcp.flags.has(TcpFlags::SYN) && f.tcp.flags.has(TcpFlags::ACK))
+        .ok_or_else(|| crate::assert::TestFail::new("no SYN-ACK from B"))?;
+
+    assert_mss_option(&syn_ack, cfg.mss, "SYN-ACK MSS should be full configured MSS")?;
+
+    Ok(())
+}
