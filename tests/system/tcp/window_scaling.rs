@@ -78,3 +78,44 @@ fn large_window_transfer() -> TestResult {
 
     Ok(())
 }
+
+// RFC 7323 §2.3 (Window Calculation): After handshake with WS=4, B's window
+// advertisement must represent the scaled window.
+#[test]
+fn receive_window_advertisement() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"hello")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let b_ack = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::ACK)
+        .without_tcp_flags(TcpFlags::SYN)
+        .last()
+        .ok_or_else(|| TestFail::new("no data ACK from B"))?;
+
+    // B's rcv_scale must equal LOCAL_WS_SHIFT (both sides use default config).
+    assert_ok!(
+        pair.tcp_b().rcv_scale() == LOCAL_WS_SHIFT,
+        "rcv_scale={} — expected {LOCAL_WS_SHIFT}", pair.tcp_b().rcv_scale()
+    );
+
+    let raw_window = b_ack.tcp.window_raw;
+    let scaled_window = (raw_window as u32) << LOCAL_WS_SHIFT;
+
+    assert_ok!(raw_window > 0, "B's raw window in ACK is 0");
+    assert_ok!(
+        scaled_window > 65535,
+        "scaled window ({scaled_window}) ≤ 65535 — window scaling may not be active"
+    );
+    assert_ok!(
+        scaled_window <= 1_048_576,
+        "B's scaled window ({scaled_window}) exceeds recv_buf_max (1048576)"
+    );
+
+    Ok(())
+}
