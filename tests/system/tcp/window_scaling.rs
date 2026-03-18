@@ -37,3 +37,44 @@ fn negotiation_both_sides() -> TestResult {
 
     Ok(())
 }
+
+// RFC 7323 §2.3 (Window Calculation): With WS=4, effective window is far
+// larger than 65535.  Send 65536 bytes to exercise scaled window.
+#[test]
+fn large_window_transfer() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let big = vec![0x55u8; 65_536];
+    pair.tcp_a_mut().send(&big)?;
+
+    // Drive until B ACKs all data.
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let total: usize = cap.tcp().from_a().with_data().map(|f| f.payload_len).sum();
+    assert_ok!(total == 65_536, "expected 65536 bytes from A but got {total}");
+
+    // Prove window scaling was active and required: B's advertised window
+    // (reconstructed with scale) must have exceeded 65535 at some point.
+    let rcv_scale = pair.tcp_b().rcv_scale();
+    assert_ok!(rcv_scale > 0, "rcv_scale is 0 — no window scaling negotiated");
+
+    let max_effective_wnd: u32 = cap.tcp().from_b()
+        .map(|f| (f.tcp.window_raw as u32) << rcv_scale)
+        .max()
+        .unwrap_or(0);
+    assert_ok!(
+        max_effective_wnd > 65535,
+        "max effective window ({max_effective_wnd}) <= 65535 — scaling not required for this transfer"
+    );
+
+    assert_ok!(
+        pair.tcp_a().state == rawket::tcp::State::Established,
+        "A not Established after large transfer"
+    );
+
+    Ok(())
+}
