@@ -4,7 +4,7 @@ use crate::{
     assert_ok,
     capture::{Dir, ParsedFrameExt},
     harness::setup_tcp_pair,
-    packet::build_tcp_data_with_ts,
+    packet::{build_tcp_data_with_ts, build_tcp_rst},
     TestResult,
 };
 
@@ -464,6 +464,58 @@ fn incoming_nonzero_payload_probe_elicits_ack() -> TestResult {
          probe byte must not be delivered",
         rcv_nxt, rcv_nxt_after
     );
+
+    Ok(())
+}
+
+// ── keepalive_rst_response ──────────────────────────────────────────────────
+//
+// RFC 1122 §4.2.3.6: if a keepalive probe elicits a RST (peer has rebooted
+// and no longer recognizes the connection), the connection must be aborted.
+#[test]
+fn keepalive_rst_response() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .keepalive_idle_ms(50)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let idle = pair.tcp_cfg.keepalive_idle_ms as i64;
+
+    let snd_una = pair.tcp_a().snd_una();
+    let rcv_nxt = pair.tcp_a().rcv_nxt();
+
+    // Blackhole B→A so B's normal keepalive ACK doesn't arrive.
+    pair.blackhole_to_a();
+
+    // Advance past idle to trigger A's keepalive probe.
+    pair.advance_both(idle + 10);
+    pair.transfer_one();
+
+    // Verify A sent a keepalive probe.
+    let cap = pair.drain_captured();
+    let probe = cap.all_tcp().from_a()
+        .filter(|f| f.payload_len == 0
+            && f.tcp.flags.has(TcpFlags::ACK)
+            && !f.tcp.flags.has(TcpFlags::SYN)
+            && !f.tcp.flags.has(TcpFlags::RST)
+            && !f.tcp.flags.has(TcpFlags::FIN)
+            && f.tcp.seq == snd_una.wrapping_sub(1))
+        .next();
+    assert_ok!(probe.is_some(), "A did not send keepalive probe");
+
+    // Clear blackhole and inject RST as if B rebooted.
+    pair.clear_impairments();
+    let rst = build_tcp_rst(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        rcv_nxt,
+    );
+    pair.inject_to_a(rst);
+    pair.transfer();
+
+    assert_state(pair.tcp_a(), State::Closed, "A must close after RST response to keepalive")?;
+    assert_error_fired(pair.tcp_a(), TcpError::Reset, "A error = Reset after keepalive RST")?;
 
     Ok(())
 }
