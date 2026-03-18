@@ -404,3 +404,47 @@ fn syn_bypasses_paws() -> TestResult {
 
     Ok(())
 }
+
+// RFC 7323 §5: PAWS must NOT apply to RST segments.
+// Inject a RST with a stale TSval — connection must still close.
+#[test]
+fn rst_bypasses_paws() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"warmup")?;
+    pair.transfer();
+
+    let ts_recent = pair.tcp_b().ts_recent();
+    assert_ok!(ts_recent > 0, "ts_recent not populated");
+
+    let rcv_nxt = pair.tcp_b().rcv_nxt();
+    pair.clear_capture();
+
+    // Build a RST with a stale TSval using build_tcp_data_with_ts and patching flags.
+    let stale_tsval = ts_recent.wrapping_sub(0x4000_0000);
+    let b_snd_nxt = pair.tcp_b().snd_nxt();
+    let mut rst = build_tcp_data_with_ts(
+        pair.mac_a, pair.mac_b,
+        pair.ip_a,  pair.ip_b,
+        12345, 80,
+        rcv_nxt,   // exact seq match for RST acceptance
+        b_snd_nxt,
+        stale_tsval,
+        0,
+        &[],
+    );
+    // Patch flags: change ACK (0x10) to RST (0x04).
+    rst[47] = 0x04;
+    recompute_frame_tcp_checksum(&mut rst);
+
+    pair.inject_to_b(rst);
+    pair.transfer_one();
+
+    // B must close — RST bypasses PAWS.
+    assert_state(pair.tcp_b(), State::Closed, "B must close after RST with stale TSval (PAWS bypassed)")?;
+
+    Ok(())
+}
