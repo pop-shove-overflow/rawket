@@ -511,3 +511,62 @@ fn ooo_overlapping_segments_coalesce() -> TestResult {
 
     Ok(())
 }
+
+// ── fin_piggybacked_on_ooo_data ────────────────────────────────────────────
+//
+// RFC 9293 §3.10.7.4: FIN piggybacked on an OOO data segment is deferred
+// until the gap is filled, then processed after data delivery.
+//
+// A data+FIN segment arrives OOO.  The OOO buffer must store both the data
+// and the FIN flag.  After the gap is filled, drain_ooo delivers the data
+// then processes the piggybacked FIN → CloseWait.
+#[test]
+fn fin_piggybacked_on_ooo_data() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let (b_rcv_nxt, b_snd_nxt) = baseline_seqs(&mut pair)?;
+
+    let ooo_fin = build_tcp_data_with_flags(
+        pair.mac_a, pair.mac_b,
+        pair.ip_a,  pair.ip_b,
+        12345, 80,
+        b_rcv_nxt + 1, b_snd_nxt,
+        0x11, // FIN|ACK
+        65535,
+        b"BC",
+    );
+    pair.inject_to_b(ooo_fin);
+    pair.transfer_one();
+
+    // B should still be Established — gap at b_rcv_nxt not filled.
+    assert_ok!(
+        pair.tcp_b().state == State::Established,
+        "B should still be Established before gap fill, got {:?}", pair.tcp_b().state
+    );
+
+    // Fill the gap and run to completion.
+    let fill = a_to_b(&pair, b_rcv_nxt, b_snd_nxt, b"A");
+    pair.inject_to_b(fill);
+    let result = pair.transfer();
+
+    // Verify data delivered in order: "A" + "BC" = "ABC".
+    // (baseline "a" was consumed by drain_b in baseline_seqs.)
+    let received = result.b.get(&0).map(|v| v.as_slice()).unwrap_or(&[]);
+    assert_ok!(received.len() == 3, "expected 3 bytes delivered to B, got {}", received.len());
+    assert_ok!(
+        received == b"ABC",
+        "delivered payload {:?} != expected {:?}",
+        received, b"ABC"
+    );
+
+    // Piggybacked FIN should have been processed after data delivery.
+    let b_state = pair.tcp_b().state;
+    assert_ok!(
+        b_state == State::CloseWait,
+        "B expected CloseWait after draining OOO data+FIN, got {b_state:?}"
+    );
+
+    Ok(())
+}
