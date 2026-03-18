@@ -495,3 +495,36 @@ fn syn_during_time_wait() -> TestResult {
 
     Ok(())
 }
+
+// ── time_wait_2msl ────────────────────────────────────────────────────────────
+//
+// RFC 9293 §3.6.1: TIME-WAIT must linger for 2×MSL (MUST-13).  This test
+// verifies the timer mechanism with a configurable time_wait_ms=100ms, not
+// that the default value satisfies 2×MSL.
+#[test]
+fn time_wait_2msl() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .time_wait_ms(100)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let cfg = pair.tcp_cfg.clone();
+
+    pair.tcp_a_mut().close()?;
+    pair.transfer();
+    pair.tcp_b_mut().close()?;
+    pair.transfer_while(|p| p.tcp_a(0).state != State::TimeWait);
+    assert_state(pair.tcp_a(), State::TimeWait, "A TimeWait")?;
+    let tw_start = pair.clock_a.monotonic_ns();
+
+    pair.transfer();
+    assert_state(pair.tcp_a(), State::Closed, "A Closed after 2MSL")?;
+
+    let elapsed_ms = (pair.clock_a.monotonic_ns() - tw_start) / 1_000_000;
+    assert_ok!(
+        elapsed_ms == cfg.time_wait_ms as u64,
+        "TimeWait lasted {elapsed_ms}ms, expected {}", cfg.time_wait_ms
+    );
+
+    Ok(())
+}
