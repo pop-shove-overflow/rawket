@@ -280,3 +280,44 @@ fn fin_retransmit() -> TestResult {
 
     Ok(())
 }
+
+// ── fin_piggybacked_on_data ────────────────────────────────────────────────────
+//
+// Implementation optimization: close() after send() piggybacks FIN on the
+// last data segment.  RFC 9293 §3.10.4 says "form a FIN segment and send it"
+// after preceding SENDs are segmentized — piggybacking is not required.
+#[test]
+fn fin_piggybacked_on_data() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // 20 000 bytes > initial_cwnd (10*MSS ≈ 14480 bytes with TS option), so
+    // flush_send_buf() cannot drain everything in send(); close() sees a
+    // non-empty buffer and piggybacks FIN on the last data segment.
+    let data = vec![0x50u8; 20_000];
+    pair.tcp_a_mut().send(&data)?;
+    pair.tcp_a_mut().close()?;
+
+    pair.transfer_while(|p| p.tcp_b(0).state != State::CloseWait);
+    assert_state(pair.tcp_b(), State::CloseWait, "B CloseWait after piggybacked FIN+data")?;
+
+    let cap = pair.drain_captured();
+    let total_data: usize = cap.tcp()
+        .direction(Dir::AtoB)
+        .with_data()
+        .map(|f| f.payload_len)
+        .sum();
+    assert_ok!(total_data == 20_000, "expected 20000 data bytes from A, got {total_data}");
+
+    let piggybacked = cap.tcp()
+        .direction(Dir::AtoB)
+        .any(|f| f.tcp.flags.has(TcpFlags::FIN) && f.payload_len > 0);
+    assert_ok!(
+        piggybacked,
+        "FIN not piggybacked on data segment — close() after send() should piggyback FIN"
+    );
+
+    Ok(())
+}
