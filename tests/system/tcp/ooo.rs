@@ -440,3 +440,74 @@ fn ooo_outside_window() -> TestResult {
 
     Ok(())
 }
+
+// ── ooo_overlapping_segments_coalesce ──────────────────────────────────────
+//
+// RFC 9293 §3.10.7.4: overlapping OOO segments coalesce; no duplicate data.
+//
+// Two OOO segments that partially overlap must coalesce into one range.
+// After gap fill, all data is delivered without duplication.
+#[test]
+fn ooo_overlapping_segments_coalesce() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let (b_rcv_nxt, b_snd_nxt) = baseline_seqs(&mut pair)?;
+
+    let seg1 = a_to_b(&pair, b_rcv_nxt + 1, b_snd_nxt, b"BC");
+    pair.inject_to_b(seg1);
+    pair.transfer_one();
+
+    let seg2 = a_to_b(&pair, b_rcv_nxt + 2, b_snd_nxt, b"CD");
+    pair.inject_to_b(seg2);
+    pair.transfer_one();
+
+    // After coalescing, SACK should report a single block [+1, +4).
+    let cap = pair.drain_captured();
+    let last_sack = cap.tcp()
+        .direction(Dir::BtoA)
+        .with_tcp_flags(TcpFlags::ACK)
+        .filter(|f| !f.tcp.opts.sack_blocks.is_empty())
+        .last();
+    let last_sack = last_sack
+        .ok_or_else(|| TestFail::new("no SACK ACK after overlapping OOO segments"))?;
+    assert_ok!(
+        last_sack.tcp.opts.sack_blocks.len() == 1,
+        "expected 1 coalesced SACK block, got {}: {:?}",
+        last_sack.tcp.opts.sack_blocks.len(), last_sack.tcp.opts.sack_blocks
+    );
+    assert_ok!(
+        last_sack.tcp.opts.sack_blocks[0] == (b_rcv_nxt + 1, b_rcv_nxt + 4),
+        "coalesced SACK block should be [{}, {}), got {:?}",
+        b_rcv_nxt + 1, b_rcv_nxt + 4, last_sack.tcp.opts.sack_blocks[0]
+    );
+
+    // Fill the gap at +0 and run to completion.
+    let fill = a_to_b(&pair, b_rcv_nxt, b_snd_nxt, b"A");
+    pair.inject_to_b(fill);
+    let result = pair.transfer();
+
+    // Verify delivered payload: "A" + "BCD" (coalesced) = "ABCD".
+    // (baseline "a" was consumed by drain_b in baseline_seqs.)
+    let received = result.b.get(&0).map(|v| v.as_slice()).unwrap_or(&[]);
+    assert_ok!(received.len() == 4, "expected 4 bytes delivered to B, got {}", received.len());
+    assert_ok!(
+        received == b"ABCD",
+        "delivered payload {:?} != expected {:?} — overlap coalesce incorrect",
+        received, b"ABCD"
+    );
+
+    // ACK should advance past all 4 injected bytes.
+    let cap2 = pair.drain_captured();
+    let max_ack = cap2.tcp()
+        .direction(Dir::BtoA)
+        .map(|f| f.tcp.ack)
+        .max();
+    assert_ok!(
+        max_ack == Some(b_rcv_nxt + 4),
+        "ACK should be exactly +4 after coalesced OOO drain"
+    );
+
+    Ok(())
+}
