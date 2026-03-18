@@ -913,3 +913,43 @@ fn send_after_close() -> TestResult {
 
     Ok(())
 }
+
+// ── send_in_close_wait ──────────────────────────────────────────────────────
+//
+// RFC 9293 §3.10.2: send() in CloseWait is allowed (half-open: peer closed,
+// we can still send).
+#[test]
+fn send_in_close_wait() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_b_mut().close()?;
+    pair.transfer();
+    assert_state(pair.tcp_a(), State::CloseWait, "A CloseWait")?;
+
+    // send() should succeed in CloseWait.
+    pair.clear_capture();
+    let result = pair.tcp_a_mut().send(b"half-open-data");
+    assert_ok!(result.is_ok(), "send() in CloseWait should succeed, got {:?}", result.err());
+
+    let result = pair.transfer();
+    let cap = pair.drain_captured();
+    let data_from_a = cap.tcp().filter(|f| f.dir == Dir::AtoB && f.payload_len > 0).count();
+    assert_ok!(data_from_a > 0, "no data segments from A in CloseWait — data never reached wire");
+
+    // Verify B received the payload content.
+    let received = result.b.get(&0).map(|v| v.as_slice()).unwrap_or(&[]);
+    assert_ok!(
+        received == b"half-open-data",
+        "B did not receive expected payload: got {:?}", received
+    );
+
+    // close() after send completes the shutdown (CloseWait → LastAck → Closed).
+    pair.tcp_a_mut().close()?;
+    pair.transfer();
+    assert_state(pair.tcp_a(), State::Closed, "A should reach Closed after close() in CloseWait")?;
+
+    Ok(())
+}
