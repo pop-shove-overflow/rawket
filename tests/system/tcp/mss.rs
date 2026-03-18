@@ -664,3 +664,44 @@ fn mss_clamp_small_peer() -> TestResult {
 
     Ok(())
 }
+
+// RFC 9293 §3.7.1: data must be segmented at exact effective-MSS boundaries
+// when the payload is an exact multiple of the effective MSS.
+#[test]
+fn mss_segmentation_boundaries() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let mss = pair.tcp_a().peer_mss() as usize;
+    let ts_overhead = if pair.tcp_a().ts_enabled() { 12 } else { 0 };
+    let effective_mss = mss - ts_overhead;
+
+    let total = 3 * effective_mss;
+    pair.tcp_a_mut().send(&vec![0x77u8; total])?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let payload_sizes: Vec<usize> = cap.tcp()
+        .filter(|f| f.dir == Dir::AtoB && f.payload_len > 0)
+        .map(|f| f.payload_len)
+        .collect();
+
+    assert_ok!(
+        payload_sizes.len() == 3,
+        "expected exactly 3 data segments for {}B payload, got {} (sizes: {:?})",
+        total, payload_sizes.len(), payload_sizes
+    );
+
+    // All 3 segments should be exactly effective_mss.
+    for (i, &sz) in payload_sizes.iter().enumerate() {
+        assert_ok!(
+            sz == effective_mss,
+            "segment {i} size {sz} != effective_mss ({effective_mss}); sizes: {:?}",
+            payload_sizes
+        );
+    }
+
+    Ok(())
+}
