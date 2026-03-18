@@ -4,7 +4,7 @@ use crate::{
     assert_ok,
     capture::{Dir, ParsedFrameExt},
     harness::setup_tcp_pair,
-    packet::{build_tcp_data, build_tcp_rst},
+    packet::{build_tcp_data, build_tcp_rst, build_tcp_syn},
     TestResult,
 };
 
@@ -430,6 +430,68 @@ fn rst_during_time_wait_ignored() -> TestResult {
     let cap = pair.drain_captured();
     let a_sent = cap.tcp().direction(Dir::AtoB).count();
     assert_ok!(a_sent == 0, "A sent {a_sent} frame(s) in response to RST in TimeWait — expected 0");
+
+    Ok(())
+}
+
+// ── syn_during_time_wait ──────────────────────────────────────────────────────
+//
+// RFC 9293 §3.6.1 MAY-2: a SYN during TIME-WAIT MAY be accepted to reopen
+// the connection.  Our implementation rejects it (stays in TimeWait).  This
+// test validates our implementation choice; the RFC permits either behavior.
+#[test]
+fn syn_during_time_wait() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().close()?;
+    pair.transfer();
+    pair.tcp_b_mut().close()?;
+    pair.transfer_while(|p| {
+        p.tcp_a(0).state != State::TimeWait || p.tcp_b(0).state != State::Closed
+    });
+    assert_state(pair.tcp_a(), State::TimeWait, "A TimeWait")?;
+
+    let cap0 = pair.drain_captured();
+    let b_fin = cap0.tcp()
+        .direction(Dir::BtoA)
+        .with_tcp_flags(TcpFlags::FIN)
+        .last()
+        .ok_or_else(|| TestFail::new("no BtoA FIN"))?;
+
+    let new_syn = build_tcp_syn(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        b_fin.tcp.seq + 1000,
+        0,
+        0x02, // SYN
+        Some(1460), None, None, false,
+    );
+    pair.clear_capture();
+    pair.forward(new_syn);
+    pair.transfer_one();
+
+    // A must still be in TimeWait immediately after SYN — SYN was rejected.
+    assert_state(pair.tcp_a(), State::TimeWait, "A still TimeWait after SYN inject")?;
+
+    // Let the TimeWait timer expire.
+    pair.transfer_while(|p| p.tcp_a(0).state == State::TimeWait);
+
+    // Our implementation rejects SYN in TIME-WAIT — no SYN-ACK sent.
+    // (RFC 9293 §3.6.1 MAY-2 permits accepting it; we choose not to.)
+    let cap1 = pair.drain_captured();
+    let sent_syn_ack = cap1.tcp()
+        .direction(Dir::AtoB)
+        .with_tcp_flags(TcpFlags::SYN)
+        .with_tcp_flags(TcpFlags::ACK)
+        .count();
+    assert_ok!(
+        sent_syn_ack == 0,
+        "A sent {sent_syn_ack} SYN-ACK(s) during TIME_WAIT — implementation rejects SYN here"
+    );
 
     Ok(())
 }
