@@ -584,3 +584,132 @@ fn ts_recent_gating_ooo() -> TestResult {
 
     Ok(())
 }
+
+// RFC 7323 §5: PAWS 24-day boundary — 2^31 ahead is rejected; 2^31-1 is accepted.
+#[test]
+fn paws_24day_boundary() -> TestResult {
+    let isn_a: u32 = 0x1000_0000;
+    let ts_base: u32 = 0x4000_0000;
+
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    let server = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {},
+        cfg,
+    )?;
+    np.add_tcp_b(server);
+
+    let syn = build_tcp_syn(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a, 0,
+        0x02,
+        Some(1460), Some(4),
+        Some((ts_base, 0)),
+        true,
+    );
+    np.inject_to_b(syn);
+    np.transfer_one();
+
+    let cap = np.drain_captured();
+    let syn_ack = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::SYN)
+        .with_tcp_flags(TcpFlags::ACK)
+        .next()
+        .ok_or_else(|| TestFail::new("no SYN-ACK from B"))?;
+    let b_isn = syn_ack.tcp.seq;
+    let b_tsval = syn_ack.tcp.opts.timestamps.map(|(v, _)| v).unwrap_or(0);
+
+    let ts_handshake = ts_base.wrapping_add(1);
+    let ack = build_tcp_data_with_ts(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a + 1, b_isn + 1,
+        ts_handshake, b_tsval,
+        &[],
+    );
+    np.inject_to_b(ack);
+    np.transfer_one();
+
+    assert_state(np.tcp_b(0), State::Established, "B Established after handshake")?;
+
+    let ts_recent = np.tcp_b(0).ts_recent();
+    assert_ok!(ts_recent == ts_handshake,
+        "B ts_recent should be {ts_handshake} after handshake ACK, got {ts_recent}");
+
+    np.clear_capture();
+
+    // Case 1: TSval = ts_recent + 2^31 → REJECTED per RFC 7323 §5.
+    //
+    // The PAWS check is: (int)(SEG.TSval - TS.Recent) < 0.
+    // At exactly 2^31 ahead, (int)(0x8000_0000) = -2147483648 < 0 → stale.
+    let boundary_ts = ts_recent.wrapping_add(0x8000_0000);
+    let seg1 = build_tcp_data_with_ts(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a + 1, b_isn + 1,
+        boundary_ts, b_tsval,
+        b"B",
+    );
+    let rcv_nxt_before = np.tcp_b(0).rcv_nxt();
+    np.inject_to_b(seg1);
+    np.transfer_one();
+    let rcv_nxt_after = np.tcp_b(0).rcv_nxt();
+    assert_ok!(
+        rcv_nxt_after == rcv_nxt_before,
+        "PAWS accepted TSval at exactly 2^31 ahead ({boundary_ts:#010x}) — \
+         RFC 7323 signed comparison requires rejection"
+    );
+
+    // Case 1b: TSval = ts_recent + 2^31 - 1 → last valid forward value, ACCEPTED.
+    let near_boundary_ts = ts_recent.wrapping_add(0x7FFF_FFFF);
+    let seg1b = build_tcp_data_with_ts(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a + 1, b_isn + 1,
+        near_boundary_ts, b_tsval,
+        b"N",
+    );
+    let rcv_nxt_before_1b = np.tcp_b(0).rcv_nxt();
+    np.inject_to_b(seg1b);
+    np.transfer_one();
+    let rcv_nxt_after_1b = np.tcp_b(0).rcv_nxt();
+    assert_ok!(
+        rcv_nxt_after_1b > rcv_nxt_before_1b,
+        "PAWS rejected TSval at 2^31-1 ahead ({near_boundary_ts:#010x}) — \
+         should be accepted as forward timestamp"
+    );
+
+    np.clear_capture();
+
+    // Case 2: TSval = ts_recent - 1 → one tick stale, must be REJECTED.
+    let ts_recent2 = np.tcp_b(0).ts_recent();
+    let stale_ts = ts_recent2.wrapping_sub(1);
+    let rcv_nxt2 = np.tcp_b(0).rcv_nxt();
+    let seg2 = build_tcp_data_with_ts(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        rcv_nxt2, b_isn + 1,
+        stale_ts, b_tsval,
+        b"S",
+    );
+    np.inject_to_b(seg2);
+    np.transfer_one();
+    let rcv_nxt_after2 = np.tcp_b(0).rcv_nxt();
+    assert_ok!(
+        rcv_nxt_after2 == rcv_nxt2,
+        "PAWS accepted TSval one tick behind ts_recent ({stale_ts:#010x} < {ts_recent2:#010x})"
+    );
+
+    Ok(())
+}
