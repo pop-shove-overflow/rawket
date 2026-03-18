@@ -456,6 +456,23 @@ impl Network {
         self.clock.clone()
     }
 
+    /// Absolute nanosecond timestamp of the earliest pending event owned by
+    /// this Network: general-purpose timers (ARP expiry, etc.) and per-socket
+    /// deadlines (RTO, TLP, keep-alive, persist, pacing).
+    ///
+    /// Does **not** include bridge delivery deadlines — the bridge is a
+    /// separate layer.  Callers that need the global next-event should
+    /// combine this with [`Bridge::next_deadline_ns`].
+    pub fn next_event_ns(&self) -> Option<u64> {
+        let timer_abs = self.timers.next_deadline_abs_ns();
+        let tcp_abs: Option<u64> = self.interfaces
+            .iter()
+            .flat_map(|i| i.tcp_sockets.iter())
+            .filter_map(|s| s.next_deadline_abs_ns())
+            .min();
+        [timer_abs, tcp_abs].into_iter().flatten().min()
+    }
+
     /// Register a bridge-port delivery closure.
     ///
     /// Called by [`PortBuilder::finish`](crate::bridge::PortBuilder::finish)

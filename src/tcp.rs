@@ -2435,6 +2435,19 @@ impl TcpSocket {
         .into_iter().flatten().min()
     }
 
+    /// Absolute nanosecond timestamp of the earliest armed deadline
+    /// (RTO, TLP, keep-alive, persist, pacing), or `None`.
+    pub fn next_deadline_abs_ns(&self) -> Option<u64> {
+        [
+            self.rto_deadline.abs_ns(),
+            self.tlp_deadline.abs_ns(),
+            self.keepalive_deadline.abs_ns(),
+            self.persist_deadline.abs_ns(),
+            self.pacing_next.abs_ns(),
+        ]
+        .into_iter().flatten().min()
+    }
+
     /// Drive the state machine: timers, retransmit, send-buffer drain.
     ///
     /// RX is now handled by the uplink's poll loop, which calls

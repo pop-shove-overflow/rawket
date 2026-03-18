@@ -207,6 +207,10 @@ impl Deadline {
     pub(crate) fn remaining_ns(self, now_ns: u64) -> Option<u64> {
         if self.0 == 0 { None } else { Some(self.0.saturating_sub(now_ns)) }
     }
+    /// Absolute nanosecond deadline, or `None` if disarmed.
+    pub(crate) fn abs_ns(self) -> Option<u64> {
+        if self.0 == 0 { None } else { Some(self.0) }
+    }
 }
 
 // ── TimerId ───────────────────────────────────────────────────────────────────
@@ -319,6 +323,12 @@ impl Timers {
     /// Returns the number of pending timers.
     pub fn len(&self) -> usize {
         self.list.len()
+    }
+
+    /// Absolute nanosecond timestamp of the earliest pending timer, or `None`.
+    /// Does **not** fire expired timers — use [`update`](Self::update) for that.
+    pub fn next_deadline_abs_ns(&self) -> Option<u64> {
+        self.list.first().map(|t| t.deadline.0)
     }
 
     /// Returns a reference to the clock driving this timer list.
