@@ -1443,3 +1443,61 @@ fn startup_exit_via_bandwidth_plateau() -> TestResult {
     assert_ok!(false, "Drain found during transfer but not in final history");
     Ok(())
 }
+
+// draft-ietf-ccwg-bbr-04 §4.3.3.9: ProbeBW_UP uses cwnd_gain = 2.25.
+// Verify that cwnd during ProbeBW_UP phase is approximately 2.25 * BDP + 4*MSS.
+#[test]
+fn probe_bw_up_cwnd_gain() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let mss = pair.tcp_a().peer_mss() as u32;
+
+    // Drive enough data to reach ProbeBwUp, using bbr_history() to find the
+    // snapshot at ProbeBwUp entry with full BBR state.
+    let mut found_up = false;
+    pair.tcp_a_mut().send(&vec![0xBBu8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0xBBu8; 2_000]);
+        }
+
+        for snap in p.tcp_a(0).bbr_history() {
+            if snap.phase == BbrPhase::ProbeBwUp
+                && snap.max_bw > 0
+                && snap.min_rtt_ns > 0
+                && snap.min_rtt_ns < u64::MAX
+            {
+                found_up = true;
+            }
+        }
+        !found_up
+    });
+
+    assert_ok!(found_up, "never observed ProbeBW_UP entry with measurable BDP in bbr_history()");
+    for snap in pair.tcp_a().bbr_history() {
+        if snap.phase == BbrPhase::ProbeBwUp
+            && snap.max_bw > 0
+            && snap.min_rtt_ns > 0
+            && snap.min_rtt_ns < u64::MAX
+        {
+            let bdp = (snap.max_bw * snap.min_rtt_ns / 1_000_000_000) as u32;
+            assert_ok!(bdp > 0, "BDP is 0 despite max_bw={} and min_rtt_ns={}", snap.max_bw, snap.min_rtt_ns);
+            // Spec §5.6.1: ProbeBW_UP cwnd_gain = 2.25.
+            // Impl: cwnd_target = 2.25*BDP + 4*MSS.
+            let expected = bdp * 225 / 100 + 4 * mss;
+            let lo = expected * 80 / 100;
+            let hi = expected * 120 / 100;
+            assert_ok!(
+                snap.cwnd >= lo && snap.cwnd <= hi,
+                "ProbeBW_UP cwnd ({}) not near 2.25*BDP+4*MSS ({expected}); \
+                 bdp={bdp}, mss={mss}, lo={lo}, hi={hi}",
+                snap.cwnd
+            );
+            return Ok(());
+        }
+    }
+    assert_ok!(false, "ProbeBwUp found during transfer but not in final history");
+    Ok(())
+}
