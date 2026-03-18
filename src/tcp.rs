@@ -353,8 +353,9 @@ struct TxSegment {
 // ── Out-of-order receive buffer ───────────────────────────────────────────────
 
 struct RxOooSegment {
-    seq:  SeqNum,
-    data: Vec<u8>,
+    seq:     SeqNum,
+    data:    Vec<u8>,
+    has_fin: bool,
 }
 
 // ── BBRv3 ─────────────────────────────────────────────────────────────────────
@@ -1686,6 +1687,7 @@ impl TcpSocket {
     // ── In-order OOO drain ───────────────────────────────────────────────────
 
     /// Flush any OOO segments that have become in-order and call on_recv.
+    /// If a drained segment carries a FIN, process the state transition.
     fn drain_ooo(&mut self, eth_src: MacAddr, eth_dst: MacAddr, ip_src: Ipv4Addr, ip_dst: Ipv4Addr) {
         loop {
             let pos = self.rx_ooo.iter().position(|s| s.seq == self.rcv_nxt);
@@ -1700,6 +1702,42 @@ impl TcpSocket {
                 dst: SocketAddrV4::new(ip_dst, self.src.port()),
                 pdu: &seg.data,
             });
+            if seg.has_fin {
+                self.process_rx_fin(eth_src, eth_dst, ip_src, ip_dst);
+                break; // FIN is last octet of stream — nothing follows it.
+            }
+        }
+    }
+
+    /// Process peer's FIN: advance rcv_nxt, ACK, notify, transition state.
+    fn process_rx_fin(&mut self, eth_src: MacAddr, eth_dst: MacAddr, ip_src: Ipv4Addr, ip_dst: Ipv4Addr) {
+        self.rcv_nxt += 1;
+        let _ = self.send_ctrl(TcpFlags::ACK);
+        let on_recv = self.on_recv;
+        on_recv(TcpPacket {
+            eth_src, eth_dst,
+            src: SocketAddrV4::new(ip_src, self.dst.port()),
+            dst: SocketAddrV4::new(ip_dst, self.src.port()),
+            pdu: &[],
+        });
+        match self.state {
+            State::Established => { self.state = State::CloseWait; }
+            State::FinWait1 => {
+                let fin_acked = seq_ge(self.snd_una, self.snd_nxt);
+                if fin_acked {
+                    let now = self.clock.monotonic_ns();
+                    self.rto_deadline.arm_from_now_ms(self.cfg.time_wait_ms, now);
+                    self.state = State::TimeWait;
+                } else {
+                    self.state = State::Closing;
+                }
+            }
+            State::FinWait2 => {
+                let now = self.clock.monotonic_ns();
+                self.rto_deadline.arm_from_now_ms(self.cfg.time_wait_ms, now);
+                self.state = State::TimeWait;
+            }
+            _ => {}
         }
     }
 
@@ -2011,40 +2049,32 @@ impl TcpSocket {
                 }
 
                 // Data / FIN
+                //
+                // FIN is treated as an OOO-bufferable event: if the FIN's
+                // position (seg.seq + pdu.len()) equals rcv_nxt it is
+                // processed immediately; otherwise the segment (data + fin
+                // flag) is buffered in the OOO queue and drain_ooo handles
+                // the state transition once rcv_nxt catches up.
+                let has_fin = seg.has_flag(TcpFlags::FIN);
 
-                if seg.has_flag(TcpFlags::FIN) {
-                    // Deliver any data with FIN
-                    if !pdu.is_empty() {
-                        let advance = pdu.len();
-                        if seg.seq == self.rcv_nxt {
-                            self.rcv_nxt += advance as u32;
-                            self.recv_buf.extend_from_slice(pdu);
-                            let on_recv = self.on_recv;
-                            let pdu_copy = &tcp_buf[payload_start..]; // borrow raw
-                            on_recv(TcpPacket {
-                                eth_src: eth.src, eth_dst: eth.dst,
-                                src: SocketAddrV4::new(ip.src, seg.src_port),
-                                dst: SocketAddrV4::new(ip.dst, seg.dst_port),
-                                pdu: pdu_copy,
-                            });
+                if pdu.is_empty() && !has_fin { return Ok(()); }
+
+                // FIN-only segment (no data).
+                if pdu.is_empty() && has_fin {
+                    let fin_pos = seg.seq;
+                    if fin_pos == self.rcv_nxt {
+                        self.process_rx_fin(eth.src, eth.dst, ip.src, ip.dst);
+                    } else if seq_gt(fin_pos, self.rcv_nxt) {
+                        // OOO FIN: buffer as zero-length entry.
+                        if self.rx_ooo.len() < self.cfg.rx_ooo_max {
+                            self.rx_ooo.push(RxOooSegment { seq: fin_pos, data: Vec::new(), has_fin: true });
                         }
+                        let _ = self.send_ctrl(TcpFlags::ACK);
+                    } else {
+                        let _ = self.send_ctrl(TcpFlags::ACK);
                     }
-                    // FIN consumes one sequence number
-                    self.rcv_nxt += 1;
-                    let _ = self.send_ctrl(TcpFlags::ACK);
-                    // Notify peer closed with empty pdu
-                    let on_recv = self.on_recv;
-                    on_recv(TcpPacket {
-                        eth_src: eth.src, eth_dst: eth.dst,
-                        src: SocketAddrV4::new(ip.src, seg.src_port),
-                        dst: SocketAddrV4::new(ip.dst, seg.dst_port),
-                        pdu: &[],
-                    });
-                    self.state = State::CloseWait;
                     return Ok(());
                 }
-
-                if pdu.is_empty() { return Ok(()); }
 
                 // RFC 793 §3.3: trim overlap when segment starts before rcv_nxt.
                 let (pdu, seg_seq) = if seq_lt(seg.seq, self.rcv_nxt) {
@@ -2063,6 +2093,10 @@ impl TcpSocket {
                     // In-order segment
                     self.rcv_nxt += pdu.len() as u32;
                     self.recv_buf.extend_from_slice(pdu);
+                    if has_fin {
+                        // FIN immediately after in-order data — process now.
+                        self.process_rx_fin(eth.src, eth.dst, ip.src, ip.dst);
+                    }
                     // Try to drain OOO queue
                     self.drain_ooo(eth.src, eth.dst, ip.src, ip.dst);
                     // Keep-alive: receiving data resets the idle timer
@@ -2117,12 +2151,13 @@ impl TcpSocket {
                                     s.data.extend_from_slice(&pdu[overlap..]);
                                 }
                             }
+                            s.has_fin |= has_fin;
                             merged = true;
                             break;
                         }
                     }
                     let inserted = if !merged && self.rx_ooo.len() < self.cfg.rx_ooo_max {
-                        self.rx_ooo.push(RxOooSegment { seq: seg_seq, data: pdu.to_vec() });
+                        self.rx_ooo.push(RxOooSegment { seq: seg_seq, data: pdu.to_vec(), has_fin });
                         true
                     } else { false };
                     if merged || inserted {
@@ -2145,6 +2180,7 @@ impl TcpSocket {
                                     let tail: Vec<u8> = self.rx_ooo[i + 1].data[overlap..].to_vec();
                                     self.rx_ooo[i].data.extend_from_slice(&tail);
                                 }
+                                self.rx_ooo[i].has_fin |= self.rx_ooo[i + 1].has_fin;
                                 self.rx_ooo.remove(i + 1);
                             } else {
                                 i += 1;
