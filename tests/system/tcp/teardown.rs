@@ -213,3 +213,70 @@ fn data_after_fin_ignored() -> TestResult {
 
     Ok(())
 }
+
+// ── fin_retransmit ─────────────────────────────────────────────────────────────
+//
+// RFC 9293 §3.8.1 (Retransmission): Drop the first FIN from A; verify RTO
+// fires a retransmit with same seq.
+#[test]
+fn fin_retransmit() -> TestResult {
+    use rawket::bridge::{Impairment, LinkProfile, PacketSpec};
+    use rawket::filter;
+
+    let mut pair = setup_tcp_pair()
+        .rto_min_ms(10).time_wait_ms(100)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Drop only the first FIN from A.
+    pair.add_impairment_to_b(Impairment::Drop(PacketSpec::nth_matching(1, filter::tcp::fin())));
+
+    pair.tcp_a_mut().close()?;
+
+    // Advance past the actual RTO (which may exceed rto_min on latency links
+    // due to SRTT from the handshake).  Use 200ms to cover any RTO value.
+    pair.advance_both(200);
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+
+    // Collect all AtoB FIN frames (including dropped).
+    let all_fins: Vec<_> = cap.all_tcp()
+        .filter(|f| f.dir == Dir::AtoB)
+        .filter(|f| f.tcp.flags.has(TcpFlags::FIN))
+        .map(|f| (f.was_dropped, f.ts_ns, f))
+        .collect();
+
+    let fin_orig = all_fins.iter().find(|(d, _, _)| *d)
+        .ok_or_else(|| TestFail::new("no dropped AtoB FIN (original)"))?;
+    let fin_retx = all_fins.iter().find(|(d, _, _)| !*d)
+        .ok_or_else(|| TestFail::new("no non-dropped AtoB FIN (retransmit)"))?;
+
+    assert_ok!(
+        fin_orig.2.tcp.seq == fin_retx.2.tcp.seq,
+        "FIN retransmit seq mismatch: original={} retransmit={}",
+        fin_orig.2.tcp.seq, fin_retx.2.tcp.seq,
+    );
+
+    // On a latency link, the RTO from handshake SRTT is ~80-100ms.
+    // Verify the gap is in a reasonable range (50-300ms).
+    let gap_ms = (fin_retx.1.saturating_sub(fin_orig.1)) / 1_000_000;
+    assert_ok!(
+        gap_ms >= 50 && gap_ms <= 300,
+        "FIN RTO gap {gap_ms}ms not in [50, 300] — expected ~RTO"
+    );
+
+    // Drive to clean closure.
+    pair.clear_impairments();
+    pair.transfer();
+    assert_state(pair.tcp_b(), State::CloseWait, "B CloseWait")?;
+    pair.tcp_b_mut().close()?;
+    pair.transfer_while(|p| {
+        p.tcp_a(0).state != State::TimeWait || p.tcp_b(0).state != State::Closed
+    });
+    assert_state(pair.tcp_b(), State::Closed, "B Closed")?;
+    pair.transfer();
+    assert_state(pair.tcp_a(), State::Closed, "A Closed")?;
+
+    Ok(())
+}
