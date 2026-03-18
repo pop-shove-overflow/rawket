@@ -401,3 +401,42 @@ fn drain_ooo_loop() -> TestResult {
 
     Ok(())
 }
+
+// ── ooo_outside_window ─────────────────────────────────────────────────────
+//
+// RFC 9293 §3.10.7.4: segment with seq beyond the receive window must be
+// dropped and not buffered in OOO.
+#[test]
+fn ooo_outside_window() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let (b_rcv_nxt, b_snd_nxt) = baseline_seqs(&mut pair)?;
+
+    let beyond = b_rcv_nxt + 2_000_000;
+    let seg = a_to_b(&pair, beyond, b_snd_nxt, b"X");
+    pair.inject_to_b(seg);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+
+    // B should ACK with current rcv_nxt (segment dropped, not buffered).
+    let ack = cap.tcp()
+        .direction(Dir::BtoA)
+        .with_tcp_flags(TcpFlags::ACK)
+        .map(|f| f.tcp.ack)
+        .max();
+    assert_ok!(
+        ack == Some(b_rcv_nxt),
+        "B should ACK with rcv_nxt={b_rcv_nxt}, got {:?}", ack
+    );
+
+    // Dropped segment must not appear in SACK blocks.
+    let has_sack = cap.tcp()
+        .direction(Dir::BtoA)
+        .any(|f| f.tcp.opts.sack_blocks.iter().any(|&(l, _)| l == beyond));
+    assert_ok!(!has_sack, "OOO segment beyond window should not appear in SACK blocks");
+
+    Ok(())
+}
