@@ -18,6 +18,9 @@ pub const HDR_LEN: usize = 20;
 /// RFC 6298 §2: clock granularity G used in RTO = SRTT + max(G, 4*RTTVAR).
 pub const CLOCK_GRANULARITY_NS: u64 = 1_000_000; // 1 ms
 
+/// RFC 8985 §7.4: worst-case delayed-ACK timer used in TLP PTO calculation.
+pub const WC_DEL_ACK_NS: u64 = 25_000_000; // 25 ms
+
 /// TCP control flags bitmask.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -897,7 +900,6 @@ impl TcpSocket {
     /// FlightSize == 1 → max(2*SRTT, 1.5*SRTT + WCDelAckT).
     /// FlightSize > 1  → 2*SRTT.
     fn tlp_deadline_ns(&self) -> u64 {
-        const WC_DEL_ACK_NS: u64 = 25_000_000; // 25 ms in ns, per RFC 8985 §7.4.1
         let two_srtt = 2 * self.srtt_ns;
         if self.unacked.len() <= 1 {
             two_srtt.max(3 * self.srtt_ns / 2 + WC_DEL_ACK_NS)
