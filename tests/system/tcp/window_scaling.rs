@@ -213,3 +213,49 @@ fn unscaled_window_when_peer_omits_ws() -> TestResult {
 
     Ok(())
 }
+
+// RFC 7323 §2.2: Window Scale option in a non-SYN segment must be ignored.
+#[test]
+fn window_scale_in_non_syn_ignored() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let snd_scale_before = pair.tcp_b().snd_scale();
+    let rcv_scale_before = pair.tcp_b().rcv_scale();
+
+    // Inject a data segment from A that carries a bogus WS=10 option.
+    let seq_a = pair.tcp_a().snd_nxt();
+    let ack_a = pair.tcp_a().rcv_nxt();
+    let pkt = build_tcp_data_with_ws(
+        pair.mac_a, pair.mac_b,
+        pair.ip_a,  pair.ip_b,
+        12345, 80,
+        seq_a, ack_a,
+        10, // bogus WS shift
+        b"hello",
+    );
+    pair.inject_to_b(pkt);
+    pair.transfer_one();
+
+    // B must accept the data (ACK it) but ignore the WS option.
+    let cap = pair.drain_captured();
+    let acked = cap.tcp().from_b().with_tcp_flags(TcpFlags::ACK).next().is_some();
+    assert_ok!(acked, "B did not ACK data segment with bogus WS option");
+
+    assert_ok!(
+        pair.tcp_b().snd_scale() == snd_scale_before,
+        "snd_scale changed from {snd_scale_before} to {} after non-SYN WS",
+        pair.tcp_b().snd_scale()
+    );
+    assert_ok!(
+        pair.tcp_b().rcv_scale() == rcv_scale_before,
+        "rcv_scale changed from {rcv_scale_before} to {} after non-SYN WS",
+        pair.tcp_b().rcv_scale()
+    );
+
+    assert_state(pair.tcp_b(), State::Established, "B still Established")?;
+
+    Ok(())
+}
