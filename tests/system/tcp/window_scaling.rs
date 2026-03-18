@@ -119,3 +119,97 @@ fn receive_window_advertisement() -> TestResult {
 
     Ok(())
 }
+
+// RFC 7323 §2.2 (WS Negotiation): When peer omits WS, snd_scale and
+// rcv_scale must be 0; SYN-ACK must not include WS option.
+#[test]
+fn unscaled_window_when_peer_omits_ws() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    let server = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {},
+        cfg,
+    )?;
+    np.add_tcp_b(server);
+
+    // Inject a SYN without WS option.
+    let syn = build_tcp_syn(
+        np.mac_a, np.mac_b,
+        np.ip_a, np.ip_b,
+        12345, 80,
+        1000, 0,
+        0x02,       // SYN
+        Some(1460), // MSS
+        None,       // no WS
+        None,       // no timestamps
+        false,      // no SACK
+    );
+    np.inject_to_b(syn);
+    np.transfer_one();
+
+    let cap = np.drain_captured();
+
+    // RFC 7323 §2.2: SYN-ACK must NOT include WS when peer omitted it.
+    let synack = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::SYN)
+        .with_tcp_flags(TcpFlags::ACK)
+        .next()
+        .ok_or_else(|| TestFail::new("no SYN-ACK captured"))?;
+    assert_ok!(
+        synack.tcp.opts.window_scale.is_none(),
+        "SYN-ACK included WS option ({:?}) when peer didn't offer WS",
+        synack.tcp.opts.window_scale
+    );
+
+    // Complete handshake.
+    let ack = build_tcp_data(
+        np.mac_a, np.mac_b,
+        np.ip_a, np.ip_b,
+        12345, 80,
+        1001,
+        synack.tcp.seq + 1,
+        b"",
+    );
+    np.inject_to_b(ack);
+    np.transfer_one();
+
+    // Verify B's snd_scale and rcv_scale are 0.
+    let sock_b = np.tcp_b(0);
+    assert_ok!(
+        sock_b.snd_scale() == 0,
+        "snd_scale = {} — should be 0 when peer omits WS", sock_b.snd_scale()
+    );
+    assert_ok!(
+        sock_b.rcv_scale() == 0,
+        "rcv_scale = {} — should be 0 when peer omits WS", sock_b.rcv_scale()
+    );
+
+    // Trigger B to send an ACK by injecting data.
+    np.clear_capture();
+    let data = build_tcp_data(
+        np.mac_a, np.mac_b,
+        np.ip_a, np.ip_b,
+        12345, 80,
+        1001,
+        synack.tcp.seq + 1,
+        b"hello",
+    );
+    np.inject_to_b(data);
+    np.transfer_one();
+
+    let cap = np.drain_captured();
+    let b_ack = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::ACK)
+        .without_tcp_flags(TcpFlags::SYN)
+        .next()
+        .ok_or_else(|| TestFail::new("no ACK from B after data"))?;
+
+    assert_ok!(b_ack.tcp.window_raw > 0, "raw window is 0 in unscaled ACK");
+
+    Ok(())
+}
