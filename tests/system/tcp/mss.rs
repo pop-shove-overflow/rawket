@@ -322,3 +322,56 @@ fn pmtud_no_increase() -> TestResult {
 
     Ok(())
 }
+
+// RFC 1191 §3: "A host MUST never reduce its estimate of the Path MTU below
+// 68 octets."  An ICMP with next-hop MTU=40 yields new_mss = 0 before
+// clamping.  The implementation clamps to MIN_MSS = 28 (68 - 20 IP - 20 TCP).
+// Verify peer_mss is reduced to 28 (not left at original, not set to 0).
+#[test]
+fn pmtud_floor() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let original_mss = pair.tcp_a().peer_mss();
+
+    pair.tcp_a_mut().send(&vec![0xabu8; 1460])?;
+    pair.transfer();
+
+    let orig_frame = pair.drain_captured().raw()
+        .find(|f| f.dir == Dir::AtoB && !f.was_dropped)
+        .map(|f| f.raw.clone())
+        .ok_or_else(|| crate::assert::TestFail::new("no AtoB data frame"))?;
+
+    // Inject ICMP Frag Needed with absurdly small MTU (40 = IP+TCP headers only).
+    // new_mss = 40 - 20 - 20 = 0 before clamping → clamped to 28.
+    let icmp = build_icmp_frag_needed(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        40,
+        &orig_frame,
+    );
+    pair.inject_to_a(icmp);
+    pair.transfer_one();
+
+    // RFC 1191 §3: PMTU clamped to 68 → MSS = 28.
+    assert_ok!(
+        pair.tcp_a().peer_mss() == 28,
+        "peer_mss should be 28 (min PMTU=68 - 40 headers), got {}",
+        pair.tcp_a().peer_mss()
+    );
+
+    // Verify A can still send data.
+    pair.clear_capture();
+    pair.tcp_a_mut().send(&vec![0xcdu8; 500])?;
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let sent = cap.tcp().filter(|f| f.dir == Dir::AtoB && f.payload_len > 0).count();
+    assert_ok!(sent > 0, "A sent no data segments after absurd PMTUD");
+
+    assert_state(pair.tcp_a(), State::Established, "A still Established after absurd PMTUD")?;
+
+    Ok(())
+}
