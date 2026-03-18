@@ -583,3 +583,84 @@ fn pmtud_multiple_reductions() -> TestResult {
 
     Ok(())
 }
+
+// Robustness test (not a specific RFC requirement): the implementation must
+// handle absurdly small peer MSS values without crashing or corrupting state.
+//
+// When peer SYN advertises an absurdly small MSS (e.g. 1), the implementation
+// must still function. With timestamps active, effective_mss = max(1 - 12, 0) = 0,
+// so no data segments can be sent — verify B stays Established and does not panic.
+// If the implementation clamps peer_mss to a minimum, verify the floor.
+#[test]
+fn mss_clamp_small_peer() -> TestResult {
+    let mut np = setup_network_pair();
+    let cfg = TcpConfig::default();
+
+    let server = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {}, cfg,
+    ).expect("accept");
+    let ib = np.add_tcp_b(server);
+
+    // Inject SYN with MSS=1 (absurdly small).
+    let isn_a = 0x3000_0000u32;
+    let syn = build_tcp_syn(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a, 0,
+        0x02,
+        Some(1),    // MSS = 1
+        None, None, false,
+    );
+    // Drop RSTs from A (no A-side socket).
+    np.add_impairment_to_b(Impairment::Drop(PacketSpec::matching(filter::tcp::rst())));
+
+    np.inject_to_b(syn);
+    np.transfer_one();
+
+    let syn_ack = np.drain_captured().tcp()
+        .find(|f| f.dir == Dir::BtoA && f.tcp.flags.has(TcpFlags::SYN) && f.tcp.flags.has(TcpFlags::ACK))
+        .ok_or_else(|| crate::assert::TestFail::new("no SYN-ACK from B"))?;
+
+    // Complete handshake.
+    let ack = build_tcp_data(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a + 1,
+        syn_ack.tcp.seq + 1,
+        &[],
+    );
+    np.inject_to_b(ack);
+    np.transfer_one();
+
+    assert_state(np.tcp_b(ib), State::Established, "B Established after MSS=1 handshake")?;
+
+    // B's peer_mss should be 1 (or a clamped floor if the impl enforces one).
+    // The key invariant: B must not crash or corrupt state.
+    let peer_mss = np.tcp_b(ib).peer_mss();
+    assert_ok!(peer_mss >= 1, "peer_mss is 0 after MSS=1 SYN");
+
+    // Try sending data from B. With TS not negotiated (peer SYN omitted TS),
+    // effective_mss = 1. B should segment into 1-byte chunks. The key invariant:
+    // no panic, no corruption, B remains Established.
+    np.clear_capture();
+    np.tcp_b_mut(ib).send(&vec![0xabu8; 10])?;
+    np.transfer_one();
+
+    assert_state(np.tcp_b(ib), State::Established, "B still Established after send with MSS=1")?;
+
+    // Verify B sent data segments capped at peer MSS.
+    let cap = np.drain_captured();
+    let sent = cap.tcp().filter(|f| f.dir == Dir::BtoA && f.payload_len > 0).count();
+    assert_ok!(sent > 0, "B sent no data segments with MSS=1");
+
+    let oversized = cap.tcp()
+        .filter(|f| f.dir == Dir::BtoA && f.payload_len > peer_mss as usize)
+        .count();
+    assert_ok!(oversized == 0, "B sent {oversized} segments > {peer_mss} bytes despite peer MSS=1");
+
+    Ok(())
+}
