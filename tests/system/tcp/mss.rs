@@ -375,3 +375,44 @@ fn pmtud_floor() -> TestResult {
 
     Ok(())
 }
+
+// RFC 9293 §3.7.1: the effective MSS must account for TCP option overhead
+// (e.g. 12 bytes for timestamps), not just the raw advertised MSS.
+#[test]
+fn effective_mss_accounts_for_ts_options() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut cfg = TcpConfig::default();
+    cfg.mss = 536;
+
+    let mut np = setup_network_pair().profile(LinkProfile::leased_line_100m());
+    let client = TcpSocket::connect_now(
+        np.iface_a(),
+        "10.0.0.1:12345".parse().unwrap(),
+        "10.0.0.2:80".parse().unwrap(),
+        Ipv4Addr::from([10, 0, 0, 2]),
+        |_| {}, |_| {}, cfg.clone(),
+    ).expect("connect_now");
+    let ia = np.add_tcp_a(client);
+
+    let server = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {}, cfg,
+    ).expect("accept");
+    np.add_tcp_b(server);
+
+    np.transfer();
+    np.clear_capture();
+
+    np.tcp_a_mut(ia).send(&vec![0xabu8; 2000])?;
+    np.transfer();
+
+    let cap = np.drain_captured();
+    let oversized = cap.tcp().filter(|f| f.dir == Dir::AtoB && f.payload_len > 524).count();
+    assert_ok!(oversized == 0, "A sent {oversized} segments > 524 bytes (peer_mss=536 minus 12 for TS)");
+
+    let sent = cap.tcp().filter(|f| f.dir == Dir::AtoB && f.payload_len > 0).count();
+    assert_ok!(sent > 0, "A sent no data segments");
+
+    Ok(())
+}
