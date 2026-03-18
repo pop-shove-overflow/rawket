@@ -877,6 +877,7 @@ impl DelayQueue {
         self.heap.iter().map(|f| f.deliver_at).max().map(|t| t.saturating_sub(self.offset_ns))
     }
 
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.heap.is_empty()
     }

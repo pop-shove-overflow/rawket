@@ -1584,7 +1584,12 @@ impl TcpSocket {
         let now = self.clock.monotonic_ns();
         loop {
             if self.state != State::Established && self.state != State::CloseWait { break; }
-            if self.send_buf.is_empty()         { break; }
+            if self.send_buf.is_empty() {
+                // Nothing to pace — disarm so next_deadline_abs_ns() doesn't
+                // report a stale pacing deadline that can never fire.
+                self.pacing_next.disarm();
+                break;
+            }
 
             // Pacing gate
             if self.pacing_next.is_armed() && !self.pacing_next.is_expired(now) { break; }

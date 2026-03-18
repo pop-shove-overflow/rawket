@@ -473,6 +473,17 @@ impl Network {
         [timer_abs, tcp_abs].into_iter().flatten().min()
     }
 
+    /// Absolute nanosecond timestamp of the earliest frame-level deadline
+    /// (pacing, RTO, TLP, keep-alive, persist), or `None` if no frame
+    /// deadlines are armed.  Excludes background timers (ARP expiry, etc.).
+    pub fn next_frame_deadline_ns(&self) -> Option<u64> {
+        self.interfaces
+            .iter()
+            .flat_map(|i| i.tcp_sockets.iter())
+            .filter_map(|s| s.next_deadline_abs_ns())
+            .min()
+    }
+
     /// Register a bridge-port delivery closure.
     ///
     /// Called by [`PortBuilder::finish`](crate::bridge::PortBuilder::finish)
