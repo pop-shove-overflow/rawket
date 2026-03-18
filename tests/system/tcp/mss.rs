@@ -486,3 +486,45 @@ fn icmp_soft_error_no_abort() -> TestResult {
 
     Ok(())
 }
+
+// RFC 6633 §1: ICMP Source Quench messages MUST be silently ignored and
+// must not affect congestion state.
+#[test]
+fn icmp_source_quench_ignored() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(&vec![0xabu8; 100])?;
+    pair.transfer();
+
+    let orig_frame = pair.drain_captured().raw()
+        .find(|f| f.dir == Dir::AtoB && !f.was_dropped)
+        .map(|f| f.raw.clone())
+        .ok_or_else(|| crate::assert::TestFail::new("no AtoB data frame"))?;
+
+    let cwnd_before = pair.tcp_a().bbr_cwnd();
+
+    let icmp = build_icmp_generic(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        4, 0,
+        [0, 0, 0, 0],
+        &orig_frame,
+    );
+    pair.inject_to_a(icmp);
+    pair.transfer_one();
+
+    assert_state(pair.tcp_a(), State::Established, "A must stay Established after ICMP Source Quench")?;
+
+    // RFC 6633: Source Quench MUST be ignored — cwnd must not change.
+    let cwnd_after = pair.tcp_a().bbr_cwnd();
+    assert_ok!(
+        cwnd_after == cwnd_before,
+        "cwnd changed after Source Quench: before={cwnd_before}, after={cwnd_after} — \
+         RFC 6633 requires Source Quench to be ignored"
+    );
+
+    Ok(())
+}
