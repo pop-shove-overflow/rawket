@@ -491,3 +491,96 @@ fn rtt_via_timestamps() -> TestResult {
 
     Ok(())
 }
+
+// RFC 7323 §4.3: ts_recent must only update when SEG.SEQ <= Last.ACK.sent.
+#[test]
+fn ts_recent_gating_ooo() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    let server = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {},
+        cfg,
+    )?;
+    np.add_tcp_b(server);
+
+    let isn_a = 0x5000_0000u32;
+    let ts_syn = 50u32;
+    let syn = build_tcp_syn(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a, 0,
+        0x02,
+        Some(1460), Some(4),
+        Some((ts_syn, 0)),
+        true,
+    );
+    np.inject_to_b(syn);
+    np.transfer_one();
+
+    let cap = np.drain_captured();
+    let syn_ack = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::SYN)
+        .with_tcp_flags(TcpFlags::ACK)
+        .next()
+        .ok_or_else(|| TestFail::new("no SYN-ACK"))?;
+    let b_isn = syn_ack.tcp.seq;
+    let b_tsval = syn_ack.tcp.opts.timestamps.map(|(v, _)| v).unwrap_or(0);
+
+    let ack = build_tcp_data_with_ts(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a + 1, b_isn + 1,
+        ts_syn + 10, b_tsval,
+        &[],
+    );
+    np.inject_to_b(ack);
+    np.transfer_one();
+
+    assert_state(np.tcp_b(0), State::Established, "B Established")?;
+
+    let ts_before = np.tcp_b(0).ts_recent();
+    assert_ok!(ts_before == ts_syn + 10,
+        "ts_recent after handshake should be {} but got {ts_before}", ts_syn + 10);
+
+    // Inject seg2 FIRST (OOO): seq = isn_a+2, TSval = 200.
+    let seg2 = build_tcp_data_with_ts(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a + 2, b_isn + 1,
+        200, b_tsval,
+        b"B",
+    );
+    np.inject_to_b(seg2);
+    np.transfer_one();
+
+    // ts_recent must remain at ts_before (seg2 was OOO, SEG.SEQ > Last.ACK.sent).
+    let ts_after_ooo = np.tcp_b(0).ts_recent();
+    assert_ok!(ts_after_ooo == ts_before,
+        "ts_recent changed from {ts_before} to {ts_after_ooo} after OOO segment — RFC 7323 §4.3 gating failed");
+
+    // Now inject seg1 (gap-filler): seq = isn_a+1, TSval = 100.
+    let seg1 = build_tcp_data_with_ts(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a + 1, b_isn + 1,
+        100, b_tsval,
+        b"A",
+    );
+    np.inject_to_b(seg1);
+    np.transfer_one();
+
+    // ts_recent should now be 100 (from the in-order seg1).
+    let ts_final = np.tcp_b(0).ts_recent();
+    assert_ok!(ts_final == 100, "ts_recent after gap-fill should be 100, got {ts_final}");
+
+    Ok(())
+}
