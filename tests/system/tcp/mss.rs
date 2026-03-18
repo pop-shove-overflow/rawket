@@ -8,7 +8,7 @@ use crate::{
     assert::{assert_mss_option, assert_state},
     capture::{Dir, ParsedFrameExt},
     harness::{setup_network_pair, setup_tcp_pair},
-    packet::{build_tcp_data, build_tcp_syn, build_icmp_frag_needed, build_icmp_generic},
+    packet::{build_tcp_data, build_tcp_syn, build_icmp_frag_needed},
 };
 
 // RFC 9293 §3.7.1: both SYN and SYN-ACK carry an MSS option; data segments
@@ -169,6 +169,50 @@ fn mss_option_absent() -> TestResult {
 
     let sent = cap.tcp().filter(|f| f.dir == Dir::BtoA && f.payload_len > 0).count();
     assert_ok!(sent > 0, "B sent no data segments");
+
+    Ok(())
+}
+
+// RFC 1191 §3: upon receiving ICMP Fragmentation Needed, the sender must
+// reduce its effective MSS to match the indicated next-hop MTU.
+#[test]
+fn pmtud_reduction() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let chunk = vec![0xabu8; 1460];
+    pair.tcp_a_mut().send(&chunk)?;
+    pair.transfer();
+
+    let orig_frame = pair.drain_captured().raw()
+        .find(|f| f.dir == Dir::AtoB && !f.was_dropped)
+        .map(|f| f.raw.clone())
+        .ok_or_else(|| crate::assert::TestFail::new("no AtoB data frame found"))?;
+
+    let icmp = build_icmp_frag_needed(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        576,
+        &orig_frame,
+    );
+    pair.inject_to_a(icmp);
+    pair.transfer_one();
+
+    let chunk2 = vec![0xcdu8; 2000];
+    pair.tcp_a_mut().send(&chunk2)?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    // MTU 576 → peer_mss 536; subtract 12 for timestamp option when active.
+    let ts_overhead = if pair.tcp_a().ts_enabled() { 12 } else { 0 };
+    let effective_mss = 536 - ts_overhead;
+    let oversized = cap.tcp().filter(|f| f.dir == Dir::AtoB && f.payload_len > effective_mss).count();
+    assert_ok!(oversized == 0, "A sent {oversized} segments > {effective_mss} bytes after PMTUD reduction to 576");
+
+    let sent = cap.tcp().filter(|f| f.dir == Dir::AtoB && f.payload_len > 0).count();
+    assert_ok!(sent > 0, "A sent no data segments after PMTUD update");
 
     Ok(())
 }
