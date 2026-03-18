@@ -8,7 +8,7 @@ use crate::{
     assert::{assert_mss_option, assert_state},
     capture::{Dir, ParsedFrameExt},
     harness::{setup_network_pair, setup_tcp_pair},
-    packet::{build_tcp_data, build_tcp_syn, build_icmp_frag_needed},
+    packet::{build_tcp_data, build_tcp_syn, build_icmp_frag_needed, build_icmp_generic},
 };
 
 // RFC 9293 §3.7.1: both SYN and SYN-ACK carry an MSS option; data segments
@@ -451,6 +451,38 @@ fn syn_ack_mss_not_reduced_by_options() -> TestResult {
         .ok_or_else(|| crate::assert::TestFail::new("no SYN-ACK from B"))?;
 
     assert_mss_option(&syn_ack, cfg.mss, "SYN-ACK MSS should be full configured MSS")?;
+
+    Ok(())
+}
+
+// RFC 1122 §4.2.3.9: ICMP Destination Unreachable (Host Unreachable) is a
+// soft error and must not abort an established TCP connection.
+#[test]
+fn icmp_soft_error_no_abort() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(&vec![0xabu8; 100])?;
+    pair.transfer();
+
+    let orig_frame = pair.drain_captured().raw()
+        .find(|f| f.dir == Dir::AtoB && !f.was_dropped)
+        .map(|f| f.raw.clone())
+        .ok_or_else(|| crate::assert::TestFail::new("no AtoB data frame"))?;
+
+    let icmp = build_icmp_generic(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        3, 1,
+        [0, 0, 0, 0],
+        &orig_frame,
+    );
+    pair.inject_to_a(icmp);
+    pair.transfer_one();
+
+    assert_state(pair.tcp_a(), State::Established, "A must stay Established after ICMP Host Unreachable")?;
 
     Ok(())
 }
