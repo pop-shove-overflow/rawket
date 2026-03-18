@@ -4,7 +4,7 @@ use crate::{
     assert_ok,
     capture::{Dir, ParsedFrameExt},
     harness::setup_tcp_pair,
-    packet::{build_tcp_data, build_tcp_rst, build_tcp_syn},
+    packet::{build_tcp_data, build_tcp_data_with_flags, build_tcp_rst, build_tcp_syn},
     TestResult,
 };
 
@@ -525,6 +525,79 @@ fn time_wait_2msl() -> TestResult {
         elapsed_ms == cfg.time_wait_ms as u64,
         "TimeWait lasted {elapsed_ms}ms, expected {}", cfg.time_wait_ms
     );
+
+    Ok(())
+}
+
+// ── duplicate_fin_resets_2msl ────────────────────────────────────────────────
+//
+// RFC 9293 §3.6.1: A duplicate FIN received during TIME_WAIT must restart
+// the 2MSL timer.  Drive to TimeWait, advance halfway through time_wait_ms,
+// inject a duplicate FIN, then verify the timer restarted (full time_wait_ms
+// required again).
+#[test]
+fn duplicate_fin_resets_2msl() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .time_wait_ms(100)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let tw_ms = pair.tcp_cfg.time_wait_ms as u64;
+
+    pair.tcp_a_mut().close()?;
+    pair.transfer();
+    pair.tcp_b_mut().close()?;
+    pair.transfer_while(|p| p.tcp_a(0).state != State::TimeWait);
+    assert_state(pair.tcp_a(), State::TimeWait, "A TimeWait")?;
+    let tw_start = pair.clock_a.monotonic_ns();
+
+    // Capture B's FIN seq for the duplicate.
+    let cap = pair.drain_captured();
+    let b_fin = cap.tcp()
+        .direction(Dir::BtoA)
+        .with_tcp_flags(TcpFlags::FIN)
+        .last()
+        .ok_or_else(|| TestFail::new("no BtoA FIN for duplicate"))?;
+    let fin_seq = b_fin.tcp.seq;
+    let fin_ack = b_fin.tcp.ack;
+
+    // Advance halfway through TIME_WAIT, then inject duplicate FIN.
+    pair.advance_both((tw_ms / 2) as i64);
+
+    let dup_fin = build_tcp_data_with_flags(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        fin_seq, fin_ack,
+        0x11, // FIN|ACK
+        65535,
+        b"",
+    );
+    pair.forward(dup_fin);
+
+    // transfer() runs to Closed — the duplicate FIN should have restarted
+    // the timer, so total elapsed > original time_wait_ms.
+    pair.transfer();
+    assert_state(pair.tcp_a(), State::Closed, "A Closed after restarted 2MSL")?;
+
+    let elapsed_ms = (pair.clock_a.monotonic_ns() - tw_start) / 1_000_000;
+    // Without restart: elapsed == tw_ms. With restart at halfway: elapsed ≈ tw_ms/2 + tw_ms.
+    // The timer was restarted at tw_ms/2, so total must be at least tw_ms/2 + tw_ms.
+    let expected_min = tw_ms + tw_ms / 2;
+    assert_ok!(
+        elapsed_ms >= expected_min,
+        "TimeWait lasted {elapsed_ms}ms, expected ≥{expected_min}ms \
+         (dup FIN at {tw}ms/2 should restart {tw}ms timer)", tw = tw_ms
+    );
+
+    // Verify A ACKed the duplicate FIN.
+    let cap2 = pair.drain_captured();
+    let a_ack = cap2.tcp()
+        .direction(Dir::AtoB)
+        .with_tcp_flags(TcpFlags::ACK)
+        .without_tcp_flags(TcpFlags::RST)
+        .count();
+    assert_ok!(a_ack > 0, "A did not ACK the duplicate FIN (RFC 9293 §3.6.1)");
 
     Ok(())
 }
