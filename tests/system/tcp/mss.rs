@@ -528,3 +528,58 @@ fn icmp_source_quench_ignored() -> TestResult {
 
     Ok(())
 }
+
+// RFC 1191 §3: successive ICMP Fragmentation Needed messages with decreasing
+// MTU must each reduce the path MTU monotonically.
+#[test]
+fn pmtud_multiple_reductions() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(&vec![0xabu8; 1460])?;
+    pair.transfer();
+
+    let orig_frame = pair.drain_captured().raw()
+        .find(|f| f.dir == Dir::AtoB && !f.was_dropped)
+        .map(|f| f.raw.clone())
+        .ok_or_else(|| crate::assert::TestFail::new("no AtoB data frame"))?;
+
+    let icmp1 = build_icmp_frag_needed(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        1000,
+        &orig_frame,
+    );
+    pair.inject_to_a(icmp1);
+    pair.transfer_one();
+
+    // peer_mss = MTU - IP(20) - TCP(20); effective payload further reduced by TS option.
+    let mss_after_first = pair.tcp_a().peer_mss();
+    assert_ok!(mss_after_first == 960, "MSS after MTU=1000 should be 960 (MTU-IP-TCP), got {mss_after_first}");
+
+    let icmp2 = build_icmp_frag_needed(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        576,
+        &orig_frame,
+    );
+    pair.inject_to_a(icmp2);
+    pair.transfer_one();
+
+    let mss_after_second = pair.tcp_a().peer_mss();
+    assert_ok!(mss_after_second == 536, "MSS after MTU=576 should be 536 (MTU-IP-TCP), got {mss_after_second}");
+    assert_ok!(mss_after_second <= mss_after_first, "MSS did not decrease monotonically");
+
+    pair.tcp_a_mut().send(&vec![0xcdu8; 2000])?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let ts_overhead = if pair.tcp_a().ts_enabled() { 12 } else { 0 };
+    let effective_mss = 536 - ts_overhead;
+    let oversized = cap.tcp().filter(|f| f.dir == Dir::AtoB && f.payload_len > effective_mss).count();
+    assert_ok!(oversized == 0, "A sent {oversized} segments > {effective_mss} bytes after dual PMTUD");
+
+    Ok(())
+}
