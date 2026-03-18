@@ -259,3 +259,41 @@ fn window_scale_in_non_syn_ignored() -> TestResult {
 
     Ok(())
 }
+
+// RFC 7323 §3.2: after timestamps are negotiated in the handshake, every
+// non-RST segment must carry the Timestamps option.
+#[test]
+fn timestamps_after_negotiation() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"from-A")?;
+    pair.transfer();
+
+    pair.tcp_b_mut().send(b"from-B")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+
+    // Every non-RST segment from B after the SYN-ACK must carry Timestamps.
+    let b_segments: Vec<_> = cap.tcp().from_b()
+        .without_tcp_flags(TcpFlags::SYN)
+        .without_tcp_flags(TcpFlags::RST)
+        .collect();
+
+    assert_ok!(!b_segments.is_empty(), "no non-SYN/non-RST segments from B");
+
+    for seg in &b_segments {
+        assert_ok!(
+            seg.tcp.opts.timestamps.is_some(),
+            "segment seq={} flags={:#04x} missing Timestamps option",
+            seg.tcp.seq, seg.tcp.flags.bits()
+        );
+        let (tsval, _tsecr) = seg.tcp.opts.timestamps.unwrap();
+        assert_ok!(tsval > 0, "TSval is 0 in segment seq={}", seg.tcp.seq);
+    }
+
+    Ok(())
+}
