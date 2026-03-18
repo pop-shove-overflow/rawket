@@ -1,5 +1,7 @@
+use core::net::Ipv4Addr;
 use rawket::{
     bridge::{Impairment, PacketSpec},
+    eth::MacAddr,
     tcp::{State, TcpFlags},
 };
 use crate::{
@@ -444,6 +446,70 @@ fn persist_window_update_ack() -> TestResult {
         "effective window ({effective_wnd} = {} << {rcv_scale}) < MSS ({mss})",
         window_ack.tcp.window_raw
     );
+
+    Ok(())
+}
+
+// ── persist_timer_caps_at_rto_max ───────────────────────────────────────────
+//
+// RFC 1122 §4.2.2.17: persist timer must cap at rto_max_ms.
+// Collect enough probes to verify gaps stop growing at rto_max_ms.
+#[test]
+fn persist_timer_caps_at_rto_max() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    setup_zero_window(&mut pair)?;
+
+    pair.tcp_a_mut().send(b"world")?;
+
+    let rto_max = pair.tcp_cfg.rto_max_ms;
+
+    // Advance well past the point where backoff has hit the cap.
+    // Doubling from ~200ms: 200, 400, 800, ..., 60000, 60000, ...
+    // ~9 doublings to reach 60s.  Use small steps to preserve timing fidelity.
+    //
+    // Only advance A's clock and drain A — never drain B so the zero-window
+    // ACK is never superseded by a real window update from B.  This avoids
+    // the ARP-cache-expiry problem that would occur if we used advance_both
+    // with a Drop impairment (ARP entries expire after 20 s, starving probes
+    // of a destination MAC).
+    let mut probe_times: Vec<u64> = Vec::new();
+    for i in 0..1200 {
+        pair.net.clock_a.advance_ms(500);
+        // Re-seed ARP every 15 s to prevent entry expiry (default TTL = 20 s).
+        if i % 30 == 0 {
+            let ip_b = Ipv4Addr::from(pair.ip_b);
+            let mac_b = MacAddr::from(pair.mac_b);
+            pair.iface_a_mut().seed_arp(ip_b, mac_b);
+        }
+        pair.transfer_one();
+        let cap = pair.drain_captured();
+        for f in cap.all_tcp().direction(Dir::AtoB).filter(|f| f.payload_len == 1) {
+            probe_times.push(f.ts_ns / 1_000_000);
+        }
+    }
+
+    assert_ok!(
+        probe_times.len() >= 10,
+        "expected ≥10 persist probes, got {} (state={:?})", probe_times.len(), pair.tcp_a().state
+    );
+
+    let gaps: Vec<u64> = probe_times.windows(2).map(|w| w[1] - w[0]).collect();
+
+    // After enough doublings, gaps must be capped at rto_max_ms (with 10% tolerance).
+    let cap_limit = rto_max + rto_max / 10;
+    for (i, &gap) in gaps.iter().enumerate() {
+        assert_ok!(
+            gap <= cap_limit,
+            "persist gap[{i}] = {gap} ms exceeds rto_max_ms ({rto_max}) + 10% — not capped"
+        );
+    }
+
+    // At least one gap must be near rto_max (within 20%) to confirm we reached the cap.
+    let near_cap = gaps.iter().any(|&g| g >= rto_max * 8 / 10);
+    assert_ok!(near_cap, "no gap near rto_max_ms ({rto_max}) — backoff may not have reached cap. gaps: {gaps:?}");
 
     Ok(())
 }
