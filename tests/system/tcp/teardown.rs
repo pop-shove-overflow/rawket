@@ -321,3 +321,62 @@ fn fin_piggybacked_on_data() -> TestResult {
 
     Ok(())
 }
+
+// ── half_close_data_delivery ───────────────────────────────────────────────────
+//
+// RFC 9293 §3.6 (Connection Close): Data received in FinWait1/FinWait2 must
+// be delivered (not dropped).  A initiates close, reaches FinWait2, THEN B
+// sends data — A must accept it.
+#[test]
+fn half_close_data_delivery() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().close()?;
+    pair.transfer();
+    assert_state(pair.tcp_a(), State::FinWait2, "A FinWait2 after B ACKs FIN")?;
+
+    // B sends data while A is in FinWait2.
+    pair.clear_capture();
+    pair.tcp_b_mut().send(b"halfclose")?;
+    let result = pair.transfer();
+
+    // RFC 9293 §3.6: data must be delivered to the application.
+    let delivered = result.a.get(&0).cloned().unwrap_or_default();
+    assert_ok!(
+        delivered == b"halfclose",
+        "data not delivered to A's application: got {:?}",
+        core::str::from_utf8(&delivered).unwrap_or("<non-utf8>")
+    );
+
+    let cap = pair.drain_captured();
+    let b_data: usize = cap.tcp()
+        .direction(Dir::BtoA)
+        .with_data()
+        .map(|f| f.payload_len)
+        .sum();
+    assert_ok!(b_data == 9, "expected 9 bytes from B in half-close, got {b_data}");
+
+    // A must ACK B's data even though A has sent its FIN.
+    let b_data_end = cap.tcp()
+        .direction(Dir::BtoA)
+        .with_data()
+        .map(|f| f.tcp.seq.wrapping_add(f.payload_len as u32))
+        .max()
+        .ok_or_else(|| TestFail::new("no B→A data frame for ACK check"))?;
+
+    let a_max_ack = cap.tcp()
+        .direction(Dir::AtoB)
+        .with_tcp_flags(TcpFlags::ACK)
+        .map(|f| f.tcp.ack)
+        .max()
+        .ok_or_else(|| TestFail::new("no ACK from A after B's data in FinWait2"))?;
+    assert_ok!(
+        a_max_ack == b_data_end,
+        "A's cumulative ACK ({a_max_ack}) != B's data end ({b_data_end})"
+    );
+
+    Ok(())
+}
