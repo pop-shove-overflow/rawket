@@ -15,6 +15,9 @@ use crate::{
 
 pub const HDR_LEN: usize = 20;
 
+/// RFC 6298 §2: clock granularity G used in RTO = SRTT + max(G, 4*RTTVAR).
+pub const CLOCK_GRANULARITY_NS: u64 = 1_000_000; // 1 ms
+
 /// TCP control flags bitmask.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -1530,9 +1533,8 @@ impl TcpSocket {
                 self.rttvar_ns = self.rttvar_ns - self.rttvar_ns / 4 + diff / 4;
                 self.srtt_ns   = self.srtt_ns   - self.srtt_ns   / 8 + rtt / 8;
             }
-            // RFC 6298 §2: RTO = SRTT + max(G, 4*RTTVAR) where G=1ms clock granularity.
-            // All in ns: G = 1_000_000 ns = 1 ms.
-            self.rto_ns = (self.srtt_ns + (4 * self.rttvar_ns).max(1_000_000))
+            // RFC 6298 §2: RTO = SRTT + max(G, 4*RTTVAR).
+            self.rto_ns = (self.srtt_ns + (4 * self.rttvar_ns).max(CLOCK_GRANULARITY_NS))
                 .max(self.cfg.rto_min_ms * 1_000_000)
                 .min(self.cfg.rto_max_ms * 1_000_000);
         }
