@@ -125,6 +125,64 @@ fn negotiation_one_omits() -> TestResult {
     Ok(())
 }
 
+// RFC 7323 §2.3: WS shift MUST be capped at 14.
+#[test]
+fn shift_capped_at_14() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    let server = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {},
+        cfg,
+    )?;
+    np.add_tcp_b(server);
+
+    let isn_a = 0x5000_0000u32;
+    let syn = build_tcp_syn(
+        np.mac_a, np.mac_b,
+        np.ip_a, np.ip_b,
+        12345, 80,
+        isn_a, 0,
+        0x02,       // SYN
+        Some(1460), // MSS
+        Some(15),   // WS=15 (exceeds max of 14)
+        None,       // no timestamps
+        false,      // no SACK
+    );
+    np.inject_to_b(syn);
+    np.transfer_one();
+
+    let cap = np.drain_captured();
+    let syn_ack = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::SYN)
+        .with_tcp_flags(TcpFlags::ACK)
+        .next()
+        .ok_or_else(|| TestFail::new("no SYN-ACK from B"))?;
+
+    let ack = build_tcp_data(
+        np.mac_a, np.mac_b,
+        np.ip_a, np.ip_b,
+        12345, 80,
+        isn_a + 1,
+        syn_ack.tcp.seq + 1,
+        &[],
+    );
+    np.inject_to_b(ack);
+    np.transfer_one();
+
+    assert_state(np.tcp_b(0), State::Established, "B Established after WS=15 SYN")?;
+    assert_ok!(
+        np.tcp_b(0).snd_scale() == 14,
+        "snd_scale={} — should be 14 (capped from peer's WS=15)", np.tcp_b(0).snd_scale()
+    );
+
+    Ok(())
+}
+
 // RFC 7323 §2.3 (Window Calculation): With WS=4, effective window is far
 // larger than 65535.  Send 65536 bytes to exercise scaled window.
 #[test]
