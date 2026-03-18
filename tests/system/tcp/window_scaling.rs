@@ -38,6 +38,93 @@ fn negotiation_both_sides() -> TestResult {
     Ok(())
 }
 
+// RFC 7323 §2.2 (WS Negotiation): When client SYN has no WS option, server
+// must still establish the connection with scale factors of 0.
+#[test]
+fn negotiation_one_omits() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    let server = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {},
+        cfg,
+    )?;
+    np.add_tcp_b(server);
+
+    let isn_a = 0x2000_0000u32;
+    let syn = build_tcp_syn(
+        np.mac_a, np.mac_b,
+        np.ip_a, np.ip_b,
+        12345, 80,
+        isn_a, 0,
+        0x02,       // SYN
+        Some(1460), // MSS
+        None,       // no WS
+        None,       // no timestamps
+        false,      // no SACK
+    );
+    np.inject_to_b(syn);
+    np.transfer_one();
+
+    let cap = np.drain_captured();
+    let syn_ack = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::SYN)
+        .with_tcp_flags(TcpFlags::ACK)
+        .next()
+        .ok_or_else(|| TestFail::new("no SYN-ACK from B"))?;
+
+    let ack = build_tcp_data(
+        np.mac_a, np.mac_b,
+        np.ip_a, np.ip_b,
+        12345, 80,
+        isn_a + 1,
+        syn_ack.tcp.seq + 1,
+        &[],
+    );
+    np.inject_to_b(ack);
+    np.transfer_one();
+
+    assert_ok!(
+        syn_ack.tcp.opts.window_scale.is_none(),
+        "SYN-ACK has WS option {:?} despite peer SYN omitting it",
+        syn_ack.tcp.opts.window_scale
+    );
+    assert_state(np.tcp_b(0), State::Established, "B state after handshake without peer WS")?;
+    assert_ok!(
+        np.tcp_b(0).snd_scale() == 0,
+        "snd_scale={} — should be 0 when peer omits WS", np.tcp_b(0).snd_scale()
+    );
+    assert_ok!(
+        np.tcp_b(0).rcv_scale() == 0,
+        "rcv_scale={} — should be 0 when peer omits WS", np.tcp_b(0).rcv_scale()
+    );
+
+    np.clear_capture();
+    let data = build_tcp_data(
+        np.mac_a, np.mac_b,
+        np.ip_a, np.ip_b,
+        12345, 80,
+        isn_a + 1,
+        syn_ack.tcp.seq + 1,
+        b"hello",
+    );
+    np.inject_to_b(data);
+    np.transfer_one();
+
+    let cap = np.drain_captured();
+    let acked = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::ACK)
+        .next()
+        .is_some();
+    assert_ok!(acked, "B did not ACK data after handshake without peer WS");
+
+    Ok(())
+}
+
 // RFC 7323 §2.3 (Window Calculation): With WS=4, effective window is far
 // larger than 65535.  Send 65536 bytes to exercise scaled window.
 #[test]
