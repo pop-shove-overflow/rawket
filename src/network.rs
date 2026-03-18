@@ -462,7 +462,7 @@ impl Network {
     ///
     /// Does **not** include bridge delivery deadlines — the bridge is a
     /// separate layer.  Callers that need the global next-event should
-    /// combine this with [`Bridge::next_deadline_ns`].
+    /// combine this with [`Bridge::next_remaining_ns`].
     pub fn next_event_ns(&self) -> Option<u64> {
         let timer_abs = self.timers.next_deadline_abs_ns();
         let tcp_abs: Option<u64> = self.interfaces
@@ -478,8 +478,8 @@ impl Network {
     /// Called by [`PortBuilder::finish`](crate::bridge::PortBuilder::finish)
     /// when a bridge port is attached to this network.  The closure is called
     /// at the start of every [`poll_rx_with_timeout`](Self::poll_rx_with_timeout)
-    /// to drain delayed frames whose deadline has arrived, and returns the
-    /// earliest remaining deadline so the poll timeout can be set accordingly.
+    /// to drain delayed frames that are ready, and returns the remaining
+    /// nanoseconds until the next pending frame for poll timeout calculation.
     pub fn add_bridge_deliver(&mut self, f: Rc<dyn Fn() -> Option<u64>>) {
         self.bridge_delivers.push(f);
     }
@@ -772,16 +772,12 @@ impl Network {
         &mut self,
         max_timeout_ms: Option<u64>,
     ) -> Result<()> {
-        // Drive bridge deliver closures first: drain any delayed frames whose
-        // deadline has arrived, and collect the next pending deadline (ns).
-        let bridge_ns: Option<u64> = {
-            let now_ns = self.timers.clock().monotonic_ns();
-            self.bridge_delivers
-                .iter()
-                .filter_map(|f| f())
-                .min()
-                .map(|deadline_ns| deadline_ns.saturating_sub(now_ns))
-        };
+        // Drive bridge deliver closures: drain any ready frames and collect
+        // the smallest remaining duration until the next pending frame.
+        let bridge_ns: Option<u64> = self.bridge_delivers
+            .iter()
+            .filter_map(|f| f())
+            .min();
 
         // First update: fire already-expired timers, get next deadline (ns).
         let timer_ns = self.timers.update();

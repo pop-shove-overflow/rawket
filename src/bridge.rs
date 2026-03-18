@@ -801,13 +801,15 @@ impl LinkProfile {
 // ── DelayQueue ────────────────────────────────────────────────────────────────
 
 struct DelayedFrame {
-    deliver_at_ns: u64,
-    data:          Vec<u8>,
+    /// Absolute offset at which this frame becomes ready.
+    /// Ready when `offset_ns >= deliver_at`.
+    deliver_at: u64,
+    data:       Vec<u8>,
 }
 
 impl PartialEq for DelayedFrame {
     fn eq(&self, other: &Self) -> bool {
-        self.deliver_at_ns == other.deliver_at_ns
+        self.deliver_at == other.deliver_at
     }
 }
 
@@ -822,37 +824,61 @@ impl PartialOrd for DelayedFrame {
 impl Ord for DelayedFrame {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         // Reverse so BinaryHeap (max-heap) acts as a min-heap.
-        other.deliver_at_ns.cmp(&self.deliver_at_ns)
+        other.deliver_at.cmp(&self.deliver_at)
     }
 }
 
+/// Duration-based delay queue.
+///
+/// Frames are enqueued with a remaining duration in nanoseconds.  Internally
+/// the queue tracks a monotonically increasing `offset_ns` — each frame's
+/// `deliver_at = offset_ns + remaining_ns` at enqueue time.  Calling
+/// [`advance`](Self::advance) increments the offset; frames whose
+/// `deliver_at <= offset_ns` are ready for delivery.
+///
+/// This design avoids per-element mutation on advance and preserves heap
+/// ordering because existing `deliver_at` values never change.
 struct DelayQueue {
-    heap: BinaryHeap<DelayedFrame>,
+    heap:      BinaryHeap<DelayedFrame>,
+    offset_ns: u64,
 }
 
 impl DelayQueue {
     fn new() -> Self {
-        DelayQueue { heap: BinaryHeap::new() }
+        DelayQueue { heap: BinaryHeap::new(), offset_ns: 0 }
     }
 
-    fn push(&mut self, deliver_at_ns: u64, data: Vec<u8>) {
-        self.heap.push(DelayedFrame { deliver_at_ns, data });
+    /// Enqueue a frame that becomes ready after `remaining_ns` nanoseconds.
+    fn push(&mut self, remaining_ns: u64, data: Vec<u8>) {
+        self.heap.push(DelayedFrame { deliver_at: self.offset_ns + remaining_ns, data });
     }
 
-    fn pop_ready(&mut self, now_ns: u64) -> Option<Vec<u8>> {
-        if self.heap.peek().is_some_and(|f| f.deliver_at_ns <= now_ns) {
+    /// Advance virtual time by `ns` nanoseconds.
+    fn advance(&mut self, ns: u64) {
+        self.offset_ns += ns;
+    }
+
+    /// Pop and return one ready frame, or `None`.
+    fn pop_ready(&mut self) -> Option<Vec<u8>> {
+        if self.heap.peek().is_some_and(|f| f.deliver_at <= self.offset_ns) {
             self.heap.pop().map(|f| f.data)
         } else {
             None
         }
     }
 
-    fn next_deadline(&self) -> Option<u64> {
-        self.heap.peek().map(|f| f.deliver_at_ns)
+    /// Remaining nanoseconds until the earliest pending frame, or `None`.
+    fn next_remaining_ns(&self) -> Option<u64> {
+        self.heap.peek().map(|f| f.deliver_at.saturating_sub(self.offset_ns))
     }
 
-    fn last_deadline(&self) -> Option<u64> {
-        self.heap.iter().map(|f| f.deliver_at_ns).max()
+    /// Remaining nanoseconds until the latest pending frame, or `None`.
+    fn last_remaining_ns(&self) -> Option<u64> {
+        self.heap.iter().map(|f| f.deliver_at).max().map(|t| t.saturating_sub(self.offset_ns))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.heap.is_empty()
     }
 }
 
@@ -1024,43 +1050,46 @@ impl CapturedFrame {
 // ── PortDirection ─────────────────────────────────────────────────────────────
 
 struct PortDirection {
-    profile:        DirectionProfile,
-    loss_state:     LossState,
-    impairments:    Vec<Impairment>,
-    delay_queue:    DelayQueue,
-    /// When the link finishes transmitting the previous frame (ns).
-    /// Used to model proper serialization: the next frame cannot begin
-    /// transmitting until the previous one completes.
-    last_depart_ns: u64,
+    profile:      DirectionProfile,
+    loss_state:   LossState,
+    impairments:  Vec<Impairment>,
+    delay_queue:  DelayQueue,
+    /// Duration (ns) until the link finishes transmitting the previous frame.
+    /// Decremented by [`advance`]; new frames queue behind this duration.
+    link_busy_ns: u64,
 }
 
 impl PortDirection {
     fn new(profile: DirectionProfile) -> Self {
         PortDirection {
             profile,
-            loss_state:  LossState::default(),
-            impairments: Vec::new(),
-            delay_queue: DelayQueue::new(),
-            last_depart_ns: 0,
+            loss_state:   LossState::default(),
+            impairments:  Vec::new(),
+            delay_queue:  DelayQueue::new(),
+            link_busy_ns: 0,
         }
     }
 
-    /// Compute the delivery deadline for a frame of `len` bytes entering
-    /// this direction at `sender_now_ns`.  Models proper link serialization:
-    /// consecutive frames queue behind each other on the wire.
-    fn schedule(&mut self, sender_now_ns: u64, len: usize) -> u64 {
+    /// Compute the remaining duration (ns) until a frame of `len` bytes
+    /// would be delivered, accounting for serialization queueing behind
+    /// previous frames.
+    fn schedule(&mut self, len: usize) -> u64 {
         let serial_ns = if self.profile.bandwidth_bps > 0 {
             (len as u64 * 8 * 1_000_000_000) / self.profile.bandwidth_bps
         } else {
             0
         };
         let jitter_ns = self.profile.sample_jitter_ns();
-        // Frame begins transmitting after both: (a) sender is ready, and
-        // (b) the link is free from the previous frame.
-        let tx_start = sender_now_ns.max(self.last_depart_ns);
-        let depart = tx_start + serial_ns;
-        self.last_depart_ns = depart;
-        depart + self.profile.latency_ns + jitter_ns
+        // Frame begins transmitting after the link is free.
+        let depart_remaining = self.link_busy_ns + serial_ns;
+        self.link_busy_ns = depart_remaining;
+        depart_remaining + self.profile.latency_ns + jitter_ns
+    }
+
+    /// Advance virtual time by `ns` nanoseconds.
+    fn advance(&mut self, ns: u64) {
+        self.link_busy_ns = self.link_busy_ns.saturating_sub(ns);
+        self.delay_queue.advance(ns);
     }
 
     /// Apply impairments and profile loss to a frame.  Returns `Some((data, duplicates))`
@@ -1097,10 +1126,10 @@ impl PortDirection {
         Some((data, duplicates))
     }
 
-    /// Drain all delay-queue frames whose deadline has passed.
-    fn drain_ready(&mut self, now: u64) -> Vec<Vec<u8>> {
+    /// Drain all delay-queue frames whose remaining duration has elapsed.
+    fn drain_ready(&mut self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
-        while let Some(frame) = self.delay_queue.pop_ready(now) {
+        while let Some(frame) = self.delay_queue.pop_ready() {
             out.push(frame);
         }
         out
@@ -1186,11 +1215,11 @@ impl Bridge {
             inner.captured.push(CapturedFrame { ingress: port, egress: None, data: frame.to_vec(), ts_ns: 0 });
             return;
         };
-        // Deliver immediately (deliver_at = 0 ≤ any clock value).
+        // Deliver immediately (no delay).
         for dup in dups {
-            forward_frame(&mut inner, port, dup, 0);
+            forward_frame(&mut inner, port, dup, 0, false);
         }
-        forward_frame(&mut inner, port, data, 0);
+        forward_frame(&mut inner, port, data, 0, false);
     }
 
     /// Drain and return all captured frames.
@@ -1198,40 +1227,68 @@ impl Bridge {
         core::mem::take(&mut self.inner.borrow_mut().captured)
     }
 
-    /// Flush all pending delayed frames regardless of their deadline.
+    /// Flush all pending delayed frames regardless of their remaining duration.
     ///
-    /// Drains every port's egress delay queue and delivers to the egress
-    /// [`FrameQueue`].  Useful in tests that want to force-deliver all
-    /// in-flight frames without advancing time.
+    /// Advances each port's egress delay queue to `u64::MAX` and delivers to
+    /// the egress [`FrameQueue`].  Useful in tests that want to force-deliver
+    /// all in-flight frames without advancing time.
     pub fn flush(&self) {
         let mut inner = self.inner.borrow_mut();
         let n_ports = inner.ports.len();
         for egress_idx in 0..n_ports {
-            let delayed: Vec<Vec<u8>> = inner.ports[egress_idx].profile_eg.drain_ready(u64::MAX);
+            // Advance far enough to make everything ready.
+            inner.ports[egress_idx].profile_eg.delay_queue.advance(u64::MAX / 2);
+            let delayed: Vec<Vec<u8>> = inner.ports[egress_idx].profile_eg.drain_ready();
             for eg_data in delayed {
                 inner.ports[egress_idx].egress.push(&eg_data);
             }
         }
     }
 
-    /// Return the earliest pending egress delivery deadline across all ports,
-    /// in nanoseconds (sender's monotonic clock domain).
-    pub fn next_deadline_ns(&self) -> Option<u64> {
-        let inner = self.inner.borrow();
-        inner.ports.iter().filter_map(|p| p.profile_eg.delay_queue.next_deadline()).min()
+    /// Advance all port delay queues and link-busy counters by `ns` nanoseconds.
+    ///
+    /// After advancing, any frames whose remaining duration has elapsed can be
+    /// delivered by calling [`deliver`](Self::deliver).
+    pub fn advance(&self, ns: u64) {
+        let mut inner = self.inner.borrow_mut();
+        for port in &mut inner.ports {
+            port.profile_eg.advance(ns);
+        }
     }
 
-    /// Return the latest pending egress delivery deadline across all ports,
-    /// in nanoseconds (sender's monotonic clock domain).  Useful for advancing
-    /// test clocks far enough to drain an entire batch of serialized frames.
-    pub fn last_deadline_ns(&self) -> Option<u64> {
+    /// Deliver all ready frames (whose remaining duration has elapsed) to their
+    /// egress [`FrameQueue`]s.  Returns the remaining nanoseconds until the
+    /// next pending frame, or `None` if all queues are empty.
+    pub fn deliver(&self) -> Option<u64> {
+        let mut inner = self.inner.borrow_mut();
+        let n_ports = inner.ports.len();
+        for idx in 0..n_ports {
+            let ready = inner.ports[idx].profile_eg.drain_ready();
+            for data in ready {
+                inner.ports[idx].egress.push(&data);
+            }
+        }
+        inner.ports.iter()
+            .filter_map(|p| p.profile_eg.delay_queue.next_remaining_ns())
+            .min()
+    }
+
+    /// Remaining nanoseconds until the earliest pending egress frame, or `None`.
+    pub fn next_remaining_ns(&self) -> Option<u64> {
         let inner = self.inner.borrow();
-        inner.ports.iter().filter_map(|p| p.profile_eg.delay_queue.last_deadline()).max()
+        inner.ports.iter().filter_map(|p| p.profile_eg.delay_queue.next_remaining_ns()).min()
+    }
+
+    /// Remaining nanoseconds until the latest pending egress frame, or `None`.
+    /// Useful for knowing how far to advance to drain an entire batch.
+    pub fn last_remaining_ns(&self) -> Option<u64> {
+        let inner = self.inner.borrow();
+        inner.ports.iter().filter_map(|p| p.profile_eg.delay_queue.last_remaining_ns()).max()
     }
 
     /// Return `true` if all delay queues are empty.
     pub fn is_idle(&self) -> bool {
-        self.next_deadline_ns().is_none()
+        self.next_remaining_ns().is_none()
     }
 
     /// Add an impairment to a port's ingress or egress pipeline.
@@ -1319,11 +1376,11 @@ impl Bridge {
 /// Apply MAC learning, determine egress ports, apply egress impairments, and
 /// deliver `data` (coming from `ingress_idx`) to the correct egress FrameQueues.
 ///
-/// `sender_now_ns` is the sender's clock reading (nanoseconds) at TX time;
-/// frames that have a non-zero egress delay are pushed into the egress delay
-/// queue stamped at `sender_now_ns + delay_ns`.  Pass `0` for immediate
-/// delivery (inject paths).
-fn forward_frame(inner: &mut BridgeInner, ingress_idx: usize, data: Vec<u8>, sender_now_ns: u64) {
+/// `capture_ts_ns` is the sender's clock reading at TX time, stored in
+/// [`CapturedFrame::ts_ns`] for test inspection.  Pass `0` for inject paths.
+/// `use_delay` controls whether frames go through the delay queue (`true`) or
+/// are delivered immediately (`false`).
+fn forward_frame(inner: &mut BridgeInner, ingress_idx: usize, data: Vec<u8>, capture_ts_ns: u64, use_delay: bool) {
     let n_ports = inner.ports.len();
 
     // Learn src MAC → ingress port.
@@ -1351,40 +1408,40 @@ fn forward_frame(inner: &mut BridgeInner, ingress_idx: usize, data: Vec<u8>, sen
     };
 
     if egress_ports.is_empty() {
-        inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: None, data, ts_ns: sender_now_ns });
+        inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: None, data, ts_ns: capture_ts_ns });
         return;
     }
 
     for &egress_idx in &egress_ports {
         // Apply egress impairments.
         let Some((eg_data, dups)) = inner.ports[egress_idx].profile_eg.process(&data) else {
-            inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: None, data: data.clone(), ts_ns: sender_now_ns });
+            inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: None, data: data.clone(), ts_ns: capture_ts_ns });
             continue;
         };
 
-        inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: Some(egress_idx), data: eg_data.clone(), ts_ns: sender_now_ns });
+        inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: Some(egress_idx), data: eg_data.clone(), ts_ns: capture_ts_ns });
 
         let has_delay = inner.ports[egress_idx].profile_eg.profile.latency_ns > 0
             || inner.ports[egress_idx].profile_eg.profile.bandwidth_bps > 0;
 
         // Deliver duplicates with the same schedule as an additional frame.
         for dup in dups {
-            inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: Some(egress_idx), data: dup.clone(), ts_ns: sender_now_ns });
-            if !has_delay || sender_now_ns == 0 {
+            inner.captured.push(CapturedFrame { ingress: ingress_idx, egress: Some(egress_idx), data: dup.clone(), ts_ns: capture_ts_ns });
+            if !has_delay || !use_delay {
                 inner.ports[egress_idx].egress.push(&dup);
             } else {
-                let deadline = inner.ports[egress_idx].profile_eg.schedule(sender_now_ns, dup.len());
-                inner.ports[egress_idx].profile_eg.delay_queue.push(deadline, dup);
+                let remaining = inner.ports[egress_idx].profile_eg.schedule(dup.len());
+                inner.ports[egress_idx].profile_eg.delay_queue.push(remaining, dup);
             }
         }
 
-        if !has_delay || sender_now_ns == 0 {
+        if !has_delay || !use_delay {
             // Deliver immediately (instant link or inject path).
             inner.ports[egress_idx].egress.push(&eg_data);
         } else {
             // Schedule with proper serialization delay.
-            let deadline = inner.ports[egress_idx].profile_eg.schedule(sender_now_ns, eg_data.len());
-            inner.ports[egress_idx].profile_eg.delay_queue.push(deadline, eg_data);
+            let remaining = inner.ports[egress_idx].profile_eg.schedule(eg_data.len());
+            inner.ports[egress_idx].profile_eg.delay_queue.push(remaining, eg_data);
         }
     }
 }
@@ -1461,35 +1518,33 @@ impl<'a, 'b> PortBuilder<'a, 'b> {
         };
 
         // Eager TX closure: apply ingress impairments, learn src MAC, forward
-        // to egress port(s) — delay-stamped with sender's clock.
+        // to egress port(s).  Sender clock is read only for capture timestamps.
         let tx_inner = Rc::clone(&bridge_inner);
         iface.set_tx(Rc::new(move |frame: &[u8]| -> crate::Result<()> {
             let mut inner = tx_inner.borrow_mut();
-            let now_ns = sender_clock.monotonic_ns();
+            let ts_ns = sender_clock.monotonic_ns();
             let Some((data, dups)) = inner.ports[port_idx].profile_in.process(frame) else {
-                inner.captured.push(CapturedFrame { ingress: port_idx, egress: None, data: frame.to_vec(), ts_ns: now_ns });
+                inner.captured.push(CapturedFrame { ingress: port_idx, egress: None, data: frame.to_vec(), ts_ns });
                 return Ok(());
             };
             for dup in dups {
-                forward_frame(&mut inner, port_idx, dup, now_ns);
+                forward_frame(&mut inner, port_idx, dup, ts_ns, true);
             }
-            forward_frame(&mut inner, port_idx, data, now_ns);
+            forward_frame(&mut inner, port_idx, data, ts_ns, true);
             Ok(())
         }));
 
         // Register a deliver closure on the receiver Network.  It drains this
-        // port's egress delay queue using the receiver's clock and returns the
-        // next pending deadline for poll timeout calculation.
+        // port's egress delay queue (frames made ready by prior `advance` calls)
+        // and returns the remaining ns until the next pending frame.
         let deliver_inner = Rc::clone(&bridge_inner);
-        let receiver_clock = net.clock_ref();
         net.add_bridge_deliver(Rc::new(move || {
-            let now_ns = receiver_clock.monotonic_ns();
             let mut inner = deliver_inner.borrow_mut();
-            let delayed: Vec<Vec<u8>> = inner.ports[port_idx].profile_eg.drain_ready(now_ns);
+            let delayed: Vec<Vec<u8>> = inner.ports[port_idx].profile_eg.drain_ready();
             for eg_data in delayed {
                 inner.ports[port_idx].egress.push(&eg_data);
             }
-            inner.ports[port_idx].profile_eg.delay_queue.next_deadline()
+            inner.ports[port_idx].profile_eg.delay_queue.next_remaining_ns()
         }));
 
         port_idx
@@ -1688,13 +1743,35 @@ mod tests {
     #[test]
     fn delay_queue_min_heap() {
         let mut dq = DelayQueue::new();
+        dq.push(100, vec![1]);  // ready at offset 100
+        dq.push(50,  vec![2]);  // ready at offset 50
+        dq.push(200, vec![3]);  // ready at offset 200
+        // Advance past all deadlines.
+        dq.advance(200);
+        assert_eq!(dq.pop_ready().unwrap(), vec![2]);
+        assert_eq!(dq.pop_ready().unwrap(), vec![1]);
+        assert_eq!(dq.pop_ready().unwrap(), vec![3]);
+        assert!(dq.pop_ready().is_none());
+    }
+
+    #[test]
+    fn delay_queue_advance_incremental() {
+        let mut dq = DelayQueue::new();
         dq.push(100, vec![1]);
-        dq.push(50,  vec![2]);
-        dq.push(200, vec![3]);
-        assert_eq!(dq.pop_ready(200).unwrap(), vec![2]);
-        assert_eq!(dq.pop_ready(200).unwrap(), vec![1]);
-        assert_eq!(dq.pop_ready(200).unwrap(), vec![3]);
-        assert!(dq.pop_ready(200).is_none());
+        dq.push(200, vec![2]);
+        // Nothing ready yet.
+        assert!(dq.pop_ready().is_none());
+        assert_eq!(dq.next_remaining_ns(), Some(100));
+        // Advance 100 — first frame ready.
+        dq.advance(100);
+        assert_eq!(dq.pop_ready().unwrap(), vec![1]);
+        assert!(dq.pop_ready().is_none());
+        assert_eq!(dq.next_remaining_ns(), Some(100));
+        // Advance another 100 — second frame ready.
+        dq.advance(100);
+        assert_eq!(dq.pop_ready().unwrap(), vec![2]);
+        assert!(dq.pop_ready().is_none());
+        assert!(dq.is_empty());
     }
 
     #[test]
