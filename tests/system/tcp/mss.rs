@@ -216,3 +216,62 @@ fn pmtud_reduction() -> TestResult {
 
     Ok(())
 }
+
+// RFC 1191 §3: ICMP Fragmentation Needed must be matched to the correct
+// flow; messages with non-matching ports must be ignored.
+#[test]
+fn pmtud_wrong_flow_ignored() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(&vec![0xabu8; 1460])?;
+    pair.transfer();
+
+    let mss_before = pair.tcp_a().peer_mss();
+
+    let wrong_ports = build_tcp_data(
+        pair.mac_a, pair.mac_b,
+        pair.ip_a,  pair.ip_b,
+        99, 99,
+        0, 0,
+        &[0u8; 100],
+    );
+
+    let icmp = build_icmp_frag_needed(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        576,
+        &wrong_ports,
+    );
+    pair.inject_to_a(icmp);
+    pair.transfer_one();
+
+    // MSS must be unchanged — wrong-flow ICMP is a complete no-op.
+    let mss_after = pair.tcp_a().peer_mss();
+    assert_ok!(
+        mss_after == mss_before,
+        "MSS changed after wrong-flow ICMP: before={mss_before}, after={mss_after}"
+    );
+
+    // Verify subsequent data uses the original MSS.
+    pair.clear_capture();
+    pair.tcp_a_mut().send(&vec![0xcdu8; 2000])?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let max_payload = cap.tcp()
+        .filter(|f| f.dir == Dir::AtoB && f.payload_len > 0)
+        .map(|f| f.payload_len)
+        .max()
+        .unwrap_or(0);
+    // Max payload = MSS minus TCP timestamp option (12 bytes).
+    assert_ok!(
+        max_payload == mss_before as usize - 12,
+        "post-ICMP max payload ({max_payload}) != original MSS - TS option ({} - 12 = {})",
+        mss_before, mss_before - 12
+    );
+
+    Ok(())
+}
