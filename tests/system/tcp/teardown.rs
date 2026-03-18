@@ -4,7 +4,7 @@ use crate::{
     assert_ok,
     capture::{Dir, ParsedFrameExt},
     harness::setup_tcp_pair,
-    packet::{build_tcp_data, build_tcp_data_with_flags, build_tcp_rst, build_tcp_syn},
+    packet::{build_tcp_data, build_tcp_rst},
     TestResult,
 };
 
@@ -377,6 +377,59 @@ fn half_close_data_delivery() -> TestResult {
         a_max_ack == b_data_end,
         "A's cumulative ACK ({a_max_ack}) != B's data end ({b_data_end})"
     );
+
+    Ok(())
+}
+
+// ── rst_during_time_wait_ignored ───────────────────────────────────────────────
+//
+// Implementation choice per RFC 1337 (Informational): RST during TIME-WAIT
+// is ignored.  Base RFC 9293 §3.10.7.4 says RST in TIME-WAIT causes CLOSED,
+// but RFC 5961 §3.2 requires exact SEQ match which provides equivalent
+// protection against spurious RSTs.
+#[test]
+fn rst_during_time_wait_ignored() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().close()?;
+    pair.transfer();
+    pair.tcp_b_mut().close()?;
+    pair.transfer_while(|p| {
+        p.tcp_a(0).state != State::TimeWait || p.tcp_b(0).state != State::Closed
+    });
+    assert_state(pair.tcp_a(), State::TimeWait, "A TimeWait")?;
+
+    let cap = pair.drain_captured();
+    let b_fin = cap.tcp()
+        .direction(Dir::BtoA)
+        .with_tcp_flags(TcpFlags::FIN)
+        .last()
+        .ok_or_else(|| TestFail::new("no BtoA FIN"))?;
+    let rst_seq = b_fin.tcp.seq + 1;
+
+    let rst = build_tcp_rst(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        rst_seq,
+    );
+    pair.clear_capture();
+    pair.forward(rst);
+    pair.transfer_one();
+
+    // A must still be in TimeWait immediately after RST — RST was ignored.
+    assert_state(pair.tcp_a(), State::TimeWait, "A still TimeWait after RST inject")?;
+
+    // Let the TimeWait timer expire.
+    pair.transfer_while(|p| p.tcp_a(0).state == State::TimeWait);
+
+    // Verify A sent nothing in response to the RST.
+    let cap = pair.drain_captured();
+    let a_sent = cap.tcp().direction(Dir::AtoB).count();
+    assert_ok!(a_sent == 0, "A sent {a_sent} frame(s) in response to RST in TimeWait — expected 0");
 
     Ok(())
 }
