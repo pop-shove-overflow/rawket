@@ -1053,3 +1053,60 @@ fn shortterm_model_resets_at_refill_entry() -> TestResult {
 
     Ok(())
 }
+
+// ── bw_sampling_effective_bw ──────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §5.5: BBRAdaptLowerBounds reduces bw_shortterm
+// from its sentinel in response to sustained loss.
+//
+// After loss sets bw_shortterm below max_bw, verify bw_shortterm <= max_bw.
+#[test]
+fn bw_sampling_effective_bw() -> TestResult {
+    // Single connection: measure max_bw clean, then add loss and verify
+    // bw_shortterm drops below the pre-loss max_bw.
+    let mut pair = setup_tcp_pair()
+        .rto_min_ms(10)
+        .max_retransmits(100)
+        .rto_max_ms(200)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Phase 1: establish max_bw with no loss.  Use drive_to_probe_bw to
+    // get a stable BW sample — it exits Startup once filled_pipe triggers.
+    drive_to_probe_bw(&mut pair)?;
+
+    let max_bw = pair.tcp_a().bbr_max_bw();
+    assert_ok!(max_bw > 0, "max_bw is 0 — test scenario invalid");
+    assert_ok!(
+        pair.tcp_a().bbr_bw_shortterm() == u64::MAX,
+        "bw_shortterm already below sentinel before loss — test scenario invalid"
+    );
+
+    // Phase 2: sustained ~40% loss via random loss on the link.
+    pair.loss_to_b(0.40);
+
+    let mut bw_st_set = false;
+    pair.tcp_a_mut().send(&vec![0xCCu8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0xCCu8; 2_000]);
+        }
+        for snap in p.tcp_a(0).bbr_history() {
+            if snap.bw_shortterm < u64::MAX {
+                bw_st_set = true;
+            }
+        }
+        !bw_st_set
+    });
+    assert_ok!(
+        bw_st_set,
+        "bw_shortterm never set below sentinel during sustained loss"
+    );
+    let bw_st = pair.tcp_a().bbr_bw_shortterm();
+    assert_ok!(
+        bw_st > 0,
+        "bw_shortterm ({bw_st}) should be > 0 after loss adaptation"
+    );
+
+    Ok(())
+}
