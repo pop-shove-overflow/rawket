@@ -448,3 +448,46 @@ fn rst_bypasses_paws() -> TestResult {
 
     Ok(())
 }
+
+// RFC 7323 §4.1 (RTT Measurement): After data/ACK exchange with TS,
+// srtt_ms() should be reasonable.
+#[test]
+fn rtt_via_timestamps() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"rtt-test")?;
+    pair.transfer_while(|p| p.tcp_a(0).snd_una() != p.tcp_a(0).snd_nxt());
+
+    // Verify data frames carry timestamp options.
+    let cap = pair.drain_captured();
+    let ts_present = cap.tcp().from_a().with_data().all(|f| f.tcp.opts.timestamps.is_some());
+    assert_ok!(ts_present, "data frames from A lack timestamp options");
+
+    // Verify B's ACK echoes A's TSval (TSecr == A's TSval from the data frame).
+    let a_tsval = cap.tcp().from_a().with_data()
+        .find_map(|f| f.tcp.opts.timestamps.map(|(v, _)| v));
+    let b_tsecr = cap.tcp().from_b()
+        .find_map(|f| f.tcp.opts.timestamps.map(|(_, e)| e));
+    assert_ok!(a_tsval.is_some(), "A's data has no TSval");
+    assert_ok!(b_tsecr.is_some(), "B's ACK has no TSecr");
+    assert_ok!(
+        b_tsecr == a_tsval,
+        "B's TSecr ({:?}) != A's TSval ({:?}) — timestamp echo broken",
+        b_tsecr, a_tsval
+    );
+
+    // SRTT should reflect the link RTT (~20ms for leased_line_100m).
+    // This proves RTT was computed from the echoed timestamp, not just
+    // from ACK arrival timing (which would be the same on a virtual link).
+    let srtt = pair.tcp_a().srtt_ms();
+    assert_ok!(srtt > 0, "srtt_ms() is 0 after data exchange");
+    assert_ok!(
+        srtt >= 15 && srtt <= 40,
+        "srtt_ms() = {srtt} — expected ~20ms for leased_line_100m"
+    );
+
+    Ok(())
+}
