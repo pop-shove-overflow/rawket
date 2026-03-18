@@ -1397,3 +1397,49 @@ fn syn_does_not_contaminate_max_bw() -> TestResult {
 
     Ok(())
 }
+
+// draft-ietf-ccwg-bbr-04 §5.3.1: Startup exits via filled_pipe when BW
+// growth < 1.25× for 3 consecutive rounds (BBRCheckStartupFullBandwidth).
+//
+// On a bandwidth-limited link, verify Startup exits and filled_pipe is
+// set without any packet loss.
+#[test]
+fn startup_exit_via_bandwidth_plateau() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Confirm we start in Startup.
+    assert_ok!(
+        pair.tcp_a().bbr_phase() == BbrPhase::Startup,
+        "not in Startup after connect: {:?}", pair.tcp_a().bbr_phase()
+    );
+
+    let mut found_drain = false;
+    pair.tcp_a_mut().send(&vec![0xABu8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0xABu8; 2_000]);
+        }
+
+        for snap in p.tcp_a(0).bbr_history() {
+            if snap.phase == BbrPhase::Drain {
+                found_drain = true;
+            }
+        }
+        !found_drain
+    });
+
+    assert_ok!(found_drain, "Startup never exited — no Drain entry in bbr_history()");
+    for snap in pair.tcp_a().bbr_history() {
+        if snap.phase == BbrPhase::Drain {
+            assert_ok!(
+                snap.filled_pipe,
+                "Drain snapshot has filled_pipe=false — bandwidth plateau not detected"
+            );
+            return Ok(());
+        }
+    }
+    assert_ok!(false, "Drain found during transfer but not in final history");
+    Ok(())
+}
