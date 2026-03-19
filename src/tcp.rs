@@ -1839,6 +1839,10 @@ impl TcpSocket {
             let peer_wnd = (self.snd_wnd_raw as u32) << self.snd_scale;
             let wnd_limit = self.snd_una + peer_wnd;
             if peer_wnd == 0 || seq_ge(self.snd_nxt, wnd_limit) {
+                // Disarm pacing — an ACK must open the window before we
+                // can send; leaving an expired pacing deadline causes a
+                // busy-wait in poll loops.
+                self.pacing_next.disarm();
                 // Arm persist timer when blocked by zero window
                 if !self.persist_deadline.is_armed() && !self.send_buf.is_empty() {
                     self.persist_backoff_ns = self.rto_ns;
