@@ -1612,7 +1612,13 @@ impl TcpSocket {
 
             // cwnd gate (cwnd already bounded by BBRBoundCwndForModel)
             let bytes_in_flight = self.snd_nxt - self.snd_una;
-            if bytes_in_flight >= self.bbr.cwnd { break; }
+            if bytes_in_flight >= self.bbr.cwnd {
+                // Disarm pacing — an ACK must open the window before we can
+                // send; leaving an expired pacing deadline causes a busy-wait
+                // in poll loops.
+                self.pacing_next.disarm();
+                break;
+            }
 
             // Both gates: cap chunk at the tighter of cwnd room and window room.
             let wnd_room   = (wnd_limit - self.snd_nxt) as usize;
