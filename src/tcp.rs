@@ -351,9 +351,11 @@ struct TxSegment {
     last_sent_ns:     u64,
     retransmits:      u8,
     sacked:           bool,
-    // RFC 9438 §4.1 delivery-rate metadata snapshot at send time
-    delivered_at_send:      u64, // bbr.delivered when this segment was sent
-    delivered_time_at_send: u64, // timestamp when this segment was sent
+    // RFC 9438 §4.1 / draft-cheng-iccrg-delivery-rate-estimation snapshots
+    delivered_at_send:      u64, // P.delivered: bbr.delivered when sent
+    delivered_time_at_send: u64, // P.delivered_time: bbr.delivered_time when sent
+    first_send_time_at_send: u64, // P.first_send_time: bbr.first_send_time when sent
+    is_app_limited:         bool, // P.is_app_limited: sender was app-limited when sent
 }
 
 // ── Out-of-order receive buffer ───────────────────────────────────────────────
@@ -400,10 +402,14 @@ struct BbrState {
     cwnd:                 u32,
     inflight_shortterm:   u32,           // short-term lower bound (spec: BBR.inflight_shortterm)
     inflight_longterm:    u32,           // long-term upper bound (spec: BBR.inflight_longterm)
-    // Delivery rate tracking
-    delivered:            u64,           // total bytes ACKed
+    // Delivery rate tracking (draft-cheng-iccrg-delivery-rate-estimation)
+    delivered:            u64,           // C.delivered: total bytes ACKed
+    delivered_time:       u64,           // C.delivered_time: clock time of last delivery event
+    first_send_time:      u64,           // C.first_send_time: send time of most recently delivered pkt
+    app_limited:          u64,           // C.app_limited: delivered + inflight at app-limit (0 = not)
     // Round counting
     round_count:          u64,
+    round_start:          bool,          // true on ACK that advances round
     next_round_delivered: u64,
     // Loss round tracking (spec §5.5)
     loss_round_delivered: u64,           // C.delivered at start of current loss round
@@ -443,7 +449,11 @@ impl BbrState {
             inflight_shortterm:   u32::MAX,
             inflight_longterm:    u32::MAX,
             delivered:            0,
+            delivered_time:       0,
+            first_send_time:      0,
+            app_limited:          0,
             round_count:          0,
+            round_start:          false,
             next_round_delivered: 0,
             loss_round_delivered: 0,
             loss_round_start:     false,
@@ -1045,49 +1055,78 @@ impl TcpSocket {
     }
 
     /// Update BBR windowed-max bandwidth and cwnd after receiving ACKs.
+    ///
+    /// Follows the spec ordering from draft-ietf-ccwg-bbr §5.5:
+    ///   BBRUpdateModelAndState → BBRUpdateControlParameters
     fn bbr_on_ack(
         &mut self,
         acked_bytes: u64,
         delivery_rate: u64,
+        is_app_limited: bool,
+        rs_prior_delivered: u64,
         rtt_ns: Option<u64>,
         now: u64,
     ) {
         if acked_bytes == 0 { return; }
 
-        // Deliver accounting
+        // Delivery accounting — C.delivered updated here (after rate sample).
         self.bbr.delivered         += acked_bytes;
         self.bbr.acked_bytes_round += acked_bytes;
 
         // ── BBRUpdateLatestDeliverySignals (spec §5.5) ──────────────────
+        // Order: (1) round counting, (2) reset at round start, (3) update.
         self.bbr.loss_round_start = false;
-        self.bbr.bw_latest        = self.bbr.bw_latest.max(delivery_rate);
-        self.bbr.inflight_latest  = self.bbr.inflight_latest.max(acked_bytes);
         if self.bbr.delivered >= self.bbr.loss_round_delivered {
             self.bbr.loss_round_delivered = self.bbr.delivered
                 + ((self.snd_nxt - self.snd_una) as u64).max(1);
             self.bbr.loss_round_start = true;
         }
 
-        // Round counting: advance round when we've ACKed past next_round_delivered.
-        if self.bbr.delivered >= self.bbr.next_round_delivered {
-            self.bbr.round_count          += 1;
-            let bytes_in_flight           = (self.snd_nxt - self.snd_una) as u64;
-            self.bbr.next_round_delivered = self.bbr.delivered + bytes_in_flight.max(1);
+        // BBRUpdateRound (spec §5.5): advance when the ACKed packet's
+        // delivery snapshot has crossed next_round_delivered.
+        self.bbr.round_start = false;
+        if rs_prior_delivered >= self.bbr.next_round_delivered {
+            self.bbr.next_round_delivered = self.bbr.delivered;
+            self.bbr.round_count         += 1;
+            self.bbr.round_start          = true;
             // Per-round acked/loss bytes reset for Startup loss-exit check.
             // loss_events_in_round and last_loss_end_seq are reset in
             // bbr_phase_update (BBRCheckStartupHighLoss) to ensure RACK
             // losses from the current ACK are visible before the reset.
-            self.bbr.loss_bytes_round     = 0;
-            self.bbr.acked_bytes_round    = 0;
+            self.bbr.loss_bytes_round  = 0;
+            self.bbr.acked_bytes_round = 0;
         }
 
-        // ── BBRUpdateMaxBw — windowed max BW ────────────────────────────
-        if delivery_rate > 0 {
-            let n_rounds   = (self.cfg.bbr_bw_filter_rounds as usize).clamp(1, 10);
-            let idx        = self.bbr.bw_sample_idx;
-            self.bbr.bw_samples[idx] = BwSample { round: self.bbr.round_count, bw: delivery_rate };
-            self.bbr.bw_sample_idx   = (idx + 1) % n_rounds;
+        // Spec: reset bw_latest/inflight_latest at round start BEFORE
+        // updating with the current sample.
+        if self.bbr.round_start {
+            self.bbr.bw_latest       = 0;
+            self.bbr.inflight_latest = 0;
+        }
+        self.bbr.bw_latest       = self.bbr.bw_latest.max(delivery_rate);
+        self.bbr.inflight_latest = self.bbr.inflight_latest.max(acked_bytes);
+
+        // ── BBRUpdateMaxBw — windowed max BW per round ──────────────────
+        // Spec: skip app-limited samples unless they exceed current BBR.bw.
+        let effective_bw = if self.bbr.bw_shortterm == u64::MAX {
+            self.bbr.max_bw
+        } else {
+            self.bbr.max_bw.min(self.bbr.bw_shortterm)
+        };
+        if delivery_rate > 0 && (!is_app_limited || delivery_rate > effective_bw) {
+            let n_rounds  = (self.cfg.bbr_bw_filter_rounds as usize).clamp(1, 10);
             let cur_round = self.bbr.round_count;
+            let idx       = self.bbr.bw_sample_idx;
+            // One entry per round: update in place or advance to next slot.
+            if self.bbr.bw_samples[idx].round == cur_round {
+                if delivery_rate > self.bbr.bw_samples[idx].bw {
+                    self.bbr.bw_samples[idx].bw = delivery_rate;
+                }
+            } else {
+                let new_idx = (idx + 1) % n_rounds;
+                self.bbr.bw_samples[new_idx] = BwSample { round: cur_round, bw: delivery_rate };
+                self.bbr.bw_sample_idx = new_idx;
+            }
             self.bbr.max_bw = self.bbr.bw_samples[..n_rounds]
                 .iter()
                 .filter(|s| s.bw > 0 && cur_round.saturating_sub(s.round) < n_rounds as u64)
@@ -1103,12 +1142,6 @@ impl TcpSocket {
             self.bbr.loss_in_round = false;
         }
 
-        // ── BBRAdvanceLatestDeliverySignals (spec §5.5) ─────────────────
-        if self.bbr.loss_round_start {
-            self.bbr.bw_latest       = delivery_rate;
-            self.bbr.inflight_latest = acked_bytes;
-        }
-
         // Min RTT filter
         if let Some(rtt) = rtt_ns {
             if rtt < self.bbr.min_rtt_ns {
@@ -1117,29 +1150,26 @@ impl TcpSocket {
             }
         }
 
-        // Update cwnd
+        // ── BBRSetCwnd (spec §5.6.2) ────────────────────────────────────
         let four_mss = 4 * self.cfg.mss as u32;
         if self.bbr.phase == BbrPhase::ProbeRtt {
-            // ProbeRtt holds cwnd at BBRMinPipeCwnd = 4*MSS throughout.
-            // Do not grow cwnd on ACKs; bbr_check_probe_rtt already set it.
             self.bbr.cwnd = four_mss;
+        } else if !self.bbr.filled_pipe {
+            // Startup: cwnd grows uncapped (spec: "if not filled_pipe:
+            // cwnd = cwnd + rs.newly_acked").  Only loss-based bounds
+            // (via bbr_bound_cwnd_for_model) can reduce it.
+            self.bbr.cwnd = self.bbr.cwnd.saturating_add(acked_bytes as u32)
+                .max(four_mss);
         } else {
-            let old_cwnd = self.bbr.cwnd;
             let (_, cwnd_gain) = self.bbr_gains();
             let bdp = if self.bbr.min_rtt_ns < u64::MAX {
-                self.bbr.max_bw * self.bbr.min_rtt_ns / 1_000_000_000 // bytes
+                self.bbr.max_bw * self.bbr.min_rtt_ns / 1_000_000_000
             } else {
                 self.cfg.mss as u64 * self.cfg.initial_cwnd_pkts as u64
             };
-            let cwnd_target = cwnd_gain.apply(bdp) as u32 + four_mss;
-            let new_cwnd    = self.bbr.cwnd.saturating_add(acked_bytes as u32);
-            self.bbr.cwnd   = new_cwnd.min(cwnd_target).max(four_mss);
-            // Startup: noisy early BDP measurements (few samples) must not shrink
-            // cwnd below where it was.  Cwnd only decreases in Startup on loss events
-            // (via bbr_on_loss → inflight_shortterm → bbr_bound_cwnd_for_model).
-            if self.bbr.phase == BbrPhase::Startup {
-                self.bbr.cwnd = self.bbr.cwnd.max(old_cwnd);
-            }
+            let max_inflight = cwnd_gain.apply(bdp) as u32 + four_mss;
+            let new_cwnd = self.bbr.cwnd.saturating_add(acked_bytes as u32);
+            self.bbr.cwnd = new_cwnd.min(max_inflight).max(four_mss);
         }
 
         // ── BBRBoundCwndForModel (spec §5.6.3) ─────────────────────────
@@ -1147,6 +1177,13 @@ impl TcpSocket {
 
         // Phase transitions
         self.bbr_phase_update(now);
+
+        // ── BBRAdvanceLatestDeliverySignals (spec §5.5) ─────────────────
+        // Reset to 0 at end of processing so next round starts fresh.
+        if self.bbr.round_start {
+            self.bbr.bw_latest       = 0;
+            self.bbr.inflight_latest = 0;
+        }
 
         // If the stale pacing deadline is farther in the future than one new
         // pacing interval, disarm it.  The next flush_send_buf call will send
@@ -1230,7 +1267,7 @@ impl TcpSocket {
                 // BBRCheckStartupFullBandwidth (spec §5.3.1.2):
                 // Only evaluate at round boundaries, per spec:
                 //   "if filled_pipe or !round_start: return"
-                if !self.bbr.filled_pipe && self.bbr.loss_round_start {
+                if !self.bbr.filled_pipe && self.bbr.round_start {
                     let max = self.bbr.max_bw;
                     if max > 0 && max >= ScaledFloat::new(125).apply(self.bbr.full_bw_at_round) {
                         self.bbr.full_bw_at_round = max;
@@ -1463,16 +1500,24 @@ impl TcpSocket {
         let now          = self.clock.monotonic_ns();
         let mut acked_data = 0u64;  // payload bytes (SYN/FIN seq-space excluded; used for BBR)
         let mut rtt_sample: Option<u64> = None;
-        // RFC 9438 §4.1: track oldest ACKed segment's delivery snapshot
-        let mut oldest_delivered:      Option<u64> = None;
-        let mut oldest_delivered_time: Option<u64> = None;
+        // Rate sample state (draft-cheng-iccrg-delivery-rate-estimation §3.3).
+        // We track the NEWEST (most recently sent) ACKed packet's snapshot.
+        let mut rs_prior_delivered:  u64  = 0;
+        let mut rs_prior_time:       u64  = 0;
+        let mut rs_send_elapsed:     u64  = 0;
+        let mut rs_is_app_limited:   bool = false;
+        let mut rs_newest_send_time: u64  = 0;
+        let mut rs_newest_end_seq:   SeqNum = SeqNum(0);
+        let mut rs_has_data:         bool = false;
         let old_snd_una  = self.snd_una;
 
         // Only process if ack advances snd_una
         if !seq_gt(new_ack, self.snd_una) { return; }
         self.dupack_count = 0; // belt-and-braces: any advancing ACK resets the counter
 
-        // 1. Remove cumulatively ACKed segments and measure RTT
+        // 1. Remove cumulatively ACKed segments and measure RTT.
+        //    Per spec UpdateRateSample: select the newest (most recently sent)
+        //    ACKed packet for the delivery-rate snapshot.
         let mut i = 0;
         while i < self.unacked.len() {
             let seg = &self.unacked[i];
@@ -1482,10 +1527,21 @@ impl TcpSocket {
                 if seg.retransmits == 0 && rtt_sample.is_none() {
                     rtt_sample = Some(now.saturating_sub(seg.first_sent_ns));
                 }
-                // Keep the oldest (earliest-sent) delivery snapshot
-                if oldest_delivered_time.is_none_or(|t| seg.delivered_time_at_send < t) {
-                    oldest_delivered      = Some(seg.delivered_at_send);
-                    oldest_delivered_time = Some(seg.delivered_time_at_send);
+                // UpdateRateSample: keep newest (most recently sent) packet.
+                let is_newer = seg.first_sent_ns > rs_newest_send_time
+                    || (seg.first_sent_ns == rs_newest_send_time
+                        && seq_gt(seg.end_seq, rs_newest_end_seq));
+                if !rs_has_data || is_newer {
+                    rs_has_data           = true;
+                    rs_prior_delivered    = seg.delivered_at_send;
+                    rs_prior_time         = seg.delivered_time_at_send;
+                    rs_send_elapsed       = seg.first_sent_ns
+                        .saturating_sub(seg.first_send_time_at_send);
+                    rs_is_app_limited     = seg.is_app_limited;
+                    rs_newest_send_time   = seg.first_sent_ns;
+                    rs_newest_end_seq     = seg.end_seq;
+                    // Spec: C.first_send_time = P.send_time (of newest delivered)
+                    self.bbr.first_send_time = seg.first_sent_ns;
                 }
                 // RACK: update rack_end_seq/xmit_ns/rtt from ACKed segment
                 if seq_gt(seg.end_seq, self.rack_end_seq) {
@@ -1493,6 +1549,8 @@ impl TcpSocket {
                     self.rack_xmit_ns  = seg.last_sent_ns;
                     self.rack_rtt_ns   = now.saturating_sub(seg.last_sent_ns).max(1);
                 }
+                // Spec: C.delivered += P.data_length; C.delivered_time = now
+                // (Actual bbr.delivered update deferred to bbr_on_ack for ordering.)
                 self.unacked.remove(i);
             } else {
                 i += 1;
@@ -1541,17 +1599,29 @@ impl TcpSocket {
                 .min(self.cfg.rto_max_ms * 1_000_000);
         }
 
-        // 5. BBRv3 bandwidth update (RFC 9438 §4.1 delivery rate)
-        // Compute delivery rate before bbr_on_ack updates delivered counter.
-        // C.delivered (after this ACK) - P.delivered / (now - P.delivered_time)
-        // BBR uses payload bytes only — SYN/FIN seq-space bytes are excluded so
-        // that the tiny delivery-rate sample from the handshake (1 byte / RTT)
-        // does not contaminate max_bw and collapse cwnd to 4 MSS.
-        let delivery_rate = if let (Some(p_delivered), Some(p_time)) =
-            (oldest_delivered, oldest_delivered_time) {
-            let interval_ns = now.saturating_sub(p_time).max(1);
-            let c_delivered = self.bbr.delivered + acked_data;
-            c_delivered.saturating_sub(p_delivered) * 1_000_000_000 / interval_ns
+        // 5. Delivery rate estimation (draft-cheng-iccrg-delivery-rate-estimation §3.4).
+        // Compute BEFORE bbr_on_ack updates the delivered counter.
+        // BBR uses payload bytes only — SYN/FIN seq-space excluded so the
+        // tiny handshake sample (1 byte / RTT) doesn't contaminate max_bw.
+        let delivery_rate = if rs_has_data && rs_prior_time > 0 {
+            // Update C.delivered_time to mark this delivery event.
+            self.bbr.delivered_time = now;
+            // Clear app_limited once we've delivered past the marked point.
+            if self.bbr.app_limited > 0
+                && self.bbr.delivered + acked_data > self.bbr.app_limited
+            {
+                self.bbr.app_limited = 0;
+            }
+            let rs_delivered = (self.bbr.delivered + acked_data)
+                .saturating_sub(rs_prior_delivered);
+            let ack_elapsed  = now.saturating_sub(rs_prior_time);
+            let interval     = rs_send_elapsed.max(ack_elapsed);
+            // Discard sample if interval < min_rtt (spec §3.4).
+            if interval < self.bbr.min_rtt_ns && self.bbr.min_rtt_ns < u64::MAX {
+                0
+            } else if interval > 0 {
+                rs_delivered * 1_000_000_000 / interval
+            } else { 0 }
         } else { 0 };
 
         // 5b. RACK loss detection (RFC 8985 §7.2)
@@ -1560,7 +1630,8 @@ impl TcpSocket {
         self.rack_detect_losses();
 
         // 5c. BBRv3 congestion control update (after RACK, so loss info is current)
-        self.bbr_on_ack(acked_data, delivery_rate, rtt_sample, now);
+        self.bbr_on_ack(acked_data, delivery_rate, rs_is_app_limited,
+                        rs_prior_delivered, rtt_sample, now);
 
         // 7. Timer management
         if self.unacked.is_empty() {
@@ -1655,7 +1726,13 @@ impl TcpSocket {
             // FIN occupies one sequence byte.
             let fin_extra = if piggybacked_fin { 1u32 } else { 0 };
 
-            // Record in retransmit buffer
+            // Record in retransmit buffer with delivery-rate snapshots.
+            // Spec: if no packets in flight, reset timing anchors.
+            let inflight_before = (self.snd_nxt - self.snd_una) as u64;
+            if inflight_before == 0 {
+                self.bbr.first_send_time = now;
+                self.bbr.delivered_time  = now;
+            }
             let seg_end = seg_seq + chunk.len() as u32 + fin_extra;
             self.unacked.push(TxSegment {
                 seq:              seg_seq,
@@ -1666,8 +1743,10 @@ impl TcpSocket {
                 last_sent_ns:     now,
                 retransmits:      0,
                 sacked:           false,
-                delivered_at_send:      self.bbr.delivered,
-                delivered_time_at_send: now,
+                delivered_at_send:       self.bbr.delivered,
+                delivered_time_at_send:  self.bbr.delivered_time,
+                first_send_time_at_send: self.bbr.first_send_time,
+                is_app_limited:          self.bbr.app_limited > 0,
             });
             self.snd_nxt = seg_end;
 
@@ -1695,6 +1774,16 @@ impl TcpSocket {
             // Arm RTO
             if !self.rto_deadline.is_armed() {
                 self.rto_deadline.arm_from_now_ns(self.rto_ns, now);
+            }
+        }
+
+        // CheckIfApplicationLimited (spec §3.5): mark app-limited when the
+        // sender ran out of data with cwnd room still available.
+        if self.send_buf.is_empty() {
+            let inflight = (self.snd_nxt - self.snd_una) as u64;
+            if inflight < self.bbr.cwnd as u64 {
+                let mark = (self.bbr.delivered + inflight).max(1);
+                self.bbr.app_limited = mark;
             }
         }
     }
@@ -1875,13 +1964,17 @@ impl TcpSocket {
                     self.snd_nxt += 1;
                     // Record SYN-ACK in unacked
                     let now = self.clock.monotonic_ns();
+                    self.bbr.first_send_time = now;
+                    self.bbr.delivered_time  = now;
                     self.unacked.push(TxSegment {
                         seq: isn, end_seq: isn + 1,
                         flags: TcpFlags::SYN | TcpFlags::ACK, data: vec![],
                         first_sent_ns: now, last_sent_ns: now,
                         retransmits: 0, sacked: false,
-                        delivered_at_send: self.bbr.delivered,
-                        delivered_time_at_send: now,
+                        delivered_at_send:       self.bbr.delivered,
+                        delivered_time_at_send:  self.bbr.delivered_time,
+                        first_send_time_at_send: self.bbr.first_send_time,
+                        is_app_limited:          false,
                     });
                     if !self.rto_deadline.is_armed() {
                         self.rto_deadline.arm_from_now_ns(self.rto_ns, now);
@@ -2384,13 +2477,17 @@ impl TcpSocket {
         s.send_ctrl_opts(TcpFlags::SYN | TcpFlags::ECE | TcpFlags::CWR, &syn_opts)?;
         s.snd_nxt += 1;
         let now = s.clock.monotonic_ns();
+        s.bbr.first_send_time = now;
+        s.bbr.delivered_time  = now;
         s.unacked.push(TxSegment {
             seq: isn, end_seq: isn + 1,
             flags: TcpFlags::SYN, data: vec![],
             first_sent_ns: now, last_sent_ns: now,
             retransmits: 0, sacked: false,
-            delivered_at_send: 0,
-            delivered_time_at_send: now,
+            delivered_at_send:       0,
+            delivered_time_at_send:  now,
+            first_send_time_at_send: now,
+            is_app_limited:          false,
         });
         s.rto_deadline.arm_from_now_ns(s.rto_ns, now);
         Ok(s)
@@ -2673,6 +2770,10 @@ impl TcpSocket {
     /// retransmitted.
     fn record_fin(&mut self, fin_seq: SeqNum) {
         let now = self.clock.monotonic_ns();
+        if (self.snd_nxt - self.snd_una) as u64 == 0 {
+            self.bbr.first_send_time = now;
+            self.bbr.delivered_time  = now;
+        }
         self.unacked.push(TxSegment {
             seq:           fin_seq,
             end_seq:       fin_seq + 1, // FIN occupies 1 sequence byte
@@ -2682,8 +2783,10 @@ impl TcpSocket {
             last_sent_ns:  now,
             retransmits:   0,
             sacked:        false,
-            delivered_at_send:      self.bbr.delivered,
-            delivered_time_at_send: now,
+            delivered_at_send:       self.bbr.delivered,
+            delivered_time_at_send:  self.bbr.delivered_time,
+            first_send_time_at_send: self.bbr.first_send_time,
+            is_app_limited:          self.bbr.app_limited > 0,
         });
         if !self.rto_deadline.is_armed() {
             self.rto_deadline.arm_from_now_ns(self.rto_ns, now);
