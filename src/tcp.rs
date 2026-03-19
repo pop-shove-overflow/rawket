@@ -1359,6 +1359,10 @@ impl TcpSocket {
                     self.bbr.last_loss_end_seq    = 0;
                 }
                 if self.bbr.filled_pipe {
+                    // Record Startup snapshot before transitioning to Drain
+                    // so tests can inspect Startup pacing gain via bbr_history().
+                    #[cfg(feature = "test-internals")]
+                    self.bbr_record_snapshot();
                     self.bbr.phase = BbrPhase::Drain;
                     #[cfg(feature = "test-internals")]
                     self.bbr_record_snapshot();
