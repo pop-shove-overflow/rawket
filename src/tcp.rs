@@ -1418,6 +1418,10 @@ impl TcpSocket {
             BbrPhase::ProbeRtt => {
                 if self.bbr.probe_rtt_done_ns > 0 && now >= self.bbr.probe_rtt_done_ns {
                     self.bbr.probe_rtt_done_ns = 0;
+                    // Spec §4.3.4.6 BBRExitProbeRTT: refresh min_rtt_stamp
+                    // so the next probe_rtt_interval countdown restarts from
+                    // now (the point where we last confirmed min_rtt).
+                    self.bbr.min_rtt_stamp_ns  = now;
                     self.bbr.cwnd              = self.bbr.prior_cwnd;
                     // Spec: BBRResetShortTermModel at ProbeRTT exit
                     self.bbr_reset_short_term_model();
