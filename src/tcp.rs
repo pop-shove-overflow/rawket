@@ -1782,7 +1782,7 @@ impl TcpSocket {
                     && seq_ge(seg.ack, self.snd_una)
                     && seq_le(seg.ack, self.snd_nxt)
                 {
-                    self.state      = State::Closed;
+                    self.enter_closed();
                     self.last_error = Some(TcpError::Reset);
                     (self.on_error)(TcpError::Reset);
                 }
@@ -1795,7 +1795,7 @@ impl TcpSocket {
             if in_window {
                 if seg.seq == self.rcv_nxt {
                     // Exact match → genuine reset
-                    self.state      = State::Closed;
+                    self.enter_closed();
                     self.last_error = Some(TcpError::Reset);
                     (self.on_error)(TcpError::Reset);
                 } else {
@@ -2318,7 +2318,7 @@ impl TcpSocket {
             // ── LAST_ACK ────────────────────────────────────────────────────
             State::LastAck => {
                 if seg.has_flag(TcpFlags::ACK) {
-                    self.state = State::Closed;
+                    self.enter_closed();
                 }
             }
 
@@ -2494,8 +2494,7 @@ impl TcpSocket {
         // ── RTO / TIME_WAIT ──
         if self.rto_deadline.is_expired(now) {
             if self.state == State::TimeWait {
-                self.state = State::Closed;
-                self.rto_deadline.disarm();
+                self.enter_closed();
                 return Ok(());
             }
             // Retransmit oldest non-sacked unacked segment
@@ -2526,7 +2525,7 @@ impl TcpSocket {
                 // RFC 793 §3.8: "If the retransmission timeout is exceeded [...]
                 // the connection is aborted."  Send RST to notify the peer.
                 let _ = self.send_ctrl(TcpFlags::RST | TcpFlags::ACK);
-                self.state      = State::Closed;
+                self.enter_closed();
                 self.last_error = Some(TcpError::Timeout);
                 let on_error    = self.on_error;
                 on_error(TcpError::Timeout);
@@ -2545,7 +2544,7 @@ impl TcpSocket {
         {
             self.keepalive_probes += 1;
             if self.keepalive_probes > self.cfg.keepalive_count {
-                self.state      = State::Closed;
+                self.enter_closed();
                 self.last_error = Some(TcpError::Timeout);
                 let on_error    = self.on_error;
                 on_error(TcpError::Timeout);
@@ -2613,14 +2612,25 @@ impl TcpSocket {
         Some(n)
     }
 
+    /// Disarm all timers and clear send state.  Called on every transition
+    /// to Closed so stale deadlines cannot spin poll loops.
+    fn enter_closed(&mut self) {
+        self.state = State::Closed;
+        self.rto_deadline.disarm();
+        self.tlp_deadline.disarm();
+        self.keepalive_deadline.disarm();
+        self.persist_deadline.disarm();
+        self.pacing_next.disarm();
+        self.send_buf.clear();
+    }
+
     /// Abortive close: send RST and immediately transition to Closed.
     pub fn abort(&mut self) -> Result<()> {
         match self.state {
             State::Closed | State::Listen => {}
             _ => { let _ = self.send_ctrl_opts(TcpFlags::RST, &[]); }
         }
-        self.state = State::Closed;
-        self.rto_deadline.disarm();
+        self.enter_closed();
         Ok(())
     }
 
