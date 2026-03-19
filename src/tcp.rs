@@ -444,6 +444,38 @@ struct BbrState {
     // ProbeBW phase management (spec §5.4)
     rounds_since_bw_probe: u32,         // rounds since last DOWN entry (for Reno coexistence)
     bw_probe_wait_ns:      u64,         // CRUISE duration target (random 2-3s)
+    #[cfg(feature = "test-internals")]
+    history:               Vec<BbrSnapshot>,
+}
+
+/// Snapshot of BBR state captured at every phase transition.
+/// Only available under `test-internals` for system-test assertions.
+#[cfg(feature = "test-internals")]
+#[derive(Clone, Debug)]
+pub struct BbrSnapshot {
+    pub phase:              BbrPhase,
+    pub cwnd:               u32,
+    pub pacing_rate_bps:    u64,
+    pub max_bw:             u64,
+    pub bw_shortterm:       u64,
+    pub bw_latest:          u64,
+    pub inflight_shortterm: u32,
+    pub inflight_longterm:  u32,
+    pub inflight_latest:    u64,
+    pub min_rtt_ns:         u64,
+    pub round_count:        u64,
+    pub loss_in_round:      bool,
+    pub delivered:          u64,
+    pub filled_pipe:        bool,
+    pub bytes_in_flight:    u32,
+    pub prior_cwnd:         u32,
+    pub cycle_stamp_ns:     u64,
+    pub rounds_since_bw_probe: u32,
+    pub bw_probe_wait_ns:   u64,
+    pub app_limited:        u64,
+    pub loss_bytes_round:   u64,
+    pub acked_bytes_round:  u64,
+    pub loss_events_in_round: u32,
 }
 
 impl BbrState {
@@ -485,6 +517,8 @@ impl BbrState {
             last_loss_end_seq:    0,
             rounds_since_bw_probe: 0,
             bw_probe_wait_ns:      0,
+            #[cfg(feature = "test-internals")]
+            history:               Vec::new(),
         }
     }
 }
@@ -1314,6 +1348,8 @@ impl TcpSocket {
                 }
                 if self.bbr.filled_pipe {
                     self.bbr.phase = BbrPhase::Drain;
+                    #[cfg(feature = "test-internals")]
+                    self.bbr_record_snapshot();
                 }
             }
             BbrPhase::Drain => {
@@ -1332,6 +1368,8 @@ impl TcpSocket {
                 let bdp = self.bbr_bdp();
                 if bytes_in_flight <= bdp.max(1) {
                     self.bbr.phase = BbrPhase::ProbeBwCruise;
+                    #[cfg(feature = "test-internals")]
+                    self.bbr_record_snapshot();
                 }
             }
             BbrPhase::ProbeBwCruise => {
@@ -1373,6 +1411,36 @@ impl TcpSocket {
         }
     }
 
+    /// Record a snapshot of full BBR state for test inspection.
+    #[cfg(feature = "test-internals")]
+    fn bbr_record_snapshot(&mut self) {
+        self.bbr.history.push(BbrSnapshot {
+            phase:              self.bbr.phase,
+            cwnd:               self.bbr.cwnd,
+            pacing_rate_bps:    self.pacing_rate_bps(),
+            max_bw:             self.bbr.max_bw,
+            bw_shortterm:       self.bbr.bw_shortterm,
+            bw_latest:          self.bbr.bw_latest,
+            inflight_shortterm: self.bbr.inflight_shortterm,
+            inflight_longterm:  self.bbr.inflight_longterm,
+            inflight_latest:    self.bbr.inflight_latest,
+            min_rtt_ns:         self.bbr.min_rtt_ns,
+            round_count:        self.bbr.round_count,
+            loss_in_round:      self.bbr.loss_in_round,
+            delivered:          self.bbr.delivered,
+            filled_pipe:        self.bbr.filled_pipe,
+            bytes_in_flight:    self.snd_nxt - self.snd_una,
+            prior_cwnd:         self.bbr.prior_cwnd,
+            cycle_stamp_ns:     self.bbr.cycle_stamp_ns,
+            rounds_since_bw_probe: self.bbr.rounds_since_bw_probe,
+            bw_probe_wait_ns:   self.bbr.bw_probe_wait_ns,
+            app_limited:        self.bbr.app_limited,
+            loss_bytes_round:   self.bbr.loss_bytes_round,
+            acked_bytes_round:  self.bbr.acked_bytes_round,
+            loss_events_in_round: self.bbr.loss_events_in_round,
+        });
+    }
+
     /// BDP estimate in bytes.
     fn bbr_bdp(&self) -> u64 {
         if self.bbr.min_rtt_ns < u64::MAX && self.bbr.max_bw > 0 {
@@ -1391,18 +1459,24 @@ impl TcpSocket {
         // bw_probe_wait = 2s + rand(0..1s)
         self.bbr.bw_probe_wait_ns = 2_000_000_000
             + (random_u32() % 1_000_000) as u64 * 1000; // 0..999_999_000 ns ≈ 0..1s
+        #[cfg(feature = "test-internals")]
+        self.bbr_record_snapshot();
     }
 
     /// Enter ProbeBW_REFILL: reset short-term model.
     fn bbr_enter_probe_bw_refill(&mut self) {
         self.bbr_reset_short_term_model();
         self.bbr.phase = BbrPhase::ProbeBwRefill;
+        #[cfg(feature = "test-internals")]
+        self.bbr_record_snapshot();
     }
 
     /// Enter ProbeBW_UP: probe for more bandwidth.
     fn bbr_enter_probe_bw_up(&mut self, now: u64) {
         self.bbr.phase           = BbrPhase::ProbeBwUp;
         self.bbr.cycle_stamp_ns  = now;
+        #[cfg(feature = "test-internals")]
+        self.bbr_record_snapshot();
     }
 
     /// Spec §5.4: check if it's time to probe BW (CRUISE→REFILL or DOWN→REFILL).
@@ -1447,6 +1521,8 @@ impl TcpSocket {
             self.bbr.probe_rtt_done_ns = now + self.cfg.bbr_probe_rtt_duration_ms * 1_000_000;
             self.bbr.phase             = BbrPhase::ProbeRtt;
             self.bbr.last_probe_rtt_ns = now;
+            #[cfg(feature = "test-internals")]
+            self.bbr_record_snapshot();
             return true;
         }
         false
@@ -2939,6 +3015,35 @@ impl TcpSocket {
     pub fn snd_scale(&self) -> u8 { self.snd_scale }
     pub fn ts_recent(&self) -> u32 { self.ts_recent }
     pub fn last_ack_sent(&self) -> u32 { self.last_ack_sent.as_u32() }
+    pub fn bbr_history(&self) -> &[BbrSnapshot] { &self.bbr.history }
+    pub fn bbr_snapshot(&self) -> BbrSnapshot {
+        BbrSnapshot {
+            phase:              self.bbr.phase,
+            cwnd:               self.bbr.cwnd,
+            pacing_rate_bps:    self.pacing_rate_bps(),
+            max_bw:             self.bbr.max_bw,
+            bw_shortterm:       self.bbr.bw_shortterm,
+            bw_latest:          self.bbr.bw_latest,
+            inflight_shortterm: self.bbr.inflight_shortterm,
+            inflight_longterm:  self.bbr.inflight_longterm,
+            inflight_latest:    self.bbr.inflight_latest,
+            min_rtt_ns:         self.bbr.min_rtt_ns,
+            round_count:        self.bbr.round_count,
+            loss_in_round:      self.bbr.loss_in_round,
+            delivered:          self.bbr.delivered,
+            filled_pipe:        self.bbr.filled_pipe,
+            bytes_in_flight:    self.snd_nxt - self.snd_una,
+            prior_cwnd:         self.bbr.prior_cwnd,
+            cycle_stamp_ns:     self.bbr.cycle_stamp_ns,
+            rounds_since_bw_probe: self.bbr.rounds_since_bw_probe,
+            bw_probe_wait_ns:   self.bbr.bw_probe_wait_ns,
+            app_limited:        self.bbr.app_limited,
+            loss_bytes_round:   self.bbr.loss_bytes_round,
+            acked_bytes_round:  self.bbr.acked_bytes_round,
+            loss_events_in_round: self.bbr.loss_events_in_round,
+        }
+    }
+    pub fn bbr_clear_history(&mut self) { self.bbr.history.clear(); }
 }
 
 // ── L4 dispatch ───────────────────────────────────────────────────────────────
