@@ -368,6 +368,17 @@ struct RxOooSegment {
 
 // ── BBRv3 ─────────────────────────────────────────────────────────────────────
 
+/// Aggregated per-ACK signals passed to `bbr_on_ack`.
+struct BbrAckState {
+    acked_bytes:        u64,
+    delivery_rate:      u64,
+    is_app_limited:     bool,
+    rs_prior_delivered: u64,
+    newly_lost:         u64,
+    rtt_ns:             Option<u64>,
+    now:                u64,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BbrPhase {
     Startup,
@@ -430,6 +441,9 @@ struct BbrState {
     acked_bytes_round:    u64,
     loss_events_in_round: u32,           // discontiguous lost ranges this round (spec §5.3.1.3)
     last_loss_end_seq:    u32,           // end_seq of previous lost segment (for range merging)
+    // ProbeBW phase management (spec §5.4)
+    rounds_since_bw_probe: u32,         // rounds since last DOWN entry (for Reno coexistence)
+    bw_probe_wait_ns:      u64,         // CRUISE duration target (random 2-3s)
 }
 
 impl BbrState {
@@ -469,6 +483,8 @@ impl BbrState {
             acked_bytes_round:    0,
             loss_events_in_round: 0,
             last_loss_end_seq:    0,
+            rounds_since_bw_probe: 0,
+            bw_probe_wait_ns:      0,
         }
     }
 }
@@ -1044,7 +1060,7 @@ impl TcpSocket {
     fn pacing_interval_ns(&self) -> u64 {
         let rate = self.pacing_rate_bps();
         if rate == 0 { return 0; } // 0 = send immediately
-        self.cfg.mss as u64 * 8 * 1_000_000_000 / rate
+        self.cfg.mss as u64 * 1_000_000_000 / rate
     }
 
     /// Spec §5.5: BBRIsProbingBW() — true for phases that are probing bandwidth.
@@ -1058,20 +1074,12 @@ impl TcpSocket {
     ///
     /// Follows the spec ordering from draft-ietf-ccwg-bbr §5.5:
     ///   BBRUpdateModelAndState → BBRUpdateControlParameters
-    fn bbr_on_ack(
-        &mut self,
-        acked_bytes: u64,
-        delivery_rate: u64,
-        is_app_limited: bool,
-        rs_prior_delivered: u64,
-        rtt_ns: Option<u64>,
-        now: u64,
-    ) {
-        if acked_bytes == 0 { return; }
+    fn bbr_on_ack(&mut self, s: BbrAckState) {
+        if s.acked_bytes == 0 { return; }
 
         // Delivery accounting — C.delivered updated here (after rate sample).
-        self.bbr.delivered         += acked_bytes;
-        self.bbr.acked_bytes_round += acked_bytes;
+        self.bbr.delivered         += s.acked_bytes;
+        self.bbr.acked_bytes_round += s.acked_bytes;
 
         // ── BBRUpdateLatestDeliverySignals (spec §5.5) ──────────────────
         // Order: (1) round counting, (2) reset at round start, (3) update.
@@ -1085,10 +1093,11 @@ impl TcpSocket {
         // BBRUpdateRound (spec §5.5): advance when the ACKed packet's
         // delivery snapshot has crossed next_round_delivered.
         self.bbr.round_start = false;
-        if rs_prior_delivered >= self.bbr.next_round_delivered {
+        if s.rs_prior_delivered >= self.bbr.next_round_delivered {
             self.bbr.next_round_delivered = self.bbr.delivered;
-            self.bbr.round_count         += 1;
-            self.bbr.round_start          = true;
+            self.bbr.round_count           += 1;
+            self.bbr.rounds_since_bw_probe += 1;
+            self.bbr.round_start            = true;
             // Per-round acked/loss bytes reset for Startup loss-exit check.
             // loss_events_in_round and last_loss_end_seq are reset in
             // bbr_phase_update (BBRCheckStartupHighLoss) to ensure RACK
@@ -1103,8 +1112,8 @@ impl TcpSocket {
             self.bbr.bw_latest       = 0;
             self.bbr.inflight_latest = 0;
         }
-        self.bbr.bw_latest       = self.bbr.bw_latest.max(delivery_rate);
-        self.bbr.inflight_latest = self.bbr.inflight_latest.max(acked_bytes);
+        self.bbr.bw_latest       = self.bbr.bw_latest.max(s.delivery_rate);
+        self.bbr.inflight_latest = self.bbr.inflight_latest.max(s.acked_bytes);
 
         // ── BBRUpdateMaxBw — windowed max BW per round ──────────────────
         // Spec: skip app-limited samples unless they exceed current BBR.bw.
@@ -1113,27 +1122,27 @@ impl TcpSocket {
         } else {
             self.bbr.max_bw.min(self.bbr.bw_shortterm)
         };
-        if delivery_rate > 0 && (!is_app_limited || delivery_rate > effective_bw) {
+        if s.delivery_rate > 0 && (!s.is_app_limited || s.delivery_rate > effective_bw) {
             let n_rounds  = (self.cfg.bbr_bw_filter_rounds as usize).clamp(1, 10);
             let cur_round = self.bbr.round_count;
             let idx       = self.bbr.bw_sample_idx;
             // One entry per round: update in place or advance to next slot.
             if self.bbr.bw_samples[idx].round == cur_round {
-                if delivery_rate > self.bbr.bw_samples[idx].bw {
-                    self.bbr.bw_samples[idx].bw = delivery_rate;
+                if s.delivery_rate > self.bbr.bw_samples[idx].bw {
+                    self.bbr.bw_samples[idx].bw = s.delivery_rate;
                 }
             } else {
                 let new_idx = (idx + 1) % n_rounds;
-                self.bbr.bw_samples[new_idx] = BwSample { round: cur_round, bw: delivery_rate };
+                self.bbr.bw_samples[new_idx] = BwSample { round: cur_round, bw: s.delivery_rate };
                 self.bbr.bw_sample_idx = new_idx;
             }
             self.bbr.max_bw = self.bbr.bw_samples[..n_rounds]
                 .iter()
-                .filter(|s| s.bw > 0 && cur_round.saturating_sub(s.round) < n_rounds as u64)
-                .map(|s| s.bw)
+                .filter(|bs| bs.bw > 0 && cur_round.saturating_sub(bs.round) < n_rounds as u64)
+                .map(|bs| bs.bw)
                 .max()
-                .unwrap_or(delivery_rate)
-                .max(delivery_rate);
+                .unwrap_or(s.delivery_rate)
+                .max(s.delivery_rate);
         }
 
         // ── BBRUpdateCongestionSignals (spec §5.5) ──────────────────────
@@ -1143,22 +1152,28 @@ impl TcpSocket {
         }
 
         // Min RTT filter
-        if let Some(rtt) = rtt_ns {
+        if let Some(rtt) = s.rtt_ns {
             if rtt < self.bbr.min_rtt_ns {
                 self.bbr.min_rtt_ns       = rtt;
-                self.bbr.min_rtt_stamp_ns = now;
+                self.bbr.min_rtt_stamp_ns = s.now;
             }
         }
 
-        // ── BBRSetCwnd (spec §5.6.2) ────────────────────────────────────
+        // ── BBRModulateCwndForRecovery (spec §5.6.2) ───────────────────
         let four_mss = 4 * self.cfg.mss as u32;
+        if s.newly_lost > 0 {
+            self.bbr.cwnd = self.bbr.cwnd.saturating_sub(s.newly_lost as u32)
+                .max(four_mss);
+        }
+
+        // ── BBRSetCwnd (spec §5.6.2) ────────────────────────────────────
         if self.bbr.phase == BbrPhase::ProbeRtt {
             self.bbr.cwnd = four_mss;
         } else if !self.bbr.filled_pipe {
             // Startup: cwnd grows uncapped (spec: "if not filled_pipe:
             // cwnd = cwnd + rs.newly_acked").  Only loss-based bounds
             // (via bbr_bound_cwnd_for_model) can reduce it.
-            self.bbr.cwnd = self.bbr.cwnd.saturating_add(acked_bytes as u32)
+            self.bbr.cwnd = self.bbr.cwnd.saturating_add(s.acked_bytes as u32)
                 .max(four_mss);
         } else {
             let (_, cwnd_gain) = self.bbr_gains();
@@ -1168,7 +1183,7 @@ impl TcpSocket {
                 self.cfg.mss as u64 * self.cfg.initial_cwnd_pkts as u64
             };
             let max_inflight = cwnd_gain.apply(bdp) as u32 + four_mss;
-            let new_cwnd = self.bbr.cwnd.saturating_add(acked_bytes as u32);
+            let new_cwnd = self.bbr.cwnd.saturating_add(s.acked_bytes as u32);
             self.bbr.cwnd = new_cwnd.min(max_inflight).max(four_mss);
         }
 
@@ -1176,7 +1191,7 @@ impl TcpSocket {
         self.bbr_bound_cwnd_for_model();
 
         // Phase transitions
-        self.bbr_phase_update(now);
+        self.bbr_phase_update(s.now);
 
         // ── BBRAdvanceLatestDeliverySignals (spec §5.5) ─────────────────
         // Reset to 0 at end of processing so next round starts fresh.
@@ -1188,7 +1203,7 @@ impl TcpSocket {
         // If the stale pacing deadline is farther in the future than one new
         // pacing interval, disarm it.  The next flush_send_buf call will send
         // a segment immediately and then re-arm with the correct interval.
-        if let Some(remaining_ns) = self.pacing_next.remaining_ns(now) {
+        if let Some(remaining_ns) = self.pacing_next.remaining_ns(s.now) {
             if remaining_ns > self.pacing_interval_ns() {
                 self.pacing_next.disarm();
             }
@@ -1309,7 +1324,9 @@ impl TcpSocket {
                 }
             }
             BbrPhase::ProbeBwDown => {
+                // Spec §5.4: check if probe wait expired (can skip CRUISE).
                 if self.bbr_check_probe_rtt(now) { return; }
+                if self.bbr_check_time_to_probe_bw(now) { return; }
                 // Transition to CRUISE when in-flight ≤ BDP
                 let bytes_in_flight = (self.snd_nxt - self.snd_una) as u64;
                 let bdp = self.bbr_bdp();
@@ -1319,28 +1336,28 @@ impl TcpSocket {
             }
             BbrPhase::ProbeBwCruise => {
                 if self.bbr_check_probe_rtt(now) { return; }
-                // Time to probe? After min_rtt interval, transition to REFILL
-                if self.bbr.round_count > 0
-                    && now.saturating_sub(self.bbr.cycle_stamp_ns) >= self.srtt_ns.max(1) * 4
-                {
-                    self.bbr_enter_probe_bw_refill();
-                }
+                // Spec §5.4: time-based or Reno coexistence round-based trigger.
+                self.bbr_check_time_to_probe_bw(now);
             }
             BbrPhase::ProbeBwRefill => {
                 if self.bbr_check_probe_rtt(now) { return; }
-                // After one round of REFILL, start UP
-                if self.bbr.round_count > 0
-                    && now.saturating_sub(self.bbr.cycle_stamp_ns) >= self.srtt_ns.max(1)
-                {
+                // Spec §5.4.4: transition to UP at next round boundary.
+                if self.bbr.round_start {
                     self.bbr_enter_probe_bw_up(now);
                 }
             }
             BbrPhase::ProbeBwUp => {
                 if self.bbr_check_probe_rtt(now) { return; }
-                // Stay UP for one round then go DOWN
-                if self.bbr.round_count > 0
-                    && now.saturating_sub(self.bbr.cycle_stamp_ns) >= self.srtt_ns.max(1)
-                {
+                // Spec §5.4.4: stay UP until min_rtt elapsed AND inflight > 1.25*BDP.
+                let elapsed = now.saturating_sub(self.bbr.cycle_stamp_ns);
+                let min_rtt = if self.bbr.min_rtt_ns < u64::MAX {
+                    self.bbr.min_rtt_ns
+                } else {
+                    self.srtt_ns.max(1_000_000)
+                };
+                let inflight = (self.snd_nxt - self.snd_una) as u64;
+                let target = self.bbr_bdp() * 125 / 100; // 1.25 × BDP
+                if elapsed >= min_rtt && inflight > target.max(1) {
                     self.bbr_enter_probe_bw_down(now);
                 }
             }
@@ -1364,10 +1381,16 @@ impl TcpSocket {
     }
 
     /// Enter ProbeBW_DOWN: start a new ProbeBW cycle.
+    /// Calls BBRPickProbeWait to randomize the next probe timing.
     fn bbr_enter_probe_bw_down(&mut self, now: u64) {
         self.bbr_reset_congestion_signals();
         self.bbr.phase           = BbrPhase::ProbeBwDown;
         self.bbr.cycle_stamp_ns  = now;
+        // BBRPickProbeWait (spec §5.4.3): randomize CRUISE duration.
+        self.bbr.rounds_since_bw_probe = random_u32() & 1; // rand(0, 1)
+        // bw_probe_wait = 2s + rand(0..1s)
+        self.bbr.bw_probe_wait_ns = 2_000_000_000
+            + (random_u32() % 1_000_000) as u64 * 1000; // 0..999_999_000 ns ≈ 0..1s
     }
 
     /// Enter ProbeBW_REFILL: reset short-term model.
@@ -1380,6 +1403,35 @@ impl TcpSocket {
     fn bbr_enter_probe_bw_up(&mut self, now: u64) {
         self.bbr.phase           = BbrPhase::ProbeBwUp;
         self.bbr.cycle_stamp_ns  = now;
+    }
+
+    /// Spec §5.4: check if it's time to probe BW (CRUISE→REFILL or DOWN→REFILL).
+    /// Returns true if we transitioned.
+    fn bbr_check_time_to_probe_bw(&mut self, now: u64) -> bool {
+        // Time-based trigger: elapsed since DOWN entry >= bw_probe_wait
+        let elapsed = now.saturating_sub(self.bbr.cycle_stamp_ns);
+        let time_to_probe = self.bbr.bw_probe_wait_ns > 0
+            && elapsed >= self.bbr.bw_probe_wait_ns;
+        // Round-based trigger: Reno coexistence (spec §5.4.5)
+        let reno_rounds = self.bbr_reno_coex_rounds();
+        let round_to_probe = self.bbr.rounds_since_bw_probe >= reno_rounds;
+        if time_to_probe || round_to_probe {
+            self.bbr_enter_probe_bw_refill();
+            return true;
+        }
+        false
+    }
+
+    /// Spec §5.4.5: Reno-coexistence probe round target.
+    /// Returns the max rounds to stay in CRUISE before probing.
+    fn bbr_reno_coex_rounds(&self) -> u32 {
+        let bdp = self.bbr_bdp();
+        let loss_thresh_mss = (self.cfg.mss as u64) * 2 / 100; // MSS × 2% (BBR.LossThresh)
+        if loss_thresh_mss == 0 {
+            return 63;
+        }
+        let rounds = bdp / loss_thresh_mss.max(1);
+        (rounds as u32).clamp(2, 63)
     }
 
     /// Check if it's time to enter ProbeRTT. Returns true if we transitioned.
@@ -1444,7 +1496,9 @@ impl TcpSocket {
     ///  2. **Packet-count**: ≥ dup_ack_thresh (3) segments SACKed *after*
     ///     this one  — equivalent to "3 packets have been delivered after
     ///     this one was sent, yet it remains unacknowledged."
-    fn rack_detect_losses(&mut self) {
+    ///
+    /// Returns total lost bytes (for BBRModulateCwndForRecovery).
+    fn rack_detect_losses(&mut self) -> u64 {
         let now = self.clock.monotonic_ns();
         let rack_rtt = if self.rack_rtt_ns > 0 { self.rack_rtt_ns } else { self.srtt_ns.max(1) };
         let min_rtt  = if self.bbr.min_rtt_ns < u64::MAX { self.bbr.min_rtt_ns } else { rack_rtt };
@@ -1468,17 +1522,27 @@ impl TcpSocket {
                 retx.push((seg.seq, seg.flags, seg.data.clone()));
             }
         }
+        let mut total_lost = 0u64;
         for (seq, flags, data) in retx {
             let now = self.clock.monotonic_ns();
+            // Update retransmit state + delivery-rate snapshots (spec: OnPacketSent
+            // applies to all sends including retransmits).
             for s in &mut self.unacked {
                 if s.seq == seq {
                     s.retransmits += 1;
                     s.last_sent_ns = now;
+                    s.first_sent_ns = now;
+                    s.delivered_at_send = self.bbr.delivered;
+                    s.delivered_time_at_send = self.bbr.delivered_time;
+                    s.first_send_time_at_send = self.bbr.first_send_time;
+                    s.is_app_limited = self.bbr.app_limited > 0;
                 }
             }
             let syn_fin_bytes = if !(flags & (TcpFlags::SYN | TcpFlags::FIN)).is_empty() { 1 } else { 0 };
+            let lost_bytes = data.len() as u64 + syn_fin_bytes as u64;
             let end_seq = seq + data.len() as u32 + syn_fin_bytes;
-            self.bbr_on_loss(data.len() as u64 + syn_fin_bytes as u64, seq, end_seq);
+            total_lost += lost_bytes;
+            self.bbr_on_loss(lost_bytes, seq, end_seq);
             let opts_arr;
             let ts_arr;
             let opts_slice: &[u8] = if flags.has(TcpFlags::SYN) {
@@ -1492,6 +1556,7 @@ impl TcpSocket {
             };
             let _ = self.send_segment(seq, flags, &data, opts_slice);
         }
+        total_lost
     }
 
     // ── Core ACK processing ──────────────────────────────────────────────────
@@ -1627,11 +1692,18 @@ impl TcpSocket {
         // 5b. RACK loss detection (RFC 8985 §7.2)
         // RACK must run BEFORE bbr_on_ack so that loss_events_in_round is
         // populated before the Startup filled_pipe exit check evaluates it.
-        self.rack_detect_losses();
+        let newly_lost = self.rack_detect_losses();
 
         // 5c. BBRv3 congestion control update (after RACK, so loss info is current)
-        self.bbr_on_ack(acked_data, delivery_rate, rs_is_app_limited,
-                        rs_prior_delivered, rtt_sample, now);
+        self.bbr_on_ack(BbrAckState {
+            acked_bytes:        acked_data,
+            delivery_rate,
+            is_app_limited:     rs_is_app_limited,
+            rs_prior_delivered,
+            newly_lost,
+            rtt_ns:             rtt_sample,
+            now,
+        });
 
         // 7. Timer management
         if self.unacked.is_empty() {
@@ -2098,14 +2170,29 @@ impl TcpSocket {
                         self.dupack_count = self.dupack_count.saturating_add(1);
                         // RACK loss detection on dup ACKs — SACK blocks
                         // accumulated above may now satisfy the time condition.
-                        self.rack_detect_losses();
+                        let rack_lost = self.rack_detect_losses();
+                        // BBRModulateCwndForRecovery on dup-ACK RACK losses
+                        if rack_lost > 0 {
+                            let min_cwnd = 4 * self.cfg.mss as u32;
+                            self.bbr.cwnd = self.bbr.cwnd.saturating_sub(rack_lost as u32)
+                                .max(min_cwnd);
+                        }
                         if self.dupack_count >= 3 {
                             self.dupack_count = 0;
                             let now = self.clock.monotonic_ns();
                             if let Some(s) = self.unacked.iter().find(|s| !s.sacked) {
                                 let (seq, flags, data) = (s.seq, s.flags, s.data.clone());
                                 for s in &mut self.unacked {
-                                    if s.seq == seq { s.retransmits += 1; s.last_sent_ns = now; }
+                                    if s.seq == seq {
+                                        s.retransmits += 1;
+                                        s.last_sent_ns = now;
+                                        // Delivery-rate snapshots (spec: OnPacketSent on retransmit)
+                                        s.first_sent_ns = now;
+                                        s.delivered_at_send = self.bbr.delivered;
+                                        s.delivered_time_at_send = self.bbr.delivered_time;
+                                        s.first_send_time_at_send = self.bbr.first_send_time;
+                                        s.is_app_limited = self.bbr.app_limited > 0;
+                                    }
                                 }
                                 let syn_arr;
                                 let ts_arr;
@@ -2600,7 +2687,16 @@ impl TcpSocket {
             });
             if let Some((seq, flags, data)) = oldest {
                 for s in &mut self.unacked {
-                    if s.seq == seq { s.retransmits += 1; s.last_sent_ns = now; }
+                    if s.seq == seq {
+                        s.retransmits += 1;
+                        s.last_sent_ns = now;
+                        // Delivery-rate snapshots (spec: OnPacketSent on retransmit)
+                        s.first_sent_ns = now;
+                        s.delivered_at_send = self.bbr.delivered;
+                        s.delivered_time_at_send = self.bbr.delivered_time;
+                        s.first_send_time_at_send = self.bbr.first_send_time;
+                        s.is_app_limited = self.bbr.app_limited > 0;
+                    }
                 }
                 let opts_arr;
                 let ts_arr;
