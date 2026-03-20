@@ -478,6 +478,18 @@ pub struct BbrSnapshot {
     pub loss_events_in_round: u32,
 }
 
+/// Snapshot of all TCP timer deadlines for test inspection.
+/// Each field is `Some(remaining_ns)` if the timer is armed, `None` if disarmed.
+#[cfg(feature = "test-internals")]
+#[derive(Clone, Debug)]
+pub struct TcpTimerState {
+    pub rto_ns:       Option<u64>,
+    pub tlp_ns:       Option<u64>,
+    pub keepalive_ns: Option<u64>,
+    pub persist_ns:   Option<u64>,
+    pub pacing_ns:    Option<u64>,
+}
+
 impl BbrState {
     fn new(cfg: &TcpConfig) -> Self {
         let init_cwnd = cfg.initial_cwnd_pkts * cfg.mss as u32;
@@ -2704,6 +2716,19 @@ impl TcpSocket {
             self.pacing_next.remaining_ns(now_ns),
         ]
         .into_iter().flatten().min()
+    }
+
+    /// Snapshot of all TCP timer deadlines for test inspection.
+    #[cfg(feature = "test-internals")]
+    pub fn timer_state(&self) -> TcpTimerState {
+        let now = self.clock.monotonic_ns();
+        TcpTimerState {
+            rto_ns:       self.rto_deadline.remaining_ns(now),
+            tlp_ns:       self.tlp_deadline.remaining_ns(now),
+            keepalive_ns: self.keepalive_deadline.remaining_ns(now),
+            persist_ns:   self.persist_deadline.remaining_ns(now),
+            pacing_ns:    self.pacing_next.remaining_ns(now),
+        }
     }
 
     /// Absolute nanosecond timestamp of the earliest armed deadline
