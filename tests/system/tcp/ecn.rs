@@ -588,3 +588,34 @@ fn ece_persists_until_cwr() -> TestResult {
 
     Ok(())
 }
+
+// ── pure_ack_no_ect ───────────────────────────────────────────────────────
+//
+// RFC 3168 §6.1.4: Pure ACKs (no data) MUST NOT have ECT bits set, since
+// they cannot be dropped by ECN-capable routers.
+#[test]
+fn pure_ack_no_ect() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Send data from A so B generates pure ACKs.
+    pair.tcp_a_mut().send(b"hello-ecn")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let pure_acks: Vec<_> = cap.tcp().from_b()
+        .filter(|f| f.tcp.flags.has(TcpFlags::ACK) && f.payload_len == 0
+            && !f.tcp.flags.has(TcpFlags::SYN) && !f.tcp.flags.has(TcpFlags::FIN))
+        .collect();
+    assert_ok!(!pure_acks.is_empty(), "no pure ACKs from B — test would be vacuous");
+
+    for f in &pure_acks {
+        assert_ok!(
+            f.ip_ecn == etherparse::IpEcn::NotEct,
+            "pure ACK has ECN bits {:?}, expected NotEct (RFC 3168 §6.1.4)", f.ip_ecn
+        );
+    }
+
+    Ok(())
+}
