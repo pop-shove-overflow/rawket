@@ -1831,10 +1831,11 @@ impl TcpSocket {
     fn flush_send_buf(&mut self) {
         let now = self.clock.monotonic_ns();
         loop {
-            if self.state != State::Established && self.state != State::CloseWait { break; }
+            if self.state != State::Established && self.state != State::CloseWait {
+                self.pacing_next.disarm();
+                break;
+            }
             if self.send_buf.is_empty() {
-                // Nothing to pace — disarm so next_deadline_abs_ns() doesn't
-                // report a stale pacing deadline that can never fire.
                 self.pacing_next.disarm();
                 break;
             }
@@ -1848,9 +1849,6 @@ impl TcpSocket {
             let peer_wnd = (self.snd_wnd_raw as u32) << self.snd_scale;
             let wnd_limit = self.snd_una + peer_wnd;
             if peer_wnd == 0 || seq_ge(self.snd_nxt, wnd_limit) {
-                // Disarm pacing — an ACK must open the window before we
-                // can send; leaving an expired pacing deadline causes a
-                // busy-wait in poll loops.
                 self.pacing_next.disarm();
                 // Arm persist timer when blocked by zero window
                 if !self.persist_deadline.is_armed() && !self.send_buf.is_empty() {
@@ -1865,9 +1863,6 @@ impl TcpSocket {
             // cwnd gate (cwnd already bounded by BBRBoundCwndForModel)
             let bytes_in_flight = self.snd_nxt - self.snd_una;
             if bytes_in_flight >= self.bbr.cwnd {
-                // Disarm pacing — an ACK must open the window before we can
-                // send; leaving an expired pacing deadline causes a busy-wait
-                // in poll loops.
                 self.pacing_next.disarm();
                 break;
             }
