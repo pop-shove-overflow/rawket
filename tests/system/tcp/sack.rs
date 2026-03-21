@@ -715,3 +715,78 @@ fn multi_hole_retransmit_ordering() -> TestResult {
 
     Ok(())
 }
+
+// ── sack_renege_retransmits ──────────────────────────────────────────────────
+//
+// RFC 2018 §8: receiver MAY renege on previously SACKed data.  When a SACK
+// block disappears from subsequent ACKs without the cumulative ACK advancing
+// past it, the sender must treat the segment as unsacked.
+//
+// Scenario:
+//   1. Blackhole B→A.  A sends seg1+seg2.
+//   2. Inject SACK ACK to A: cumulative ack at seg1, SACK covering seg2.
+//   3. Verify sacked_count == 1.
+//   4. Inject reneging ACK: same cumulative ack, NO SACK blocks.
+//   5. Verify sacked_count == 0 (seg2 un-sacked by the renege).
+#[test]
+fn sack_renege_retransmits() -> TestResult {
+    use crate::packet::build_tcp_data_with_sack_ts;
+
+    let mut pair = setup_tcp_pair()
+        .rto_min_ms(10)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Seed BBR/SRTT.
+    pair.tcp_a_mut().send(b"init")?;
+    pair.transfer();
+    pair.clear_capture();
+
+    // Blackhole B→A so A never gets real ACKs.
+    pair.blackhole_to_a();
+
+    pair.tcp_a_mut().send(&[0xAAu8; 100])?;
+    pair.tcp_a_mut().send(&[0xBBu8; 100])?;
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let data_frames: Vec<_> = cap.all_tcp().from_a().with_data().collect();
+    assert_ok!(data_frames.len() >= 2, "expected ≥2 data frames, got {}", data_frames.len());
+    let seg2_seq = data_frames[1].tcp.seq;
+
+    let b_seq = pair.tcp_b().snd_nxt();
+    let a_snd_una = pair.tcp_a().snd_una();
+    pair.clear_impairments();
+
+    // Step 1: Inject SACK ACK — marks seg2 as sacked.
+    let sack_ack = build_tcp_data_with_sack_ts(
+        pair.mac_b, pair.mac_a, pair.ip_b, pair.ip_a,
+        80, 12345, b_seq, a_snd_una,
+        0, 0, // timestamps patched by inject_to_a
+        &[(seg2_seq, seg2_seq + 100)],
+        b"",
+    );
+    pair.inject_to_a(sack_ack);
+    pair.transfer_one();
+
+    assert_ok!(
+        pair.tcp_a().sacked_count() == 1,
+        "SACK ACK did not mark seg2 — sacked_count={}, expected 1",
+        pair.tcp_a().sacked_count()
+    );
+
+    // Step 2: Inject reneging ACK — plain ACK, no SACK blocks.
+    let renege_ack = crate::harness::b_to_a(&pair.net, b_seq, a_snd_una, b"");
+    pair.inject_to_a(renege_ack);
+    pair.transfer_one();
+
+    // The key assertion: after the reneging ACK, seg2 must no longer be sacked.
+    assert_ok!(
+        pair.tcp_a().sacked_count() == 0,
+        "sacked_count after reneging ACK is {} (expected 0) — \
+         sacked flag was not cleared when SACK block disappeared",
+        pair.tcp_a().sacked_count()
+    );
+
+    Ok(())
+}
