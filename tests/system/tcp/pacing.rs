@@ -751,3 +751,47 @@ fn pacing_deadline_gates_transmission() -> TestResult {
 
     Ok(())
 }
+
+// ── probe_rtt_cwnd_during_phase ──────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.3.4: during ProbeRTT, cwnd is reduced to
+// bdp_target (4 packets). Drive BBR until ProbeRTT entry, then verify
+// cwnd is capped.
+#[test]
+fn probe_rtt_cwnd_during_phase() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let mss = pair.tcp_a().peer_mss() as u32;
+    let mut saw_probe_rtt = false;
+    let mut probe_rtt_cwnd: u32 = 0;
+
+    pair.tcp_a_mut().send(&vec![0xEEu8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0xEEu8; 2_000]);
+        }
+        if p.tcp_a(0).bbr_phase() == BbrPhase::ProbeRtt {
+            saw_probe_rtt = true;
+            probe_rtt_cwnd = p.tcp_a(0).bbr_cwnd();
+            return false;
+        }
+        true
+    });
+
+    assert_ok!(saw_probe_rtt, "never entered ProbeRTT phase");
+
+    // BBRv3 §4.3.4.5: ProbeRTT cwnd = bdp_target = 4 * MSS.
+    let bdp_target = 4 * mss;
+    assert_ok!(
+        probe_rtt_cwnd <= bdp_target,
+        "ProbeRTT cwnd ({probe_rtt_cwnd}) exceeds bdp_target ({bdp_target} = 4 * MSS={mss})"
+    );
+    assert_ok!(
+        probe_rtt_cwnd > 0,
+        "ProbeRTT cwnd is 0 — should be capped at bdp_target, not zeroed"
+    );
+
+    Ok(())
+}
