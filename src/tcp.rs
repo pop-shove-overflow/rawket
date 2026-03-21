@@ -21,6 +21,9 @@ pub const CLOCK_GRANULARITY_NS: u64 = 1_000_000; // 1 ms
 /// RFC 8985 §7.4: worst-case delayed-ACK timer used in TLP PTO calculation.
 pub const WC_DEL_ACK_NS: u64 = 25_000_000; // 25 ms
 
+/// RFC 5961 §5: max challenge ACKs per second window.
+pub const CHALLENGE_ACK_LIMIT: u8 = 10;
+
 /// TCP control flags bitmask.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -1055,7 +1058,6 @@ impl TcpSocket {
 
     /// Challenge ACK with per-second rate limit (RFC 5961 §5).
     fn send_challenge_ack(&mut self) {
-        const CHALLENGE_ACK_LIMIT: u8 = 10;
         const CHALLENGE_ACK_WINDOW_NS: u64 = 1_000_000_000;
         let now = self.clock.monotonic_ns();
         if now.wrapping_sub(self.challenge_ack_epoch_ns) >= CHALLENGE_ACK_WINDOW_NS {
