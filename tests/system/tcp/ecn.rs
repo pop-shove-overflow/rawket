@@ -619,3 +619,43 @@ fn pure_ack_no_ect() -> TestResult {
 
     Ok(())
 }
+
+// ── retransmit_no_ect ────────────────────────────────────────────────────
+//
+// RFC 3168 §6.1.5: "ECN-capable TCP implementations MUST NOT set either
+// ECT codepoint in the IP header for retransmitted data packets."
+#[test]
+fn retransmit_no_ect() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Seed BBR so cwnd allows multiple segments.
+    pair.tcp_a_mut().send(&[0xAAu8; 5000])?;
+    pair.transfer();
+    pair.clear_capture();
+
+    // Drop the first data segment, send enough for SACK feedback.
+    pair.drop_next_data_to_b();
+    pair.tcp_a_mut().send(&[0xBBu8; 5000])?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let dropped = cap.all_tcp().from_a().dropped().with_data().next()
+        .ok_or_else(|| TestFail::new("no dropped segment — impairment didn't fire"))?;
+    let dropped_seq = dropped.tcp.seq;
+
+    // Find the retransmit of the dropped segment.
+    let retx = cap.all_tcp().from_a().delivered().with_data()
+        .find(|f| f.tcp.seq == dropped_seq)
+        .ok_or_else(|| TestFail::new("dropped segment was never retransmitted"))?;
+
+    // RFC 3168 §6.1.5: retransmitted packets MUST NOT carry ECT.
+    assert_ok!(
+        retx.ip_ecn == etherparse::IpEcn::NotEct,
+        "retransmit at seq={dropped_seq} has ECN bits {:?}, expected NotEct \
+         (RFC 3168 §6.1.5)", retx.ip_ecn
+    );
+
+    Ok(())
+}
