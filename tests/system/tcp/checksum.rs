@@ -277,3 +277,29 @@ fn udp_zero_checksum_accepted() -> TestResult {
 
     Ok(())
 }
+
+// ── tcp_valid_checksum_accepted ──────────────────────────────────────────────
+//
+// RFC 9293 §3.1: Positive control — a correctly-checksummed TCP segment MUST
+// be accepted when checksum validation is enabled (the default test config).
+#[test]
+fn tcp_valid_checksum_accepted() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let rcv_nxt_before = pair.tcp_b().rcv_nxt();
+
+    // make_data_frame builds a frame with correct checksums.
+    let frame = make_data_frame(&pair);
+    pair.inject_to_b(frame);
+    pair.transfer_one();
+
+    let rcv_nxt_after = pair.tcp_b().rcv_nxt();
+    assert_ok!(
+        rcv_nxt_after > rcv_nxt_before,
+        "B did not advance rcv_nxt after valid checksum segment (before={}, after={})",
+        rcv_nxt_before, rcv_nxt_after
+    );
+    Ok(())
+}
