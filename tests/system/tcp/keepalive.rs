@@ -519,3 +519,47 @@ fn keepalive_rst_response() -> TestResult {
 
     Ok(())
 }
+
+// ── keepalive_first_probe_timing ────────────────────────────────────────────
+//
+// RFC 1122 §4.2.3.6: keepalives are sent after an idle interval (default
+// not less than 2 hours).  This test uses keepalive_idle_ms=100 and verifies
+// the probe fires within that window.  The ±20% tolerance and 100ms setting
+// are implementation-specific; the RFC does not define this precision.
+#[test]
+fn keepalive_first_probe_timing() -> TestResult {
+    use rawket::bridge::LinkProfile;
+
+    let idle_ms: u64 = 100;
+    let mut pair = setup_tcp_pair()
+        .keepalive_idle_ms(idle_ms)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let snd_una = pair.tcp_a().snd_una();
+    pair.clear_capture();
+
+    let is_keepalive = |f: &crate::capture::ParsedFrame| -> bool {
+        f.tcp.seq == snd_una.wrapping_sub(1) && f.payload_len == 0
+            && f.tcp.flags.has(TcpFlags::ACK) && !f.tcp.flags.has(TcpFlags::SYN)
+    };
+
+    // Negative check: advance to 80% of idle — no probe should fire.
+    pair.advance_both((idle_ms * 80 / 100) as i64);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let premature = cap.tcp().direction(Dir::AtoB).any(|f| is_keepalive(&f));
+    assert_ok!(!premature, "keepalive probe fired at 80% of idle_ms — too early");
+
+    // Positive check: advance past the idle timeout — probe must fire.
+    pair.clear_capture();
+    pair.advance_both((idle_ms * 25 / 100) as i64);  // now at 105% of idle
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let fired = cap.tcp().direction(Dir::AtoB).any(|f| is_keepalive(&f));
+    assert_ok!(fired, "no keepalive probe at 105% of idle_ms ({idle_ms})");
+
+    Ok(())
+}
