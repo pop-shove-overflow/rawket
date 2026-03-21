@@ -486,3 +486,55 @@ fn dupack_during_zero_window() -> TestResult {
 
     Ok(())
 }
+
+// ── retransmit_on_exact_third_dupack ────────────────────────────────────────
+//
+// RFC 5681 §3.2: fast retransmit fires on the 3rd duplicate ACK, not before
+// and not after.  Inject DupACKs one at a time and verify: no retransmit
+// after 1 or 2, exactly 1 retransmit after the 3rd.
+#[test]
+fn retransmit_on_exact_third_dupack() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.blackhole_to_a();
+    pair.tcp_a_mut().send(b"exact-3rd")?;
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let data_frame = cap.all_tcp().from_a().with_data().next()
+        .ok_or_else(|| TestFail::new("no AtoB data"))?;
+    let a_snd_una = data_frame.tcp.seq;
+    let b_snd_nxt = data_frame.tcp.ack;
+    pair.clear_impairments();
+
+    // 1st DupACK — no retransmit.
+    pair.clear_capture();
+    pair.inject_to_a(b_to_a(&pair, b_snd_nxt, a_snd_una, b""));
+    pair.transfer_one();
+    let retx1 = pair.drain_captured().all_tcp().from_a().with_data()
+        .filter(|f| f.tcp.seq == a_snd_una).count();
+    assert_ok!(retx1 == 0, "retransmit after 1 DupACK ({retx1} frames)");
+
+    // 2nd DupACK — no retransmit.
+    pair.clear_capture();
+    pair.inject_to_a(b_to_a(&pair, b_snd_nxt, a_snd_una, b""));
+    pair.transfer_one();
+    let retx2 = pair.drain_captured().all_tcp().from_a().with_data()
+        .filter(|f| f.tcp.seq == a_snd_una).count();
+    assert_ok!(retx2 == 0, "retransmit after 2 DupACKs ({retx2} frames)");
+
+    // 3rd DupACK — fast retransmit fires.
+    pair.clear_capture();
+    pair.inject_to_a(b_to_a(&pair, b_snd_nxt, a_snd_una, b""));
+    pair.transfer_one();
+    let retx3 = pair.drain_captured().all_tcp().from_a().with_data()
+        .filter(|f| f.tcp.seq == a_snd_una).count();
+    assert_ok!(
+        retx3 == 1,
+        "expected exactly 1 retransmit on 3rd DupACK, got {retx3}"
+    );
+
+    Ok(())
+}
