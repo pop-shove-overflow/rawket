@@ -519,3 +519,84 @@ fn asymmetric_window_scale() -> TestResult {
 
     Ok(())
 }
+
+// ── syn_to_data_window_transition ───────────────────────────────────────────
+//
+// RFC 7323 §2.4 (SYN Unscaled): The window field in a SYN is NOT scaled
+// (WS applies only to non-SYN segments).  Verify that B's SYN-ACK window
+// is unscaled, then B's first data/ACK after handshake uses the scaled
+// window.
+#[test]
+fn syn_to_data_window_transition() -> TestResult {
+    use rawket::bridge::LinkProfile;
+
+    let (mut pair, cap) = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect_and_capture();
+
+    // SYN-ACK window must be unscaled (raw value represents actual bytes).
+    let syn_ack = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::SYN)
+        .with_tcp_flags(TcpFlags::ACK)
+        .next()
+        .ok_or_else(|| TestFail::new("no SYN-ACK from B"))?;
+    let syn_ack_window_raw = syn_ack.tcp.window_raw;
+
+    let rcv_scale = pair.tcp_b().rcv_scale();
+    assert_ok!(rcv_scale > 0, "rcv_scale is 0 — no scaling to verify");
+    let recv_buf_max = pair.tcp_cfg.recv_buf_max as u32;
+
+    // 1. SYN-ACK window is UNSCALED: raw value == actual headroom (no shift).
+    //    Headroom at SYN-ACK time is recv_buf_max (no data received yet).
+    //    The u16 window field caps at 65535, so the unscaled value is
+    //    min(recv_buf_max, 65535).
+    let syn_expected = recv_buf_max.min(65535) as u16;
+    assert_ok!(
+        syn_ack_window_raw == syn_expected,
+        "SYN-ACK window_raw ({syn_ack_window_raw}) != unscaled headroom ({syn_expected}) — \
+         SYN window should NOT be scaled"
+    );
+
+    // 2. Send data from A to elicit a non-SYN ACK from B.
+    pair.tcp_a_mut().send(b"window-transition-test")?;
+    // Drive until A's data is acked (snd_una catches up to snd_nxt).
+    let snd_nxt = pair.tcp_a().snd_nxt();
+    pair.transfer_while(|p| p.tcp_a(0).snd_una() != snd_nxt);
+
+    let cap2 = pair.drain_captured();
+    let data_ack = cap2.tcp().from_b()
+        .with_tcp_flags(TcpFlags::ACK)
+        .without_tcp_flags(TcpFlags::SYN)
+        .next()
+        .ok_or_else(|| TestFail::new("no non-SYN ACK from B"))?;
+    let data_window_raw = data_ack.tcp.window_raw;
+
+    // 3. Non-SYN ACK window is SCALED: raw = headroom >> rcv_scale.
+    //    At ACK time, recv_buf holds the 21-byte payload (not yet drained).
+    let payload_len = b"window-transition-test".len() as u32;
+    let headroom = recv_buf_max - payload_len;
+    let expected_raw = (headroom >> rcv_scale) as u16;
+    assert_ok!(
+        data_window_raw == expected_raw,
+        "data ACK window_raw ({data_window_raw}) != headroom >> scale \
+         ({expected_raw} = ({recv_buf_max} - {payload_len}) >> {rcv_scale})"
+    );
+
+    // 4. Reconstructed effective window matches actual headroom.
+    let data_window_effective = (data_window_raw as u32) << rcv_scale;
+    assert_ok!(
+        data_window_effective == (expected_raw as u32) << rcv_scale,
+        "reconstructed window ({data_window_effective}) != expected"
+    );
+
+    // 5. Negative proof: SYN and non-SYN raw values MUST differ.
+    //    If both were scaled or both unscaled, they'd be the same (modulo
+    //    the small payload-induced headroom change).
+    assert_ok!(
+        syn_ack_window_raw != data_window_raw,
+        "SYN-ACK and data ACK have identical window_raw ({syn_ack_window_raw}) — \
+         cannot distinguish scaled from unscaled encoding"
+    );
+
+    Ok(())
+}
