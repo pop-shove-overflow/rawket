@@ -442,3 +442,80 @@ fn timestamps_after_negotiation() -> TestResult {
 
     Ok(())
 }
+
+// ── asymmetric_window_scale ─────────────────────────────────────────────────
+//
+// RFC 7323 §2.2 (WS Negotiation): Each direction may use a different window
+// scale factor.  Inject a SYN with WS=2 to B (which advertises
+// WS=LOCAL_WS_SHIFT=4).  Verify B uses snd_scale=2 and rcv_scale=4.
+#[test]
+fn asymmetric_window_scale() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    use std::net::Ipv4Addr;
+    use rawket::filter;
+    use rawket::bridge::{Impairment, PacketSpec};
+
+    let mut np = setup_network_pair().profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    let server = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {}, cfg,
+    )?;
+    np.add_tcp_b(server);
+
+    // Drop RSTs from A (no A-side socket).
+    np.add_impairment_to_b(Impairment::Drop(PacketSpec::matching(filter::tcp::rst())));
+
+    // Inject SYN with WS=2 (asymmetric: peer=2, local=4).
+    let isn_a = 0x4000_0000u32;
+    let syn = build_tcp_syn(
+        np.mac_a, np.mac_b,
+        np.ip_a, np.ip_b,
+        12345, 80,
+        isn_a, 0,
+        0x02,
+        Some(1460),
+        Some(2),    // WS=2 (different from B's LOCAL_WS_SHIFT=4)
+        None, false,
+    );
+    np.inject_to_b(syn);
+    np.transfer_one();
+
+    let cap = np.drain_captured();
+    let syn_ack = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::SYN)
+        .with_tcp_flags(TcpFlags::ACK)
+        .next()
+        .ok_or_else(|| TestFail::new("no SYN-ACK from B"))?;
+
+    // B's SYN-ACK must advertise its own WS (LOCAL_WS_SHIFT=4).
+    assert_window_scale(&syn_ack, LOCAL_WS_SHIFT, "SYN-ACK WS")?;
+
+    // Complete handshake.
+    let ack = build_tcp_data(
+        np.mac_a, np.mac_b,
+        np.ip_a, np.ip_b,
+        12345, 80,
+        isn_a + 1,
+        syn_ack.tcp.seq + 1,
+        &[],
+    );
+    np.inject_to_b(ack);
+    np.transfer_one();
+
+    assert_state(np.tcp_b(0), State::Established, "B Established after asymmetric WS handshake")?;
+
+    // RFC 7323 §2.2: snd_scale = peer's WS (2), rcv_scale = own WS (4).
+    assert_ok!(
+        np.tcp_b(0).snd_scale() == 2,
+        "snd_scale={} — expected 2 (peer's WS)", np.tcp_b(0).snd_scale()
+    );
+    assert_ok!(
+        np.tcp_b(0).rcv_scale() == LOCAL_WS_SHIFT,
+        "rcv_scale={} — expected {} (own WS)", np.tcp_b(0).rcv_scale(), LOCAL_WS_SHIFT
+    );
+
+    Ok(())
+}
