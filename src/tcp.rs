@@ -1569,11 +1569,19 @@ impl TcpSocket {
     /// Mark unacked segments covered by SACK blocks and update RACK state.
     fn mark_sack_blocks(&mut self, opts: &ParsedOpts) {
         let now = self.clock.monotonic_ns();
+        // RFC 2018 §3: receiver MAY renege on previously SACKed data.
+        // Rebuild sacked state from scratch on each ACK so that reneged
+        // segments become eligible for retransmission.  This applies even
+        // when sack_count == 0: if SACK was negotiated but the ACK carries
+        // no SACK blocks, all previously-SACKed segments are reneged.
+        for seg in &mut self.unacked {
+            seg.sacked = false;
+        }
         for k in 0..opts.sack_count as usize {
             if let Some((left, right)) = opts.sack_blocks[k] {
                 let (left, right) = (SeqNum::new(left), SeqNum::new(right));
                 for seg in &mut self.unacked {
-                    if !seg.sacked && seq_ge(seg.seq, left) && seq_le(seg.end_seq, right) {
+                    if seq_ge(seg.seq, left) && seq_le(seg.end_seq, right) {
                         seg.sacked = true;
                         if seq_gt(seg.end_seq, self.rack_end_seq) {
                             self.rack_end_seq = seg.end_seq;
@@ -1720,8 +1728,7 @@ impl TcpSocket {
             }
         }
 
-        // 2. Mark SACK-covered segments (may already have been called from
-        //    the Established handler, but idempotent — sacked=true is sticky).
+        // 2. Rebuild SACK scoreboard from this ACK's blocks (handles reneging).
         self.mark_sack_blocks(opts);
 
         // 3. Advance snd_una
