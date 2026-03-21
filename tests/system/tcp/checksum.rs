@@ -241,3 +241,39 @@ fn udp_checksum_accepted_when_disabled() -> TestResult {
 
     Ok(())
 }
+
+// ── udp_zero_checksum_accepted ──────────────────────────────────────────────
+//
+// RFC 768: UDP checksum 0x0000 means "no checksum computed" and MUST be
+// accepted even when checksum validation is enabled.
+#[test]
+fn udp_zero_checksum_accepted() -> TestResult {
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+
+    let mut frame = build_udp_data(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 9999,
+        b"zero-cksum",
+    );
+    // Set UDP checksum to 0x0000 (no checksum).
+    frame[UDP_CSUM_BYTE] = 0;
+    frame[UDP_CSUM_BYTE + 1] = 0;
+
+    np.inject_to_b(frame);
+    np.transfer_one();
+
+    // Port 9999 is closed, so the frame should be accepted and trigger
+    // ICMP Port Unreachable — proving it was NOT dropped by checksum validation.
+    let cap = np.drain_captured();
+    let icmp_sent = cap.raw().any(|f| {
+        f.raw.len() > 37 && f.raw[12] == 0x08 && f.raw[13] == 0x00 && f.raw[23] == 1
+    });
+    assert_ok!(
+        icmp_sent,
+        "UDP frame with checksum 0x0000 was dropped — RFC 768 requires acceptance"
+    );
+
+    Ok(())
+}
