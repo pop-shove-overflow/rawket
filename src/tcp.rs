@@ -3057,6 +3057,8 @@ impl TcpSocket {
     pub fn bbr_delivered(&self) -> u64 { self.bbr.delivered }
     pub fn bbr_next_round_delivered(&self) -> u64 { self.bbr.next_round_delivered }
     pub fn unacked_len(&self) -> usize { self.unacked.len() }
+    #[cfg(feature = "test-internals")]
+    pub fn sacked_count(&self) -> usize { self.unacked.iter().filter(|s| s.sacked).count() }
     pub fn rcv_scale(&self) -> u8 { self.rcv_scale }
     pub fn snd_scale(&self) -> u8 { self.snd_scale }
     pub fn ts_recent(&self) -> u32 { self.ts_recent }
