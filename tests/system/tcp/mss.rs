@@ -705,3 +705,82 @@ fn mss_segmentation_boundaries() -> TestResult {
 
     Ok(())
 }
+
+// ── pmtud_retransmit_at_reduced_mss ─────────────────────────────────────────
+//
+// RFC 1191 §6.4 (TCP Layer Actions): "The datagram size used in the
+// retransmission should, of course, be no larger than the new PMTU."
+#[test]
+fn pmtud_retransmit_at_reduced_mss() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .rto_min_ms(10)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Seed SRTT so RTO is bounded.
+    pair.tcp_a_mut().send(b"warmup")?;
+    pair.transfer();
+
+    // Blackhole B→A so subsequent data stays in-flight (unacked).
+    pair.blackhole_to_a();
+    pair.clear_capture();
+
+    // Send a large chunk — segmented at original MSS (1460), stays in-flight.
+    pair.tcp_a_mut().send(&vec![0xEEu8; 5000])?;
+    pair.transfer_one();
+
+    // Capture one of the original full-MSS frames for the ICMP payload.
+    let orig_frame = pair.drain_captured().raw()
+        .find(|f| f.dir == Dir::AtoB && !f.was_dropped)
+        .map(|f| f.raw.clone())
+        .ok_or_else(|| crate::assert::TestFail::new("no AtoB data frame"))?;
+
+    // Inject ICMP Frag Needed with MTU=576 → new MSS=536.
+    // Data is still in-flight at the original MSS.
+    let icmp = build_icmp_frag_needed(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        576,
+        &orig_frame,
+    );
+    pair.inject_to_a(icmp);
+    pair.transfer_one();
+
+    let ts_overhead = if pair.tcp_a().ts_enabled() { 12 } else { 0 };
+    let reduced_mss = 536 - ts_overhead;
+
+    // Verify PMTU was applied.
+    assert_ok!(
+        pair.tcp_a().peer_mss() == 536,
+        "peer_mss not reduced: {}", pair.tcp_a().peer_mss()
+    );
+
+    pair.clear_capture();
+    let t_after_icmp = pair.clock_a.monotonic_ns();
+
+    // Let RTO fire → retransmit of the in-flight data at reduced MSS.
+    for _ in 0..5 {
+        let rto = pair.tcp_a().rto_ms().max(10);
+        pair.advance_both(rto as i64 + 5);
+        pair.transfer_one();
+    }
+
+    // All segments SENT after ICMP must use reduced MSS.
+    // Filter by ts_ns > t_after_icmp to exclude bridge deliveries of pre-ICMP data.
+    let cap = pair.drain_captured();
+    let post_icmp: Vec<usize> = cap.all_tcp().from_a().with_data()
+        .filter(|f| f.ts_ns > t_after_icmp)
+        .map(|f| f.payload_len)
+        .collect();
+    let oversized = post_icmp.iter().filter(|&&s| s > reduced_mss).count();
+    assert_ok!(
+        oversized == 0,
+        "{oversized} retransmitted segment(s) exceed reduced MSS ({reduced_mss}) \
+         after PMTUD reduction to MTU=576. sizes={post_icmp:?}"
+    );
+
+    assert_ok!(!post_icmp.is_empty(), "no retransmitted segments — test may be vacuous");
+
+    Ok(())
+}
