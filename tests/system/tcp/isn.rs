@@ -203,3 +203,56 @@ fn syn_collision_ack_numbers() -> TestResult {
 
     Ok(())
 }
+
+// ── isn_unpredictable_across_flows ───────────────────────────────────────────
+//
+// Implementation test: our getrandom(2)-based ISN generation produces
+// uncorrelated ISNs across flows.  RFC 6528 §3 proposes ISN = timer +
+// PRF(connection-id), which could produce correlated timer increments
+// across rapid connections.  This test validates our stronger (pure random)
+// choice by checking consecutive ISN diffs are not constant.
+#[test]
+fn isn_unpredictable_across_flows() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+    let mut isns: Vec<u32> = Vec::new();
+
+    for i in 0..10u16 {
+        let src_port = 30000 + i;
+        let client = TcpSocket::connect_now(
+            np.iface_a(),
+            format!("10.0.0.1:{src_port}").parse().unwrap(),
+            "10.0.0.2:80".parse().unwrap(),
+            Ipv4Addr::from([10, 0, 0, 2]),
+            |_| {}, |_| {},
+            cfg.clone(),
+        ).expect("connect_now");
+        np.add_tcp_a(client);
+
+        let cap = np.drain_captured();
+        let isn = cap.tcp()
+            .direction(Dir::AtoB)
+            .with_tcp_flags(TcpFlags::SYN)
+            .without_tcp_flags(TcpFlags::ACK)
+            .next()
+            .map(|f| f.tcp.seq)
+            .expect("no SYN found");
+        isns.push(isn);
+    }
+
+    // Consecutive differences must not all be equal (would indicate a
+    // simple counter-based ISN generator).
+    let diffs: Vec<u32> = isns.windows(2)
+        .map(|w| w[1].wrapping_sub(w[0]))
+        .collect();
+    let all_same = diffs.windows(2).all(|w| w[0] == w[1]);
+    assert_ok!(
+        !all_same,
+        "ISN differences are all identical ({}) — ISNs are predictable: {:?}",
+        diffs[0], isns
+    );
+
+    Ok(())
+}
