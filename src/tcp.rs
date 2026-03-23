@@ -59,19 +59,21 @@ impl core::ops::BitAnd for TcpFlags {
     fn bitand(self, r: Self) -> Self { Self(self.0 & r.0) }
 }
 
-/// A fixed-point multiplier stored as × 100.
+/// A fixed-point multiplier with configurable scale.
 ///
-/// `ScaledFloat::new(125)` represents 1.25.
-/// Use [`apply`] to multiply a `u64` by this factor.
-#[repr(transparent)]
+/// `ScaledFloat::new(125)` represents 1.25 (×100 default).
+/// `ScaledFloat::x1000(347)` represents 0.347 (×1000 for higher precision).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct ScaledFloat(u32);
+struct ScaledFloat { val: u32, scale: u32 }
 
 impl ScaledFloat {
-    pub const fn new(x100: u32) -> Self { Self(x100) }
-    /// Returns `v × self / 100`.
+    /// ×100 precision (default). `new(125)` = 1.25.
+    pub const fn new(x100: u32) -> Self { Self { val: x100, scale: 100 } }
+    /// ×1000 precision. `x1000(347)` = 0.347.
+    pub const fn x1000(x1000: u32) -> Self { Self { val: x1000, scale: 1000 } }
+    /// Returns `v × self.val / self.scale`.
     #[inline]
-    pub fn apply(self, v: u64) -> u64 { v * self.0 as u64 / 100 }
+    pub fn apply(self, v: u64) -> u64 { v * self.val as u64 / self.scale as u64 }
 }
 
 /// A TCP sequence or acknowledgment number with RFC 793 wrapping arithmetic.
@@ -1086,7 +1088,7 @@ impl TcpSocket {
     fn bbr_gains(&self) -> (ScaledFloat, ScaledFloat) {
         match self.bbr.phase {
             BbrPhase::Startup      => (ScaledFloat::new(289), ScaledFloat::new(200)),
-            BbrPhase::Drain        => (ScaledFloat::new(35),  ScaledFloat::new(200)),
+            BbrPhase::Drain        => (ScaledFloat::x1000(347), ScaledFloat::new(200)),
             BbrPhase::ProbeBwDown  => (ScaledFloat::new(90),  ScaledFloat::new(200)),
             BbrPhase::ProbeBwCruise=> (ScaledFloat::new(100), ScaledFloat::new(200)),
             BbrPhase::ProbeBwRefill=> (ScaledFloat::new(100), ScaledFloat::new(200)),
