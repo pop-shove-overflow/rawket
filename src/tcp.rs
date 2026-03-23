@@ -112,8 +112,6 @@ impl core::ops::Sub<SeqNum> for SeqNum {
 /// Applications that never call `recv()` will see the window close to zero —
 /// this is correct flow-control behaviour, not a memory leak.
 /// Window scale lets us advertise up to 1 MiB (16 × 65535) to the peer.
-const RECV_BUF_MAX: u32 = 1 << 20; // 1 MiB
-
 /// Window scale shift we advertise (RFC 1323 §2).  With shift=4 one window
 /// unit represents 16 bytes, giving a max window of 16 × 65535 ≈ 1 MiB.
 const LOCAL_WS_SHIFT: u8 = 4;
@@ -156,6 +154,11 @@ pub struct TcpConfig {
     /// [`TcpSocket::send`] that would exceed this limit return
     /// [`Error::WouldBlock`].  Default: 1 MiB.
     pub send_buf_max:              usize,
+    /// Maximum bytes that may be buffered in the receive buffer.  Incoming
+    /// segments that would exceed this limit are silently dropped (ACK for
+    /// rcv_nxt is still sent).  Also drives rcv_wnd advertisement.
+    /// Default: 1 MiB.
+    pub recv_buf_max:              usize,
     /// Maximum out-of-order segments buffered per connection before
     /// discarding.  SACK blocks are emitted for at most 4 OOO segments
     /// regardless of this value.  Default: 8.
@@ -180,6 +183,7 @@ impl Default for TcpConfig {
             keepalive_interval_ms:     75_000,
             keepalive_count:           9,
             send_buf_max:              1 << 20, // 1 MiB
+            recv_buf_max:              1 << 20, // 1 MiB
             rx_ooo_max:                8,
             time_wait_ms:              120_000,
         }
@@ -1018,7 +1022,7 @@ impl TcpSocket {
         buf[13] = flags.0;
         // Advertise how much receive buffer space we have, scaled by rcv_scale.
         // Cap at u16::MAX; if rcv_scale is 0 (not negotiated) this is bytes-exact.
-        let recv_headroom = RECV_BUF_MAX.saturating_sub(self.recv_buf.len() as u32);
+        let recv_headroom = (self.cfg.recv_buf_max as u32).saturating_sub(self.recv_buf.len() as u32);
         let adv_window    = (recv_headroom >> self.rcv_scale).min(u16::MAX as u32) as u16;
         buf[14..16].copy_from_slice(&adv_window.to_be_bytes());
         buf[16..18].copy_from_slice(&[0, 0]); // checksum placeholder
@@ -2054,7 +2058,7 @@ impl TcpSocket {
                 return Ok(());
             }
             // Validate RST is within receive window (use actual advertised window).
-            let rcv_wnd   = RECV_BUF_MAX.saturating_sub(self.recv_buf.len() as u32);
+            let rcv_wnd   = (self.cfg.recv_buf_max as u32).saturating_sub(self.recv_buf.len() as u32);
             let in_window = seq_ge(seg.seq, self.rcv_nxt)
                 && seq_lt(seg.seq, self.rcv_nxt + rcv_wnd);
             if in_window {
@@ -2215,7 +2219,7 @@ impl TcpSocket {
                 // RFC 793 §3.3: a segment that starts before rcv_nxt but
                 // extends past it carries new data and must be accepted
                 // (the overlap is trimmed later, at the delivery path).
-                let rcv_wnd   = RECV_BUF_MAX.saturating_sub(self.recv_buf.len() as u32);
+                let rcv_wnd   = (self.cfg.recv_buf_max as u32).saturating_sub(self.recv_buf.len() as u32);
                 let payload_start_wc = seg.hdr_len().min(tcp_buf.len());
                 let seg_end   = seg.seq + (tcp_buf.len() - payload_start_wc) as u32;
                 let in_window = (seq_ge(seg.seq, self.rcv_nxt)
@@ -2389,7 +2393,11 @@ impl TcpSocket {
                 };
 
                 if seg_seq == self.rcv_nxt {
-                    // In-order segment
+                    // In-order segment — drop if recv_buf would overflow.
+                    if self.recv_buf.len() + pdu.len() > self.cfg.recv_buf_max {
+                        let _ = self.send_ctrl(TcpFlags::ACK);
+                        return Ok(());
+                    }
                     self.rcv_nxt += pdu.len() as u32;
                     self.recv_buf.extend_from_slice(pdu);
                     if has_fin {
@@ -2521,6 +2529,10 @@ impl TcpSocket {
 
                 // Deliver in-order payload data (half-close: peer may still send).
                 if !pdu.is_empty() && seg.seq == self.rcv_nxt {
+                    if self.recv_buf.len() + pdu.len() > self.cfg.recv_buf_max {
+                        let _ = self.send_ctrl(TcpFlags::ACK);
+                        return Ok(());
+                    }
                     self.rcv_nxt += pdu.len() as u32;
                     self.recv_buf.extend_from_slice(pdu);
                     let on_recv = self.on_recv;
@@ -2566,6 +2578,10 @@ impl TcpSocket {
 
                 // Deliver in-order payload data (peer's send direction is open).
                 if !pdu.is_empty() && seg.seq == self.rcv_nxt {
+                    if self.recv_buf.len() + pdu.len() > self.cfg.recv_buf_max {
+                        let _ = self.send_ctrl(TcpFlags::ACK);
+                        return Ok(());
+                    }
                     self.rcv_nxt += pdu.len() as u32;
                     self.recv_buf.extend_from_slice(pdu);
                     let on_recv = self.on_recv;

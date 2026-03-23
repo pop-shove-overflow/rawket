@@ -140,6 +140,11 @@ typedef struct {
      */
     size_t   tcp_send_buf_max;
 
+    /** Maximum bytes in the TCP receive buffer.  Incoming segments that
+     *  would exceed this limit are silently dropped.  Default: 1 MiB.
+     */
+    size_t   tcp_recv_buf_max;
+
     /**
      * Maximum out-of-order segments buffered per TCP connection.
      *

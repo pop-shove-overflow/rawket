@@ -71,6 +71,8 @@ pub struct RawketNetworkConfig {
     pub tcp_keepalive_count:           u8,
     /// Maximum bytes buffered in the TCP send buffer.  Default: 1 MiB.
     pub tcp_send_buf_max:              libc::size_t,
+    /// Maximum bytes buffered in the TCP receive buffer.  Default: 1 MiB.
+    pub tcp_recv_buf_max:              libc::size_t,
     /// Maximum out-of-order segments buffered per TCP connection.
     /// Segments beyond this limit are dropped; at most 4 SACK blocks are
     /// emitted regardless of this value.  Default: 8.
@@ -108,6 +110,7 @@ pub extern "C" fn rawket_network_config_default() -> RawketNetworkConfig {
         tcp_keepalive_interval_ms:     c.tcp_keepalive_interval_ms,
         tcp_keepalive_count:           c.tcp_keepalive_count,
         tcp_send_buf_max:              c.tcp_send_buf_max,
+        tcp_recv_buf_max:              c.tcp_recv_buf_max,
         tcp_rx_ooo_max:                c.tcp_rx_ooo_max,
         checksum_validate_ip:          c.checksum_validate_ip,
         checksum_validate_tcp:         c.checksum_validate_tcp,
@@ -173,6 +176,7 @@ impl From<RawketNetworkConfig> for NetworkConfig {
             tcp_keepalive_interval_ms:     c.tcp_keepalive_interval_ms,
             tcp_keepalive_count:           c.tcp_keepalive_count,
             tcp_send_buf_max:              c.tcp_send_buf_max,
+            tcp_recv_buf_max:              c.tcp_recv_buf_max,
             tcp_rx_ooo_max:                c.tcp_rx_ooo_max,
             tcp_time_wait_ms:              120_000,
             checksum_validate_ip:          c.checksum_validate_ip,

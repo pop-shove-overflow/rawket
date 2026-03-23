@@ -104,6 +104,10 @@ pub struct NetworkConfig {
     /// Default: 1 MiB.
     pub tcp_send_buf_max: usize,
 
+    /// Maximum bytes in the TCP receive buffer before dropping segments.
+    /// Default: 1 MiB.
+    pub tcp_recv_buf_max: usize,
+
     /// Maximum out-of-order TCP segments buffered per connection.  Segments
     /// beyond this limit are dropped; the sender must retransmit them.  At
     /// most 4 SACK blocks are emitted regardless of this value.  Default: 8.
@@ -151,6 +155,7 @@ impl Default for NetworkConfig {
             tcp_keepalive_interval_ms:     75_000,
             tcp_keepalive_count:           9,
             tcp_send_buf_max:              1 << 20,
+            tcp_recv_buf_max:              1 << 20,
             tcp_rx_ooo_max:                8,
             tcp_time_wait_ms:              120_000,
             checksum_validate_ip:          false,
@@ -176,6 +181,7 @@ impl NetworkConfig {
             keepalive_interval_ms:     self.tcp_keepalive_interval_ms,
             keepalive_count:           self.tcp_keepalive_count,
             send_buf_max:              self.tcp_send_buf_max,
+            recv_buf_max:              self.tcp_recv_buf_max,
             rx_ooo_max:                self.tcp_rx_ooo_max,
             time_wait_ms:              self.tcp_time_wait_ms,
         }
