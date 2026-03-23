@@ -2790,6 +2790,11 @@ impl TcpSocket {
                 let opts: &[u8] = if self.ts_enabled { ts = self.ts_opt(); &ts } else { &[] };
                 let _ = self.send_segment(seq, TcpFlags::PSH | TcpFlags::ACK, &probe, opts);
             }
+            // RFC 8985 §7.3: after sending a TLP probe, re-arm RTO from now
+            // to prevent RTO from firing in the same poll cycle (double-send).
+            if self.rto_deadline.is_armed() {
+                self.rto_deadline.arm_from_now_ns(self.rto_ns, now);
+            }
         }
 
         // ── RTO / TIME_WAIT ──
