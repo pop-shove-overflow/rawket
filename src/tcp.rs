@@ -995,6 +995,17 @@ impl TcpSocket {
     fn send_segment(&mut self, seq: SeqNum, mut flags: TcpFlags, payload: &[u8], opts: &[u8]) -> Result<()> {
         debug_assert!(opts.len().is_multiple_of(4));
 
+        // RFC 1191 §6.4: clamp payload to effective MSS.  PMTUD may have
+        // reduced peer_mss since the segment was originally sent.  SYN
+        // segments are excluded (no data, option-only).
+        let payload = if !flags.has(TcpFlags::SYN) && !payload.is_empty() {
+            let ts_overhead = if self.ts_enabled { 12 } else { 0 };
+            let eff_mss = (self.peer_mss as usize).saturating_sub(ts_overhead);
+            &payload[..payload.len().min(eff_mss)]
+        } else {
+            payload
+        };
+
         // ECN flag injection (RFC 3168):
         // • ECE on ACK-only segments when we received a CE-marked IP datagram.
         // • CWR on the next data segment after we received an ECE-bearing ACK.
