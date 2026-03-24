@@ -35,13 +35,14 @@ fn setup_zero_window(
     };
     let a_snd_una = a_first_seq + 1; // after "x" is ACKed
 
-    // Build zero-window ACK.
-    let mut zw = build_tcp_data(
+    // Build zero-window ACK with timestamps (required by PAWS guard).
+    let mut zw = crate::packet::build_tcp_data_with_ts(
         pair.mac_b, pair.mac_a,
         pair.ip_b,  pair.ip_a,
         80, 12345,
         b_snd_nxt,
         a_snd_una,
+        0, 0, // patched by inject_to_a
         b"",
     );
     zw[48] = 0; zw[49] = 0; // zero window
@@ -510,6 +511,67 @@ fn persist_timer_caps_at_rto_max() -> TestResult {
     // At least one gap must be near rto_max (within 20%) to confirm we reached the cap.
     let near_cap = gaps.iter().any(|&g| g >= rto_max * 8 / 10);
     assert_ok!(near_cap, "no gap near rto_max_ms ({rto_max}) — backoff may not have reached cap. gaps: {gaps:?}");
+
+    Ok(())
+}
+
+// ── persist_fires_in_close_wait ─────────────────────────────────────────────
+//
+// RFC 9293 §3.8.6.1: persist probes must fire when the sender has data and
+// the peer window is zero, regardless of state.  In CloseWait the peer has
+// closed but we may still send data.
+#[test]
+fn persist_fires_in_close_wait() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // B closes → A enters CloseWait.
+    pair.tcp_b_mut().close()?;
+    pair.transfer_while(|p| p.tcp_a(0).state != State::CloseWait);
+    assert_state(pair.tcp_a(), State::CloseWait, "A CloseWait")?;
+
+    // Inject zero-window ACK directly (B is Closed, can't send normally).
+    let a_snd_una = pair.tcp_a().snd_una();
+    let a_rcv_nxt = pair.tcp_a().rcv_nxt();
+    let mut zw = crate::packet::build_tcp_data_with_ts(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        a_rcv_nxt, a_snd_una,
+        0, 0,
+        b"",
+    );
+    zw[48] = 0; zw[49] = 0; // zero window
+    recompute_frame_tcp_checksum(&mut zw);
+    pair.inject_to_a(zw);
+    pair.transfer_one();
+    pair.advance_both(1000);
+
+    assert_ok!(
+        pair.tcp_a().snd_wnd() == 0,
+        "snd_wnd not zero after ZW inject: {}", pair.tcp_a().snd_wnd()
+    );
+
+    // A sends data — blocked by zero window.
+    pair.tcp_a_mut().send(b"close-wait-persist")?;
+    pair.clear_capture();
+
+    // Advance enough for persist to fire.
+    for _ in 0..5 {
+        let rto = pair.tcp_a().rto_ms().max(10);
+        pair.advance_both(rto as i64 + 5);
+        pair.transfer_one();
+    }
+
+    let cap = pair.drain_captured();
+    let probes = cap.all_tcp().direction(Dir::AtoB)
+        .filter(|f| f.payload_len == 1)
+        .count();
+    assert_ok!(probes >= 1, "no persist probes in CloseWait ({probes} found)");
+
+    assert_state(pair.tcp_a(), State::CloseWait, "A should remain CloseWait during persist")?;
 
     Ok(())
 }
