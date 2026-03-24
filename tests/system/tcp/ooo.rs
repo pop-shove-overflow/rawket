@@ -1,6 +1,6 @@
 use rawket::tcp::{State, TcpFlags};
 use crate::{
-    assert::TestFail,
+    assert::{assert_state, TestFail},
     assert_ok,
     capture::{Dir, ParsedFrameExt},
     harness::{a_to_b, setup_tcp_pair},
@@ -566,6 +566,51 @@ fn fin_piggybacked_on_ooo_data() -> TestResult {
     assert_ok!(
         b_state == State::CloseWait,
         "B expected CloseWait after draining OOO data+FIN, got {b_state:?}"
+    );
+
+    Ok(())
+}
+
+// ── ooo_in_fin_wait2 ────────────────────────────────────────────────────────
+//
+// RFC 9293 §3.6: data received in FinWait2 must be delivered with the same
+// reassembly rules as Established (OOO buffering, gap fill, cumulative ACK).
+#[test]
+fn ooo_in_fin_wait2() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // A closes → FinWait2 after B ACKs FIN.
+    pair.tcp_a_mut().close()?;
+    pair.transfer();
+    assert_state(pair.tcp_a(), State::FinWait2, "A FinWait2")?;
+
+    let a_rcv_nxt = pair.tcp_a().rcv_nxt();
+    let a_snd_nxt = pair.tcp_a().snd_nxt();
+
+    // Inject OOO segment from B: seq at A's rcv_nxt+1 (gap at rcv_nxt).
+    let ooo = crate::harness::b_to_a(&pair, a_rcv_nxt + 1, a_snd_nxt, b"B");
+    pair.inject_to_a(ooo);
+    pair.transfer_one();
+
+    // rcv_nxt should NOT advance (OOO buffered).
+    assert_ok!(
+        pair.tcp_a().rcv_nxt() == a_rcv_nxt,
+        "rcv_nxt advanced on OOO segment in FinWait2"
+    );
+
+    // Fill the gap: seq at A's rcv_nxt.
+    let fill = crate::harness::b_to_a(&pair, a_rcv_nxt, a_snd_nxt, b"A");
+    pair.inject_to_a(fill);
+    pair.transfer_one();
+
+    // rcv_nxt should advance by 2 (gap fill + OOO drain).
+    assert_ok!(
+        pair.tcp_a().rcv_nxt() == a_rcv_nxt + 2,
+        "rcv_nxt after gap fill: expected {}, got {}",
+        a_rcv_nxt + 2, pair.tcp_a().rcv_nxt()
     );
 
     Ok(())
