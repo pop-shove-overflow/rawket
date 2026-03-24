@@ -2108,6 +2108,11 @@ impl TcpSocket {
                     let _ = self.send_ctrl(TcpFlags::ACK);
                     return Ok(());
                 }
+            } else if !seg.has_flag(TcpFlags::RST) {
+                // RFC 7323 §3.2: once timestamps are negotiated, non-RST
+                // segments without a TS option are not acceptable.
+                let _ = self.send_ctrl(TcpFlags::ACK);
+                return Ok(());
             }
         }
 
