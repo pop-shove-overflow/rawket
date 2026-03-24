@@ -2847,11 +2847,15 @@ impl TcpSocket {
                 } else {
                     &[]
                 };
+                // RFC 1191 §6.4: retransmit at the (possibly reduced) effective MSS.
+                let ts_overhead = if self.ts_enabled { 12 } else { 0 };
+                let eff_mss = (self.peer_mss as usize).saturating_sub(ts_overhead);
+                let send_len = if flags.has(TcpFlags::SYN) { data.len() } else { data.len().min(eff_mss) };
                 self.retransmit_in_progress = true;
-                let _ = self.send_segment(seq, flags, &data, opts_slice);
+                let _ = self.send_segment(seq, flags, &data[..send_len], opts_slice);
                 self.retransmit_in_progress = false;
-                let end_seq = seq + data.len() as u32;
-                self.bbr_on_loss(data.len() as u64, seq, end_seq);
+                let end_seq = seq + send_len as u32;
+                self.bbr_on_loss(send_len as u64, seq, end_seq);
             }
             self.rto_count += 1;
             if self.rto_count >= self.cfg.max_retransmits {
