@@ -764,6 +764,7 @@ pub struct TcpSocket {
     ecn_enabled:    bool,   // both sides negotiated ECN at SYN time
     ecn_ce_pending: bool,   // received CE-marked IP; echo ECE in next ACK
     ecn_cwr_needed: bool,   // received ECE in ACK; send CWR on next data seg
+    retransmit_in_progress: bool, // RFC 3168 §6.1.5: suppress ECT on retransmits
     fin_pending:    bool,   // close() called with data in send_buf; piggyback FIN
 
     // Keep-alive
@@ -843,6 +844,7 @@ impl TcpSocket {
             ecn_enabled:        false,
             ecn_ce_pending:     false,
             ecn_cwr_needed:     false,
+            retransmit_in_progress: false,
             fin_pending:        false,
             last_recv_ns:       0,
             keepalive_deadline: Deadline::default(),
@@ -1046,8 +1048,13 @@ impl TcpSocket {
 
         if flags.has(TcpFlags::ACK) { self.last_ack_sent = self.rcv_nxt; }
 
-        // ECT(0) = 0x02 marks outgoing data segments as ECN-capable transport.
-        let dscp_ecn = if self.ecn_enabled && !payload.is_empty() { 0x02u8 } else { 0u8 };
+        // RFC 3168 §6.1.5: retransmitted packets MUST NOT carry ECT.
+        // ECT(0) = 0x02 on original data segments only.
+        let dscp_ecn = if self.ecn_enabled && !payload.is_empty() && !self.retransmit_in_progress {
+            0x02u8
+        } else {
+            0u8
+        };
         (self.tx)(*self.dst.ip(), IpProto::TCP, dscp_ecn, &buf)
     }
 
@@ -1666,7 +1673,9 @@ impl TcpSocket {
             } else {
                 &[]
             };
+            self.retransmit_in_progress = true;
             let _ = self.send_segment(seq, flags, &data, opts_slice);
+            self.retransmit_in_progress = false;
         }
         total_lost
     }
@@ -2311,7 +2320,9 @@ impl TcpSocket {
                                 } else if self.ts_enabled {
                                     ts_arr = self.ts_opt(); &ts_arr
                                 } else { &[] };
+                                self.retransmit_in_progress = true;
                                 let _ = self.send_segment(seq, flags, &data, opts_slice);
+                                self.retransmit_in_progress = false;
                             }
                         }
                     }
@@ -2798,7 +2809,9 @@ impl TcpSocket {
                 let tlp_data  = seg.data.clone();
                 let ts;
                 let opts: &[u8] = if self.ts_enabled { ts = self.ts_opt(); &ts } else { &[] };
+                self.retransmit_in_progress = true;
                 let _ = self.send_segment(tlp_seq, tlp_flags, &tlp_data, opts);
+                self.retransmit_in_progress = false;
             } else if !self.send_buf.is_empty() {
                 // Probe with tail of send_buf
                 let probe_len = (self.cfg.mss as usize).min(self.send_buf.len());
@@ -2849,7 +2862,9 @@ impl TcpSocket {
                 } else {
                     &[]
                 };
+                self.retransmit_in_progress = true;
                 let _ = self.send_segment(seq, flags, &data, opts_slice);
+                self.retransmit_in_progress = false;
                 let end_seq = seq + data.len() as u32;
                 self.bbr_on_loss(data.len() as u64, seq, end_seq);
             }
