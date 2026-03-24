@@ -1323,3 +1323,78 @@ fn rst_at_zero_window() -> TestResult {
 
     Ok(())
 }
+
+// ── data_on_completing_ack ──────────────────────────────────────────────────
+//
+// RFC 793 §3.4: the completing ACK in a 3-way handshake may carry piggybacked
+// data.  The server must deliver it after transitioning to Established.
+#[test]
+fn data_on_completing_ack() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    // B listens.
+    let listener = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {}, cfg,
+    )?;
+    let ib = np.add_tcp_b(listener);
+
+    // A sends SYN.
+    let isn_a: u32 = 5000;
+    let syn = build_tcp_syn(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a, 0,
+        0x02,
+        Some(1460), None, None, false,
+    );
+    np.inject_to_b(syn);
+    np.transfer_one();
+    assert_ok!(np.tcp_b(ib).state == State::SynReceived, "B not SynReceived");
+
+    // Capture B's SYN-ACK to get B's ISN.
+    let cap = np.drain_captured();
+    let syn_ack = cap.tcp().from_b()
+        .find(|f| f.tcp.flags.has(TcpFlags::SYN) && f.tcp.flags.has(TcpFlags::ACK))
+        .ok_or_else(|| crate::assert::TestFail::new("no SYN-ACK"))?;
+    let isn_b = syn_ack.tcp.seq;
+
+    // Send completing ACK with piggybacked data "hello".
+    let ack_with_data = crate::packet::build_tcp_data_with_ts(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a + 1,     // seq after SYN
+        isn_b + 1,     // ack B's SYN
+        0, 0,
+        b"hello",
+    );
+    np.inject_to_b(ack_with_data);
+    np.transfer_one();
+
+    assert_ok!(
+        np.tcp_b(ib).state == State::Established,
+        "B not Established after completing ACK: {:?}", np.tcp_b(ib).state
+    );
+
+    // Verify B's rcv_nxt advanced past the piggybacked data.
+    let expected_rcv_nxt = isn_a + 1 + 5; // SYN + "hello"
+    assert_ok!(
+        np.tcp_b(ib).rcv_nxt() == expected_rcv_nxt,
+        "rcv_nxt ({}) != expected ({expected_rcv_nxt}) — piggybacked data not delivered",
+        np.tcp_b(ib).rcv_nxt()
+    );
+
+    // Verify payload was delivered to the application (not just rcv_nxt advanced).
+    let mut buf = [0u8; 64];
+    let n = np.tcp_b_mut(ib).recv(&mut buf);
+    assert_ok!(n == Some(5), "recv returned {:?}, expected Some(5)", n);
+    assert_ok!(&buf[..5] == b"hello", "payload mismatch: {:?}", &buf[..5]);
+
+    Ok(())
+}
