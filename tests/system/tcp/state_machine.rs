@@ -1007,3 +1007,43 @@ fn unmatched_socket_rst() -> TestResult {
 
     Ok(())
 }
+
+// ── listen_ignores_ack ──────────────────────────────────────────────────────
+//
+// RFC 9293 §3.10.7.2: In Listen state, any ACK is "unacceptable."
+// Implementation: silently dropped (the dispatch layer sends RST for
+// unmatched ports; the socket-level Listen handler only acts on SYN).
+#[test]
+fn listen_ignores_ack() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    let listener = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {}, cfg,
+    )?;
+    let ib = np.add_tcp_b(listener);
+
+    assert_ok!(np.tcp_b(ib).state == State::Listen, "B not in Listen");
+
+    // Inject a pure ACK (no SYN) into the listening socket.
+    let ack = build_tcp_data(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        1000, 1,
+        b"",
+    );
+    np.inject_to_b(ack);
+    np.transfer_one();
+
+    assert_ok!(
+        np.tcp_b(ib).state == State::Listen,
+        "B left Listen after stray ACK: {:?}", np.tcp_b(ib).state
+    );
+
+    Ok(())
+}
