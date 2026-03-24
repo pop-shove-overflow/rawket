@@ -1047,3 +1047,47 @@ fn listen_ignores_ack() -> TestResult {
 
     Ok(())
 }
+
+// ── listen_ignores_rst ──────────────────────────────────────────────────────
+//
+// RFC 9293 §3.10.7.2: RST in Listen must be ignored.  The socket stays in
+// Listen and no response is sent.
+#[test]
+fn listen_ignores_rst() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    let listener = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {}, cfg,
+    )?;
+    let ib = np.add_tcp_b(listener);
+
+    np.clear_capture();
+    let rst = build_tcp_data_with_flags(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        1000, 0,
+        0x04, // RST
+        65535,
+        b"",
+    );
+    np.inject_to_b(rst);
+    np.transfer_one();
+
+    assert_ok!(
+        np.tcp_b(ib).state == State::Listen,
+        "B left Listen after RST: {:?}", np.tcp_b(ib).state
+    );
+
+    // No response should be sent to a RST.
+    let cap = np.drain_captured();
+    let b_sent = cap.tcp().from_b().count();
+    assert_ok!(b_sent == 0, "B sent {b_sent} frame(s) in response to RST in Listen");
+
+    Ok(())
+}
