@@ -2211,20 +2211,18 @@ impl TcpSocket {
                 }
                 return Ok(());
             }
-            // Validate RST is within receive window (use actual advertised window).
-            let rcv_wnd   = (self.cfg.recv_buf_max as u32).saturating_sub(self.recv_buf.len() as u32);
-            let in_window = seq_ge(seg.seq, self.rcv_nxt)
-                && seq_lt(seg.seq, self.rcv_nxt + rcv_wnd);
-            if in_window {
-                if seg.seq == self.rcv_nxt {
-                    // Exact match → genuine reset
-                    self.enter_closed();
-                    self.last_error = Some(TcpError::Reset);
-                    (self.on_error)(TcpError::Reset);
-                } else {
-                    // RFC 5961 §3: in-window but not exact → challenge ACK
-                    self.send_challenge_ack();
-                }
+            // RFC 5961 §3.2: exact-match RST (SEQ == RCV.NXT) always resets,
+            // even when the receive window is zero.
+            if seg.seq == self.rcv_nxt {
+                self.enter_closed();
+                self.last_error = Some(TcpError::Reset);
+                (self.on_error)(TcpError::Reset);
+                return Ok(());
+            }
+            // In-window but not exact → challenge ACK.
+            let rcv_wnd = (self.cfg.recv_buf_max as u32).saturating_sub(self.recv_buf.len() as u32);
+            if seq_gt(seg.seq, self.rcv_nxt) && seq_lt(seg.seq, self.rcv_nxt + rcv_wnd) {
+                self.send_challenge_ack();
                 return Ok(());
             }
             return Ok(());
