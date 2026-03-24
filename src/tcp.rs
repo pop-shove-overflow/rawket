@@ -3057,6 +3057,11 @@ impl TcpSocket {
     pub fn ecn_enabled(&self) -> bool { self.ecn_enabled }
     pub fn peer_mss(&self) -> u16 { self.peer_mss }
     pub fn snd_nxt(&self) -> u32 { self.snd_nxt.as_u32() }
+    /// Advance snd_nxt to cover injected data that bypassed the send path.
+    pub fn advance_snd_nxt_to(&mut self, seq: u32) {
+        let seq = SeqNum::new(seq);
+        if seq_gt(seq, self.snd_nxt) { self.snd_nxt = seq; }
+    }
     pub fn snd_una(&self) -> u32 { self.snd_una.as_u32() }
     pub fn rcv_nxt(&self) -> u32 { self.rcv_nxt.as_u32() }
     pub fn bytes_in_flight(&self) -> u32 { self.snd_nxt - self.snd_una }
