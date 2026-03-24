@@ -1091,3 +1091,44 @@ fn listen_ignores_rst() -> TestResult {
 
     Ok(())
 }
+
+// ── listen_ignores_data_only ────────────────────────────────────────────────
+//
+// RFC 9293 §3.10.7.2: In Listen, only a SYN (without ACK) triggers a
+// transition to SynReceived.  A data-only segment (no SYN, no ACK) is
+// silently dropped.
+#[test]
+fn listen_ignores_data_only() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    let listener = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {}, cfg,
+    )?;
+    let ib = np.add_tcp_b(listener);
+
+    np.clear_capture();
+    // PSH-only data segment (no SYN, no ACK).
+    let data = build_tcp_data_with_flags(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        1000, 0,
+        0x08, // PSH
+        65535,
+        b"stray-data",
+    );
+    np.inject_to_b(data);
+    np.transfer_one();
+
+    assert_ok!(
+        np.tcp_b(ib).state == State::Listen,
+        "B left Listen after data-only segment: {:?}", np.tcp_b(ib).state
+    );
+
+    Ok(())
+}
