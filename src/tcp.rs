@@ -2916,20 +2916,26 @@ impl TcpSocket {
         Ok(())
     }
 
-    /// Buffer data for sending.  Only valid in `Established` state.
+    /// Buffer data for sending.
     ///
+    /// RFC 9293 §3.10.2: SEND is valid in SYN-SENT, SYN-RECEIVED (data is
+    /// queued for transmission after entering ESTABLISHED), ESTABLISHED, and
+    /// CLOSE-WAIT.  Returns [`Error::NotConnected`] in all other states.
     /// Returns [`Error::WouldBlock`] when the send buffer would exceed
     /// [`TcpConfig::send_buf_max`].
     pub fn send(&mut self, data: &[u8]) -> Result<()> {
-        // RFC 9293 §3.10.2: send() is valid in Established and CloseWait
-        // (half-open: peer closed, we can still send).
-        if self.state != State::Established && self.state != State::CloseWait {
-            return Err(Error::NotConnected);
+        match self.state {
+            State::SynSent | State::SynReceived
+            | State::Established | State::CloseWait => {}
+            _ => return Err(Error::NotConnected),
         }
         if self.send_buf.len() + data.len() > self.cfg.send_buf_max {
             return Err(Error::WouldBlock);
         }
         self.send_buf.extend_from_slice(data);
+        // flush_send_buf only transmits in Established/CloseWait; in
+        // SYN-SENT and SYN-RECEIVED the data stays queued until the
+        // handshake completes.
         self.flush_send_buf();
         Ok(())
     }
