@@ -582,11 +582,13 @@ fn syn_to_data_window_transition() -> TestResult {
          ({expected_raw} = ({recv_buf_max} - {payload_len}) >> {rcv_scale})"
     );
 
-    // 4. Reconstructed effective window matches actual headroom.
+    // 4. Reconstructed effective window matches actual headroom (with
+    //    truncation from the right-shift/left-shift round-trip).
     let data_window_effective = (data_window_raw as u32) << rcv_scale;
+    let truncated_headroom = (headroom >> rcv_scale) << rcv_scale;
     assert_ok!(
-        data_window_effective == (expected_raw as u32) << rcv_scale,
-        "reconstructed window ({data_window_effective}) != expected"
+        data_window_effective == truncated_headroom,
+        "reconstructed window ({data_window_effective}) != truncated headroom ({truncated_headroom})"
     );
 
     // 5. Negative proof: SYN and non-SYN raw values MUST differ.
@@ -640,6 +642,55 @@ fn recv_window_right_edge_rejected() -> TestResult {
     let ack = cap.tcp()
         .find(|f| f.dir == crate::capture::Dir::BtoA && f.tcp.flags.has(TcpFlags::ACK));
     assert_ok!(ack.is_some(), "B did not send ACK for out-of-window segment");
+
+    Ok(())
+}
+
+// ── keepalive_exception_at_rcv_nxt_minus_one ────────────────────────────────
+//
+// RFC 9293 §3.10.7.4: SEQ = RCV.NXT - 1 is the keepalive exception — the
+// segment is accepted (elicits ACK) even though it's technically outside
+// the window.  This is the boundary complement to recv_window_right_edge_rejected.
+#[test]
+fn keepalive_exception_at_rcv_nxt_minus_one() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let rcv_nxt = pair.tcp_b().rcv_nxt();
+    let b_snd_nxt = pair.tcp_b().snd_nxt();
+
+    pair.clear_capture();
+    // Inject 1-byte segment at seq = rcv_nxt - 1 (keepalive probe pattern).
+    let probe = build_tcp_data_with_ts(
+        pair.mac_a, pair.mac_b,
+        pair.ip_a,  pair.ip_b,
+        12345, 80,
+        rcv_nxt.wrapping_sub(1),
+        b_snd_nxt,
+        0, 0,
+        &[0xAB],
+    );
+    pair.inject_to_b(probe);
+    pair.transfer_one();
+
+    // rcv_nxt must NOT advance (the byte is below rcv_nxt).
+    assert_ok!(
+        pair.tcp_b().rcv_nxt() == rcv_nxt,
+        "rcv_nxt advanced after keepalive-exception segment"
+    );
+
+    // B must send a duplicate ACK (keepalive response).
+    let cap = pair.drain_captured();
+    let ack = cap.tcp()
+        .find(|f| f.dir == crate::capture::Dir::BtoA && f.tcp.flags.has(TcpFlags::ACK));
+    assert_ok!(ack.is_some(), "B did not send ACK for keepalive-exception segment");
+    let ack = ack.unwrap();
+    assert_ok!(
+        ack.tcp.ack == rcv_nxt,
+        "keepalive ACK ({}) != rcv_nxt ({rcv_nxt})", ack.tcp.ack
+    );
 
     Ok(())
 }
