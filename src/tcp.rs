@@ -2590,9 +2590,9 @@ impl TcpSocket {
 
             // ── CLOSING ─────────────────────────────────────────────────────
             State::Closing => {
-                if seg.has_flag(TcpFlags::ACK) {
+                // Only transition on ACK that covers our FIN (ack >= snd_nxt).
+                if seg.has_flag(TcpFlags::ACK) && seq_ge(seg.ack, self.snd_nxt) {
                     let now = self.clock.monotonic_ns();
-                    // Reuse rto_deadline as TIME_WAIT linger timer (field is idle during TimeWait).
                     self.rto_deadline.arm_from_now_ms(self.cfg.time_wait_ms, now);
                     self.state = State::TimeWait;
                 }
@@ -2600,17 +2600,21 @@ impl TcpSocket {
 
             // ── LAST_ACK ────────────────────────────────────────────────────
             State::LastAck => {
-                if seg.has_flag(TcpFlags::ACK) {
+                // Only transition on ACK that covers our FIN (ack >= snd_nxt).
+                if seg.has_flag(TcpFlags::ACK) && seq_ge(seg.ack, self.snd_nxt) {
                     self.enter_closed();
                 }
             }
 
             // ── CLOSE_WAIT ───────────────────────────────────────────────────
             // Peer has sent FIN; local app has not yet called close().
-            // Process ACKs; don't expect new data from peer.
+            // Process ACKs and window updates; don't expect new data from peer.
             State::CloseWait => {
-                if seg.has_flag(TcpFlags::ACK) && seq_gt(seg.ack, self.snd_una) {
-                    self.on_ack(seg.ack, &opts);
+                if seg.has_flag(TcpFlags::ACK) {
+                    self.snd_wnd_raw = seg.window;
+                    if seq_gt(seg.ack, self.snd_una) {
+                        self.on_ack(seg.ack, &opts);
+                    }
                 }
             }
 
