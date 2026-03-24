@@ -2277,13 +2277,19 @@ impl TcpSocket {
             State::Established | State::FinWait1 | State::FinWait2
             | State::CloseWait | State::Closing | State::LastAck)
         {
-            // SYN segments bypass the ACK-bit check (step 4 precedes step 5).
-            if !seg.has_flag(TcpFlags::ACK) && !seg.has_flag(TcpFlags::SYN) {
+            // RFC 5961 §4: SYN in any synchronized state → challenge ACK.
+            // This is step 4; must precede step 5 (ACK-bit check).
+            if seg.has_flag(TcpFlags::SYN) {
+                self.send_challenge_ack();
+                return Ok(());
+            }
+            // RFC 9293 §3.10.7.4 step 5: if the ACK bit is off, drop.
+            if !seg.has_flag(TcpFlags::ACK) {
                 return Ok(());
             }
             // RFC 9293 §3.10.7.4 step 5: if SEG.ACK > SND.NXT, send an
             // ACK and drop the segment.
-            if seg.has_flag(TcpFlags::ACK) && seq_gt(seg.ack, self.snd_nxt) {
+            if seq_gt(seg.ack, self.snd_nxt) {
                 let _ = self.send_ctrl(TcpFlags::ACK);
                 return Ok(());
             }
@@ -2432,11 +2438,7 @@ impl TcpSocket {
                     return Ok(());
                 }
 
-                // RFC 5961 §4: SYN in synchronized state → challenge ACK
-                if seg.has_flag(TcpFlags::SYN) {
-                    self.send_challenge_ack();
-                    return Ok(());
-                }
+                // SYN challenge ACK is handled in the shared pre-dispatch block above.
 
                 // Payload slice computed here so dupack can check pdu.is_empty().
                 let payload_start = seg.hdr_len().min(tcp_buf.len());
