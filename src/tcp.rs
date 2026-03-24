@@ -3101,6 +3101,8 @@ impl TcpSocket {
     pub fn unacked_len(&self) -> usize { self.unacked.len() }
     #[cfg(feature = "test-internals")]
     pub fn sacked_count(&self) -> usize { self.unacked.iter().filter(|s| s.sacked).count() }
+    #[cfg(feature = "test-internals")]
+    pub fn challenge_ack_count(&self) -> u8 { self.challenge_ack_count }
     pub fn rcv_scale(&self) -> u8 { self.rcv_scale }
     pub fn snd_scale(&self) -> u8 { self.snd_scale }
     pub fn ts_recent(&self) -> u32 { self.ts_recent }
