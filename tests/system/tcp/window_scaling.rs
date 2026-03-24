@@ -4,7 +4,7 @@ use crate::{
     assert_ok,
     capture::ParsedFrameExt,
     harness::{setup_network_pair, setup_tcp_pair},
-    packet::{build_tcp_data, build_tcp_data_with_ws, build_tcp_syn},
+    packet::{build_tcp_data, build_tcp_data_with_ts, build_tcp_data_with_ws, build_tcp_syn},
     TestResult,
 };
 
@@ -597,6 +597,49 @@ fn syn_to_data_window_transition() -> TestResult {
         "SYN-ACK and data ACK have identical window_raw ({syn_ack_window_raw}) — \
          cannot distinguish scaled from unscaled encoding"
     );
+
+    Ok(())
+}
+
+// ── recv_window_right_edge_rejected ─────────────────────────────────────────
+//
+// RFC 9293 §3.10.7.4: a segment starting at exactly RCV.NXT + RCV.WND is
+// outside the window and must be rejected.
+#[test]
+fn recv_window_right_edge_rejected() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let rcv_nxt = pair.tcp_b().rcv_nxt();
+    let rcv_wnd = pair.tcp_cfg.recv_buf_max as u32;
+    let b_snd_nxt = pair.tcp_b().snd_nxt();
+
+    // Inject data at exactly the right edge of the window — should be rejected.
+    let right_edge = build_tcp_data_with_ts(
+        pair.mac_a, pair.mac_b,
+        pair.ip_a,  pair.ip_b,
+        12345, 80,
+        rcv_nxt.wrapping_add(rcv_wnd), // exactly at window right edge
+        b_snd_nxt,
+        0, 0,
+        b"outside",
+    );
+    pair.inject_to_b(right_edge);
+    pair.transfer_one();
+
+    let rcv_nxt_after = pair.tcp_b().rcv_nxt();
+    assert_ok!(
+        rcv_nxt_after == rcv_nxt,
+        "rcv_nxt advanced ({rcv_nxt} → {rcv_nxt_after}) for segment at window right edge"
+    );
+
+    // B must send a duplicate ACK for the out-of-window segment.
+    let cap = pair.drain_captured();
+    let ack = cap.tcp()
+        .find(|f| f.dir == crate::capture::Dir::BtoA && f.tcp.flags.has(TcpFlags::ACK));
+    assert_ok!(ack.is_some(), "B did not send ACK for out-of-window segment");
 
     Ok(())
 }
