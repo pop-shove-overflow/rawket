@@ -563,3 +563,88 @@ fn keepalive_first_probe_timing() -> TestResult {
 
     Ok(())
 }
+
+// ── ack_progress_resets_timer ────────────────────────────────────────────────
+//
+// RFC 1122 §4.2.3.6: the keepalive timer resets on any connection activity.
+// Pure ACK progress (snd_una advances, no payload) counts as activity.
+//
+// Advance close to the idle deadline, then deliver a pure ACK that advances
+// snd_una.  Verify no probe fires for another full idle interval.
+#[test]
+fn ack_progress_resets_timer() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .keepalive_idle_ms(50)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let idle_ms = pair.tcp_cfg.keepalive_idle_ms as i64;
+    let snd_una = pair.tcp_a().snd_una();
+
+    // Send data from A, drive until B's pure ACK advances snd_una.
+    pair.tcp_a_mut().send(b"keepalive-ack-test")?;
+    pair.clear_capture();
+    pair.transfer_while(|p| p.tcp_a(0).snd_una() == snd_una);
+
+    // Verify snd_una advanced via pure ACK (no payload from B).
+    let snd_una_after = pair.tcp_a().snd_una();
+    assert_ok!(
+        snd_una_after > snd_una,
+        "snd_una did not advance — ACK not received (was {snd_una}, still {snd_una_after})"
+    );
+
+    // Confirm the B→A segments that advanced snd_una were pure ACKs (no payload).
+    let cap = pair.drain_captured();
+    let b_data = cap.tcp()
+        .direction(Dir::BtoA)
+        .filter(|f| f.payload_len > 0)
+        .count();
+    assert_ok!(
+        b_data == 0,
+        "B sent {b_data} data segment(s) — expected pure ACKs only"
+    );
+
+    // Blackhole B→A so no further activity resets the timer.
+    pair.blackhole_to_a();
+
+    // The keepalive deadline is at (clock_after_transfer + idle_ms).
+    // Use the timer state to find the exact remaining time.
+    let remaining_ns = pair.tcp_a().timer_state().keepalive_ns
+        .expect("keepalive not armed after ACK progress");
+    let remaining_ms = (remaining_ns / 1_000_000) as i64;
+
+    // Helper: detect keepalive probe keyed to snd_una_after.
+    let is_probe = |f: &crate::capture::ParsedFrame| {
+        f.payload_len == 0
+            && f.tcp.flags.has(TcpFlags::ACK)
+            && !f.tcp.flags.has(TcpFlags::SYN)
+            && !f.tcp.flags.has(TcpFlags::FIN)
+            && !f.tcp.flags.has(TcpFlags::RST)
+            && f.tcp.seq == snd_una_after.wrapping_sub(1)
+    };
+
+    // Negative half: advance to 80% of remaining — no probe yet.
+    pair.clear_capture();
+    pair.advance_both(remaining_ms * 80 / 100);
+    pair.transfer_one();
+    let cap = pair.drain_captured();
+    let early_probes = cap.tcp().direction(Dir::AtoB).filter(|f| is_probe(f)).count();
+    assert_ok!(
+        early_probes == 0,
+        "keepalive probe fired at 80% of remaining idle — timer not reset"
+    );
+
+    // Positive half: advance past the deadline.
+    pair.clear_capture();
+    pair.advance_both(remaining_ms * 30 / 100); // 80% + 30% = 110%
+    pair.transfer_one();
+    let cap = pair.drain_captured();
+    let probe = cap.tcp().direction(Dir::AtoB).find(|f| is_probe(f));
+    assert_ok!(
+        probe.is_some(),
+        "no keepalive probe after full reset idle interval (expected seq={})",
+        snd_una_after.wrapping_sub(1)
+    );
+
+    Ok(())
+}
