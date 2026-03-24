@@ -2345,6 +2345,13 @@ impl TcpSocket {
                     self.on_ack(seg.ack, &opts);
                     self.state = State::Established;
                     self.flush_send_buf();
+                    // RFC 793 §3.4: the completing ACK may carry piggybacked data.
+                    let payload_start = seg.hdr_len().min(tcp_buf.len());
+                    let pdu = &tcp_buf[payload_start..];
+                    let has_fin = seg.has_flag(TcpFlags::FIN);
+                    if !pdu.is_empty() || has_fin {
+                        self.receive_data(pdu, seg.seq, has_fin)?;
+                    }
                 }
             }
 
