@@ -2143,10 +2143,17 @@ impl TcpSocket {
         if matches!(self.state,
             State::Established | State::FinWait1 | State::FinWait2
             | State::CloseWait | State::Closing | State::LastAck)
-            && !seg.has_flag(TcpFlags::ACK)
-            && !seg.has_flag(TcpFlags::SYN)
         {
-            return Ok(());
+            // SYN segments bypass the ACK-bit check (step 4 precedes step 5).
+            if !seg.has_flag(TcpFlags::ACK) && !seg.has_flag(TcpFlags::SYN) {
+                return Ok(());
+            }
+            // RFC 9293 §3.10.7.4 step 5: if SEG.ACK > SND.NXT, send an ACK
+            // and drop the segment.
+            if seg.has_flag(TcpFlags::ACK) && seq_gt(seg.ack, self.snd_nxt) {
+                let _ = self.send_ctrl(TcpFlags::ACK);
+                return Ok(());
+            }
         }
 
         match self.state {
