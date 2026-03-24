@@ -713,3 +713,48 @@ fn paws_24day_boundary() -> TestResult {
 
     Ok(())
 }
+
+// ── missing_ts_rejected_after_negotiation ────────────────────────────────────
+//
+// RFC 7323 §3.2: once timestamps are negotiated, non-RST segments without
+// a TS option must be treated as not acceptable.
+#[test]
+fn missing_ts_rejected_after_negotiation() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    assert_ok!(pair.tcp_b().ts_enabled(), "timestamps not negotiated");
+
+    let rcv_nxt = pair.tcp_b().rcv_nxt();
+    let b_snd_nxt = pair.tcp_b().snd_nxt();
+
+    // Inject in-order data WITHOUT a TS option (using build_tcp_data, not _with_ts).
+    // Go through NetworkPair::inject_to_b to bypass TcpSocketPair's TS patcher.
+    let no_ts = build_tcp_data(
+        pair.mac_a, pair.mac_b,
+        pair.ip_a,  pair.ip_b,
+        12345, 80,
+        rcv_nxt, b_snd_nxt,
+        b"no-timestamp",
+    );
+    pair.net.inject_to_b(no_ts);
+    pair.transfer_one();
+
+    // rcv_nxt must NOT advance — segment rejected by missing-TS guard.
+    let rcv_nxt_after = pair.tcp_b().rcv_nxt();
+    assert_ok!(
+        rcv_nxt_after == rcv_nxt,
+        "rcv_nxt advanced ({rcv_nxt} → {rcv_nxt_after}) for segment without TS option"
+    );
+
+    // B should have sent a duplicate ACK (RFC 7323 §5.3 R1).
+    let cap = pair.drain_captured();
+    let ack = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::ACK)
+        .next();
+    assert_ok!(ack.is_some(), "B did not send ACK in response to missing-TS segment");
+
+    Ok(())
+}
