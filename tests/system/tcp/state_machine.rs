@@ -1398,3 +1398,48 @@ fn data_on_completing_ack() -> TestResult {
 
     Ok(())
 }
+
+// ── syn_challenge_ack_in_fin_wait2 ──────────────────────────────────────────
+//
+// RFC 5961 §4: an in-window SYN in a synchronized teardown state must elicit
+// a challenge ACK and must NOT perturb state.
+#[test]
+fn syn_challenge_ack_in_fin_wait2() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().close()?;
+    pair.transfer_while(|p| p.tcp_a(0).state != State::FinWait2);
+    assert_state(pair.tcp_a(), State::FinWait2, "A FinWait2")?;
+
+    let rcv_nxt = pair.tcp_a().rcv_nxt();
+    let a_snd_nxt = pair.tcp_a().snd_nxt();
+    let challenge_before = pair.tcp_a().challenge_ack_count();
+
+    // Inject in-window SYN from B.
+    let syn = build_tcp_syn(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        rcv_nxt,
+        a_snd_nxt,
+        0x02, // SYN
+        Some(1460), None, None, false,
+    );
+    pair.inject_to_a(syn);
+    pair.transfer_one();
+
+    // State must NOT change.
+    assert_state(pair.tcp_a(), State::FinWait2, "A still FinWait2 after SYN")?;
+
+    // Challenge ACK must have been sent.
+    let challenge_after = pair.tcp_a().challenge_ack_count();
+    assert_ok!(
+        challenge_after > challenge_before,
+        "no challenge ACK for SYN in FinWait2 ({challenge_before} → {challenge_after})"
+    );
+
+    Ok(())
+}
