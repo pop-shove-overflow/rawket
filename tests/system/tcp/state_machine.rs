@@ -1276,3 +1276,50 @@ fn established_rejects_ack_beyond_snd_nxt() -> TestResult {
 
     Ok(())
 }
+
+// ── rst_at_zero_window ──────────────────────────────────────────────────────
+//
+// RFC 5961 §3.2: exact-match RST (SEQ == RCV.NXT) must reset even when the
+// advertised receive window is zero (recv_buf full).
+#[test]
+fn rst_at_zero_window() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .recv_buf_max(100)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let rcv_nxt = pair.tcp_b().rcv_nxt();
+    let b_snd_nxt = pair.tcp_b().snd_nxt();
+
+    // Fill B's recv_buf to zero window (inject 100 bytes, don't drain).
+    let fill = crate::packet::build_tcp_data_with_ts(
+        pair.mac_a, pair.mac_b,
+        pair.ip_a,  pair.ip_b,
+        12345, 80,
+        rcv_nxt, b_snd_nxt,
+        0, 0,
+        &vec![0xAAu8; 100],
+    );
+    pair.inject_to_b(fill);
+    pair.transfer_one();
+    assert_ok!(
+        pair.tcp_b().rcv_nxt() == rcv_nxt + 100,
+        "fill not accepted"
+    );
+
+    // Inject exact-match RST at B's rcv_nxt (now rcv_nxt + 100).
+    let rst = build_tcp_rst(
+        pair.mac_a, pair.mac_b,
+        pair.ip_a,  pair.ip_b,
+        12345, 80,
+        rcv_nxt + 100,
+    );
+    pair.inject_to_b(rst);
+    pair.transfer_one();
+
+    assert_state(pair.tcp_b(), State::Closed, "B Closed after RST at zero window")?;
+    assert_error_fired(pair.tcp_b(), TcpError::Reset, "B error = Reset")?;
+
+    Ok(())
+}
