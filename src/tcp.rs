@@ -3,7 +3,7 @@ use alloc::{vec, vec::Vec};
 use core::fmt;
 use core::net::{Ipv4Addr, SocketAddrV4};
 use crate::{
-    eth::{EthHdr, EtherType, MacAddr},
+    eth::{EthHdr, EtherType},
     interface::Interface,
     ip::{
         checksum_add, checksum_finish, pseudo_header_acc, IpProto, Ipv4Hdr,
@@ -341,8 +341,6 @@ impl TcpHdr {
 /// Valid only for the duration of the callback invocation.  An empty `pdu`
 /// signals a FIN (EOF) from the peer.
 pub struct TcpPacket<'a> {
-    pub eth_src: MacAddr,
-    pub eth_dst: MacAddr,
     pub src:     SocketAddrV4,
     pub dst:     SocketAddrV4,
     /// Layer-4 payload.  Empty on FIN.
@@ -1991,7 +1989,7 @@ impl TcpSocket {
 
     /// Flush any OOO segments that have become in-order and call on_recv.
     /// If a drained segment carries a FIN, process the state transition.
-    fn drain_ooo(&mut self, eth_src: MacAddr, eth_dst: MacAddr, ip_src: Ipv4Addr, ip_dst: Ipv4Addr) {
+    fn drain_ooo(&mut self) {
         loop {
             let pos = self.rx_ooo.iter().position(|s| s.seq == self.rcv_nxt);
             let Some(pos) = pos else { break };
@@ -2000,27 +1998,164 @@ impl TcpSocket {
             self.recv_buf.extend_from_slice(&seg.data);
             let on_recv = self.on_recv;
             on_recv(TcpPacket {
-                eth_src, eth_dst,
-                src: SocketAddrV4::new(ip_src, self.dst.port()),
-                dst: SocketAddrV4::new(ip_dst, self.src.port()),
+                src: self.dst,
+                dst: self.src,
                 pdu: &seg.data,
             });
             if seg.has_fin {
-                self.process_rx_fin(eth_src, eth_dst, ip_src, ip_dst);
-                break; // FIN is last octet of stream — nothing follows it.
+                self.process_rx_fin();
+                break;
             }
         }
     }
 
-    /// Process peer's FIN: advance rcv_nxt, ACK, notify, transition state.
-    fn process_rx_fin(&mut self, eth_src: MacAddr, eth_dst: MacAddr, ip_src: Ipv4Addr, ip_dst: Ipv4Addr) {
+    /// Shared receive-data path for Established and half-close states.
+    ///
+    /// Handles overlap trimming, in-order delivery (recv_buf + on_recv),
+    /// OOO buffering with merge, SACK/D-SACK ACK, keepalive reset, and
+    /// deferred FIN processing via [`process_rx_fin`].
+    ///
+    /// Returns `true` if any in-order data was delivered (rcv_nxt advanced).
+    fn receive_data(
+        &mut self,
+        pdu: &[u8],
+        seg_seq: SeqNum,
+        has_fin: bool,
+    ) -> Result<bool> {
+        if pdu.is_empty() && !has_fin { return Ok(false); }
+
+        // RFC 793 §3.3: trim overlap when segment starts before rcv_nxt.
+        let (pdu, seg_seq) = if seq_lt(seg_seq, self.rcv_nxt) {
+            let overlap = (self.rcv_nxt - seg_seq) as usize;
+            if overlap >= pdu.len() {
+                let _ = self.send_ctrl(TcpFlags::ACK);
+                return Ok(false);
+            }
+            (&pdu[overlap..], self.rcv_nxt)
+        } else {
+            (pdu, seg_seq)
+        };
+
+        if seg_seq == self.rcv_nxt {
+            if self.recv_buf.len() + pdu.len() > self.cfg.recv_buf_max {
+                let _ = self.send_ctrl(TcpFlags::ACK);
+                return Ok(false);
+            }
+            self.rcv_nxt += pdu.len() as u32;
+            self.recv_buf.extend_from_slice(pdu);
+            if has_fin {
+                self.process_rx_fin();
+            }
+            self.drain_ooo();
+            {
+                let now = self.clock.monotonic_ns();
+                self.last_recv_ns     = now;
+                self.keepalive_probes = 0;
+                if self.cfg.keepalive_idle_ms > 0 {
+                    self.keepalive_deadline.arm_from_now_ms(self.cfg.keepalive_idle_ms, now);
+                }
+            }
+            let mut sack_buf = [0u8; 40];
+            let max = self.max_sack_blocks();
+            let sack_len = if self.sack_ok { self.build_sack_opts(&mut sack_buf, max) } else { 0 };
+            self.send_ack_with_opts(&sack_buf[..sack_len])?;
+            let on_recv = self.on_recv;
+            on_recv(TcpPacket {
+                src: self.dst,
+                dst: self.src,
+                pdu,
+            });
+            return Ok(true);
+        }
+
+        if seq_gt(seg_seq, self.rcv_nxt) {
+            // Out-of-order: buffer and SACK.
+            let seg_end = seg_seq + pdu.len() as u32;
+            let is_dup = self.rx_ooo.iter().any(|s| {
+                let s_end = s.seq + s.data.len() as u32;
+                seq_ge(seg_seq, s.seq) && seq_le(seg_end, s_end)
+            });
+            let mut merged = false;
+            for s in &mut self.rx_ooo {
+                let s_end = s.seq + s.data.len() as u32;
+                if seq_ge(seg_end, s.seq) && seq_ge(s_end, seg_seq) {
+                    if seq_lt(seg_seq, s.seq) {
+                        let prepend = (s.seq - seg_seq) as usize;
+                        let mut new_data = pdu[..prepend].to_vec();
+                        new_data.extend_from_slice(&s.data);
+                        s.data = new_data;
+                        s.seq = seg_seq;
+                    }
+                    if seq_gt(seg_end, s_end) {
+                        let overlap = (s_end - seg_seq) as usize;
+                        if overlap < pdu.len() {
+                            s.data.extend_from_slice(&pdu[overlap..]);
+                        }
+                    }
+                    s.has_fin |= has_fin;
+                    merged = true;
+                    break;
+                }
+            }
+            let inserted = if !merged && self.rx_ooo.len() < self.cfg.rx_ooo_max {
+                self.rx_ooo.push(RxOooSegment { seq: seg_seq, data: pdu.to_vec(), has_fin });
+                true
+            } else { false };
+            if merged || inserted {
+                self.rx_ooo.sort_by(|a, b| {
+                    if seq_lt(a.seq, b.seq) { core::cmp::Ordering::Less }
+                    else if a.seq == b.seq  { core::cmp::Ordering::Equal }
+                    else                    { core::cmp::Ordering::Greater }
+                });
+                let mut i = 0;
+                while i + 1 < self.rx_ooo.len() {
+                    let a_end = self.rx_ooo[i].seq + self.rx_ooo[i].data.len() as u32;
+                    let b_seq = self.rx_ooo[i + 1].seq;
+                    if seq_ge(a_end, b_seq) {
+                        let b_end = self.rx_ooo[i + 1].seq
+                            + self.rx_ooo[i + 1].data.len() as u32;
+                        if seq_gt(b_end, a_end) {
+                            let overlap = (a_end - b_seq) as usize;
+                            let tail: Vec<u8> = self.rx_ooo[i + 1].data[overlap..].to_vec();
+                            self.rx_ooo[i].data.extend_from_slice(&tail);
+                        }
+                        self.rx_ooo[i].has_fin |= self.rx_ooo[i + 1].has_fin;
+                        self.rx_ooo.remove(i + 1);
+                    } else {
+                        i += 1;
+                    }
+                }
+                self.rx_ooo_last = self.rx_ooo.iter()
+                    .find(|s| {
+                        let s_end = s.seq + s.data.len() as u32;
+                        seq_ge(seg_seq, s.seq) && seq_le(seg_seq, s_end)
+                    })
+                    .map(|s| s.seq)
+                    .or(Some(seg_seq));
+            }
+            let mut sack_buf = [0u8; 40];
+            let max = self.max_sack_blocks();
+            let sack_len = if self.sack_ok {
+                if is_dup && !pdu.is_empty() {
+                    let dsack_right = seg_seq + pdu.len() as u32;
+                    self.build_dsack_opts(&mut sack_buf, seg_seq, dsack_right, max)
+                } else {
+                    self.build_sack_opts(&mut sack_buf, max)
+                }
+            } else { 0 };
+            self.send_ack_with_opts(&sack_buf[..sack_len])?;
+        }
+        Ok(false)
+    }
+
+    /// Process peer's FIN: advance rcv_nxt, notify, transition state.
+    /// The caller is responsible for sending the ACK (receive_data does this).
+    fn process_rx_fin(&mut self) {
         self.rcv_nxt += 1;
-        let _ = self.send_ctrl(TcpFlags::ACK);
         let on_recv = self.on_recv;
         on_recv(TcpPacket {
-            eth_src, eth_dst,
-            src: SocketAddrV4::new(ip_src, self.dst.port()),
-            dst: SocketAddrV4::new(ip_dst, self.src.port()),
+            src: self.dst,
+            dst: self.src,
             pdu: &[],
         });
         match self.state {
@@ -2148,8 +2283,8 @@ impl TcpSocket {
             if !seg.has_flag(TcpFlags::ACK) && !seg.has_flag(TcpFlags::SYN) {
                 return Ok(());
             }
-            // RFC 9293 §3.10.7.4 step 5: if SEG.ACK > SND.NXT, send an ACK
-            // and drop the segment.
+            // RFC 9293 §3.10.7.4 step 5: if SEG.ACK > SND.NXT, send an
+            // ACK and drop the segment.
             if seg.has_flag(TcpFlags::ACK) && seq_gt(seg.ack, self.snd_nxt) {
                 let _ = self.send_ctrl(TcpFlags::ACK);
                 return Ok(());
@@ -2404,210 +2539,31 @@ impl TcpSocket {
                 // flag) is buffered in the OOO queue and drain_ooo handles
                 // the state transition once rcv_nxt catches up.
                 let has_fin = seg.has_flag(TcpFlags::FIN);
-
-                if pdu.is_empty() && !has_fin { return Ok(()); }
-
-                // FIN-only segment (no data).
-                if pdu.is_empty() && has_fin {
-                    let fin_pos = seg.seq;
-                    if fin_pos == self.rcv_nxt {
-                        self.process_rx_fin(eth.src, eth.dst, ip.src, ip.dst);
-                    } else if seq_gt(fin_pos, self.rcv_nxt) {
-                        // OOO FIN: buffer as zero-length entry.
-                        if self.rx_ooo.len() < self.cfg.rx_ooo_max {
-                            self.rx_ooo.push(RxOooSegment { seq: fin_pos, data: Vec::new(), has_fin: true });
-                        }
-                        let _ = self.send_ctrl(TcpFlags::ACK);
-                    } else {
-                        let _ = self.send_ctrl(TcpFlags::ACK);
-                    }
-                    return Ok(());
-                }
-
-                // RFC 793 §3.3: trim overlap when segment starts before rcv_nxt.
-                let (pdu, seg_seq) = if seq_lt(seg.seq, self.rcv_nxt) {
-                    let overlap = (self.rcv_nxt - seg.seq) as usize;
-                    if overlap >= pdu.len() {
-                        // Entirely old data — send ACK only.
-                        let _ = self.send_ctrl(TcpFlags::ACK);
-                        return Ok(());
-                    }
-                    (&pdu[overlap..], self.rcv_nxt)
-                } else {
-                    (pdu, seg.seq)
-                };
-
-                if seg_seq == self.rcv_nxt {
-                    // In-order segment — drop if recv_buf would overflow.
-                    if self.recv_buf.len() + pdu.len() > self.cfg.recv_buf_max {
-                        let _ = self.send_ctrl(TcpFlags::ACK);
-                        return Ok(());
-                    }
-                    self.rcv_nxt += pdu.len() as u32;
-                    self.recv_buf.extend_from_slice(pdu);
-                    if has_fin {
-                        // FIN immediately after in-order data — process now.
-                        self.process_rx_fin(eth.src, eth.dst, ip.src, ip.dst);
-                    }
-                    // Try to drain OOO queue
-                    self.drain_ooo(eth.src, eth.dst, ip.src, ip.dst);
-                    // Keep-alive: receiving data resets the idle timer
-                    {
-                        let now = self.clock.monotonic_ns();
-                        self.last_recv_ns     = now;
-                        self.keepalive_probes = 0;
-                        if self.cfg.keepalive_idle_ms > 0 {
-                            self.keepalive_deadline.arm_from_now_ms(self.cfg.keepalive_idle_ms, now);
-                        }
-                    }
-                    // ACK (with SACK if OOO pending)
-                    let mut sack_buf = [0u8; 40];
-                    let max = self.max_sack_blocks();
-                    let sack_len = if self.sack_ok { self.build_sack_opts(&mut sack_buf, max) } else { 0 };
-                    self.send_ack_with_opts(&sack_buf[..sack_len])?;
-                    let on_recv = self.on_recv;
-                    on_recv(TcpPacket {
-                        eth_src: eth.src, eth_dst: eth.dst,
-                        src: SocketAddrV4::new(ip.src, seg.src_port),
-                        dst: SocketAddrV4::new(ip.dst, seg.dst_port),
-                        pdu,
-                    });
-                } else if seq_gt(seg_seq, self.rcv_nxt) {
-                    // Out-of-order: buffer and SACK.
-                    let seg_end = seg_seq + pdu.len() as u32;
-                    // D-SACK: check if segment is fully contained in existing
-                    // OOO range BEFORE any merge/insert attempt (RFC 2883 §3.2).
-                    let is_dup = self.rx_ooo.iter().any(|s| {
-                        let s_end = s.seq + s.data.len() as u32;
-                        seq_ge(seg_seq, s.seq) && seq_le(seg_end, s_end)
-                    });
-                    // Try to merge with an existing OOO range first, then fall
-                    // back to inserting a new entry if capacity allows.
-                    let mut merged = false;
-                    for s in &mut self.rx_ooo {
-                        let s_end = s.seq + s.data.len() as u32;
-                        // Check if new segment is contiguous/overlapping with this range
-                        if seq_ge(seg_end, s.seq) && seq_ge(s_end, seg_seq) {
-                            // Extend left if new segment starts before
-                            if seq_lt(seg_seq, s.seq) {
-                                let prepend = (s.seq - seg_seq) as usize;
-                                let mut new_data = pdu[..prepend].to_vec();
-                                new_data.extend_from_slice(&s.data);
-                                s.data = new_data;
-                                s.seq = seg_seq;
-                            }
-                            // Extend right if new segment ends after
-                            if seq_gt(seg_end, s_end) {
-                                let overlap = (s_end - seg_seq) as usize;
-                                if overlap < pdu.len() {
-                                    s.data.extend_from_slice(&pdu[overlap..]);
-                                }
-                            }
-                            s.has_fin |= has_fin;
-                            merged = true;
-                            break;
-                        }
-                    }
-                    let inserted = if !merged && self.rx_ooo.len() < self.cfg.rx_ooo_max {
-                        self.rx_ooo.push(RxOooSegment { seq: seg_seq, data: pdu.to_vec(), has_fin });
-                        true
-                    } else { false };
-                    if merged || inserted {
-                        // Sort by seq
-                        self.rx_ooo.sort_by(|a, b| {
-                            if seq_lt(a.seq, b.seq) { core::cmp::Ordering::Less }
-                            else if a.seq == b.seq  { core::cmp::Ordering::Equal }
-                            else                    { core::cmp::Ordering::Greater }
-                        });
-                        // Merge adjacent/overlapping ranges after sort
-                        let mut i = 0;
-                        while i + 1 < self.rx_ooo.len() {
-                            let a_end = self.rx_ooo[i].seq + self.rx_ooo[i].data.len() as u32;
-                            let b_seq = self.rx_ooo[i + 1].seq;
-                            if seq_ge(a_end, b_seq) {
-                                let b_end = self.rx_ooo[i + 1].seq
-                                    + self.rx_ooo[i + 1].data.len() as u32;
-                                if seq_gt(b_end, a_end) {
-                                    let overlap = (a_end - b_seq) as usize;
-                                    let tail: Vec<u8> = self.rx_ooo[i + 1].data[overlap..].to_vec();
-                                    self.rx_ooo[i].data.extend_from_slice(&tail);
-                                }
-                                self.rx_ooo[i].has_fin |= self.rx_ooo[i + 1].has_fin;
-                                self.rx_ooo.remove(i + 1);
-                            } else {
-                                i += 1;
-                            }
-                        }
-                        // After sort+merge, set rx_ooo_last to the containing range
-                        self.rx_ooo_last = self.rx_ooo.iter()
-                            .find(|s| {
-                                let s_end = s.seq + s.data.len() as u32;
-                                seq_ge(seg_seq, s.seq) && seq_le(seg_seq, s_end)
-                            })
-                            .map(|s| s.seq)
-                            .or(Some(seg_seq));
-                    }
-                    let mut sack_buf = [0u8; 40];
-                    let max = self.max_sack_blocks();
-                    let sack_len = if self.sack_ok {
-                        if is_dup && !pdu.is_empty() {
-                            let dsack_right = seg_seq + pdu.len() as u32;
-                            self.build_dsack_opts(&mut sack_buf, seg_seq, dsack_right, max)
-                        } else {
-                            self.build_sack_opts(&mut sack_buf, max)
-                        }
-                    } else { 0 };
-                    self.send_ack_with_opts(&sack_buf[..sack_len])?;
-                }
-                // else: seq < rcv_nxt (retransmit of already-received data) → ACK only
+                self.receive_data(pdu, seg.seq, has_fin)?;
             }
 
             // ── FIN_WAIT_1 ──────────────────────────────────────────────────
             State::FinWait1 => {
                 let payload_start = seg.hdr_len().min(tcp_buf.len());
                 let pdu           = &tcp_buf[payload_start..];
+                let has_fin       = seg.has_flag(TcpFlags::FIN);
 
                 // Process cumulative ACK (may ACK our FIN or earlier data).
                 if seg.has_flag(TcpFlags::ACK) && seq_gt(seg.ack, self.snd_una) {
                     self.on_ack(seg.ack, &opts);
                 }
 
-                // Deliver in-order payload data (half-close: peer may still send).
-                if !pdu.is_empty() && seg.seq == self.rcv_nxt {
-                    if self.recv_buf.len() + pdu.len() > self.cfg.recv_buf_max {
-                        let _ = self.send_ctrl(TcpFlags::ACK);
-                        return Ok(());
-                    }
-                    self.rcv_nxt += pdu.len() as u32;
-                    self.recv_buf.extend_from_slice(pdu);
-                    let on_recv = self.on_recv;
-                    on_recv(TcpPacket {
-                        eth_src: eth.src, eth_dst: eth.dst,
-                        src: SocketAddrV4::new(ip.src, seg.src_port),
-                        dst: SocketAddrV4::new(ip.dst, seg.dst_port),
-                        pdu,
-                    });
-                }
+                // Deliver payload + FIN using shared reassembly path.
+                // receive_data handles OOO, overlap trim, recv_buf overflow,
+                // and calls process_rx_fin() for FIN — which transitions state.
+                self.receive_data(pdu, seg.seq, has_fin)?;
 
-                // State transition based on whether our FIN was ACKed.
-                let fin_acked = seq_ge(self.snd_una, self.snd_nxt);
-
-                if seg.has_flag(TcpFlags::FIN) {
-                    self.rcv_nxt += 1;
-                    let _ = self.send_ctrl(TcpFlags::ACK);
+                // If no FIN and our FIN was ACKed, advance to FinWait2.
+                if self.state == State::FinWait1 {
+                    let fin_acked = seq_ge(self.snd_una, self.snd_nxt);
                     if fin_acked {
-                        let now = self.clock.monotonic_ns();
-                        // Reuse rto_deadline as TIME_WAIT linger timer (field is idle during TimeWait).
-                        self.rto_deadline.arm_from_now_ms(self.cfg.time_wait_ms, now);
-                        self.state = State::TimeWait;
-                    } else {
-                        self.state = State::Closing;
+                        self.state = State::FinWait2;
                     }
-                } else if fin_acked {
-                    self.state = State::FinWait2;
-                }
-                if !pdu.is_empty() || seg.has_flag(TcpFlags::FIN) {
-                    let _ = self.send_ctrl(TcpFlags::ACK);
                 }
             }
 
@@ -2615,39 +2571,16 @@ impl TcpSocket {
             State::FinWait2 => {
                 let payload_start = seg.hdr_len().min(tcp_buf.len());
                 let pdu           = &tcp_buf[payload_start..];
+                let has_fin       = seg.has_flag(TcpFlags::FIN);
 
                 // Process ACKs for any remaining retransmit state.
                 if seg.has_flag(TcpFlags::ACK) && seq_gt(seg.ack, self.snd_una) {
                     self.on_ack(seg.ack, &opts);
                 }
 
-                // Deliver in-order payload data (peer's send direction is open).
-                if !pdu.is_empty() && seg.seq == self.rcv_nxt {
-                    if self.recv_buf.len() + pdu.len() > self.cfg.recv_buf_max {
-                        let _ = self.send_ctrl(TcpFlags::ACK);
-                        return Ok(());
-                    }
-                    self.rcv_nxt += pdu.len() as u32;
-                    self.recv_buf.extend_from_slice(pdu);
-                    let on_recv = self.on_recv;
-                    on_recv(TcpPacket {
-                        eth_src: eth.src, eth_dst: eth.dst,
-                        src: SocketAddrV4::new(ip.src, seg.src_port),
-                        dst: SocketAddrV4::new(ip.dst, seg.dst_port),
-                        pdu,
-                    });
-                }
-
-                if seg.has_flag(TcpFlags::FIN) {
-                    self.rcv_nxt += 1;
-                    let _ = self.send_ctrl(TcpFlags::ACK);
-                    let now = self.clock.monotonic_ns();
-                    // Reuse rto_deadline as TIME_WAIT linger timer (field is idle during TimeWait).
-                    self.rto_deadline.arm_from_now_ms(self.cfg.time_wait_ms, now);
-                    self.state = State::TimeWait;
-                } else if !pdu.is_empty() {
-                    let _ = self.send_ctrl(TcpFlags::ACK);
-                }
+                // Deliver payload + FIN using shared reassembly path.
+                // receive_data calls process_rx_fin() for FIN → TimeWait.
+                self.receive_data(pdu, seg.seq, has_fin)?;
             }
 
             // ── CLOSING ─────────────────────────────────────────────────────
