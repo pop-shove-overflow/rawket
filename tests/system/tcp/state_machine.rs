@@ -953,3 +953,57 @@ fn send_in_close_wait() -> TestResult {
 
     Ok(())
 }
+
+// ── unmatched_socket_rst ─────────────────────────────────────────────────────
+//
+// RFC 9293 §3.10.7: A TCP segment arriving at a port with no matching socket
+// must elicit a RST.  For a SYN to a closed port: RST with SEQ=0, ACK=SEG.SEQ+1.
+#[test]
+fn unmatched_socket_rst() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    // No TCP sockets — just two network stacks connected by a bridge.
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+
+    let isn: u32 = 1000;
+    let syn = build_tcp_syn(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 9999,   // port 9999 has no listener
+        isn,
+        0,
+        0x02,          // SYN
+        Some(1460), None, None, false,
+    );
+    np.inject_to_b(syn);
+    // transfer_one, not transfer() — no sockets means transfer() never quiesces.
+    np.transfer_one();
+
+    let cap = np.drain_captured();
+    let rst = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::RST)
+        .next()
+        .ok_or_else(|| crate::assert::TestFail::new("B did not send RST for unmatched SYN"))?;
+
+    // RFC 9293 §3.10.7: RST for a SYN: SEQ=0, ACK=SEG.SEQ+SEG.LEN (ISN+1 for SYN).
+    assert_ok!(
+        rst.tcp.flags.has(TcpFlags::ACK),
+        "RST for SYN must carry ACK flag"
+    );
+    assert_ok!(
+        rst.tcp.seq == 0,
+        "RST seq ({}) should be 0 for SYN-triggered RST", rst.tcp.seq
+    );
+    assert_ok!(
+        rst.tcp.ack == isn + 1,
+        "RST ack ({}) should be ISN+1 ({})", rst.tcp.ack, isn + 1
+    );
+
+    // Only one RST should be sent.
+    let rst_count = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::RST)
+        .count();
+    assert_ok!(rst_count == 1, "expected 1 RST, got {rst_count}");
+
+    Ok(())
+}
