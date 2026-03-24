@@ -18,7 +18,7 @@ pub const HDR_LEN: usize = 20;
 /// RFC 6298 §2: clock granularity G used in RTO = SRTT + max(G, 4*RTTVAR).
 pub const CLOCK_GRANULARITY_NS: u64 = 1_000_000; // 1 ms
 
-/// RFC 8985 §7.4: worst-case delayed-ACK timer used in TLP PTO calculation.
+/// RFC 8985 §7.2: worst-case delayed-ACK timer used in TLP PTO calculation.
 pub const WC_DEL_ACK_NS: u64 = 25_000_000; // 25 ms
 
 /// RFC 5961 §5: max challenge ACKs per second window.
@@ -979,16 +979,13 @@ impl TcpSocket {
     /// Max SACK blocks that fit in option space, accounting for timestamps.
     fn max_sack_blocks(&self) -> usize { if self.ts_enabled { 3 } else { 4 } }
 
-    /// TLP deadline: RFC 8985 §7.4.
-    /// FlightSize == 1 → max(2*SRTT, 1.5*SRTT + WCDelAckT).
-    /// FlightSize > 1  → 2*SRTT.
+    /// RFC 8985 §7.2: PTO = 2 * SRTT; += max_ack_delay when FlightSize == 1.
     fn tlp_deadline_ns(&self) -> u64 {
-        let two_srtt = 2 * self.srtt_ns;
-        if self.unacked.len() <= 1 {
-            two_srtt.max(3 * self.srtt_ns / 2 + WC_DEL_ACK_NS)
-        } else {
-            two_srtt
+        let mut pto = 2 * self.srtt_ns;
+        if self.unacked.len() == 1 {
+            pto += WC_DEL_ACK_NS;
         }
+        pto
     }
 
     // ── Frame builder / sender ───────────────────────────────────────────────
@@ -1953,7 +1950,7 @@ impl TcpSocket {
             let interval = self.pacing_interval_ns();
             if interval > 0 { self.pacing_next.arm_from_now_ns(interval, now); } else { self.pacing_next.disarm(); }
 
-            // Arm/re-arm TLP (RFC 8985 §7.4): deadline depends on
+            // Arm/re-arm TLP (RFC 8985 §7.2): deadline depends on
             // FlightSize, so re-compute each time a new segment is sent.
             // When SRTT is unknown (no RTT sample yet), skip TLP — a
             // meaningful PTO cannot be computed and RTO already covers
