@@ -615,3 +615,48 @@ fn ooo_in_fin_wait2() -> TestResult {
 
     Ok(())
 }
+
+// ── recv_buf_exhaustion_in_fin_wait2 ────────────────────────────────────────
+//
+// RFC 9293 §3.6 + §3.8: data received in FinWait2 must be dropped when the
+// receive buffer is full, same as Established.
+#[test]
+fn recv_buf_exhaustion_in_fin_wait2() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .recv_buf_max(100)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // A closes → FinWait2.
+    pair.tcp_a_mut().close()?;
+    pair.transfer();
+    assert_state(pair.tcp_a(), State::FinWait2, "A FinWait2")?;
+
+    let a_rcv_nxt = pair.tcp_a().rcv_nxt();
+    let a_snd_nxt = pair.tcp_a().snd_nxt();
+
+    // Fill A's recv_buf by injecting 100 bytes from B.
+    // Use transfer_one() which does NOT drain recv_buf.
+    let fill = crate::harness::b_to_a(&pair, a_rcv_nxt, a_snd_nxt, &vec![0xAAu8; 100]);
+    pair.inject_to_a(fill);
+    pair.transfer_one();
+
+    let rcv_nxt_after_fill = pair.tcp_a().rcv_nxt();
+    assert_ok!(
+        rcv_nxt_after_fill == a_rcv_nxt + 100,
+        "fill not accepted: rcv_nxt {} → {}", a_rcv_nxt, rcv_nxt_after_fill
+    );
+
+    // Inject more — must be dropped.
+    let extra = crate::harness::b_to_a(&pair, rcv_nxt_after_fill, a_snd_nxt, b"overflow");
+    pair.inject_to_a(extra);
+    pair.transfer_one();
+
+    assert_ok!(
+        pair.tcp_a().rcv_nxt() == rcv_nxt_after_fill,
+        "rcv_nxt advanced in FinWait2 despite full recv_buf"
+    );
+
+    Ok(())
+}
