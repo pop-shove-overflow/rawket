@@ -1230,3 +1230,49 @@ fn established_rejects_no_ack_data() -> TestResult {
 
     Ok(())
 }
+
+// ── established_rejects_ack_beyond_snd_nxt ──────────────────────────────────
+//
+// RFC 9293 §3.10.7.4 step 5: if SEG.ACK > SND.NXT, send an ACK and drop.
+// An ACK acknowledging bytes the peer never sent must not update snd_una.
+#[test]
+fn established_rejects_ack_beyond_snd_nxt() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let snd_una_before = pair.tcp_b().snd_una();
+    let b_snd_nxt = pair.tcp_b().snd_nxt();
+    let a_rcv_nxt = pair.tcp_a().rcv_nxt();
+
+    // Inject ACK with ack far beyond B's snd_nxt.
+    let bad_ack = crate::packet::build_tcp_data_with_ts(
+        pair.mac_a, pair.mac_b,
+        pair.ip_a,  pair.ip_b,
+        12345, 80,
+        a_rcv_nxt,
+        b_snd_nxt.wrapping_add(1000), // ack > snd_nxt
+        pair.clock_a.monotonic_ms() as u32,
+        pair.tcp_a().ts_recent(),
+        b"",
+    );
+    pair.net.inject_to_b(bad_ack);
+    pair.transfer_one();
+
+    // snd_una must NOT advance — the ACK was rejected.
+    let snd_una_after = pair.tcp_b().snd_una();
+    assert_ok!(
+        snd_una_after == snd_una_before,
+        "snd_una advanced ({snd_una_before} → {snd_una_after}) after ACK > SND.NXT"
+    );
+
+    // B should have sent a corrective ACK (RFC 9293 §3.10.7.4 step 5).
+    let cap = pair.drain_captured();
+    let corrective = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::ACK)
+        .count();
+    assert_ok!(corrective > 0, "B did not send corrective ACK for ACK > SND.NXT");
+
+    Ok(())
+}
