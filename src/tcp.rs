@@ -2137,6 +2137,18 @@ impl TcpSocket {
             }
         }
 
+        // RFC 9293 §3.10.7.4 step 5: in synchronized states, if the ACK bit
+        // is off, drop the segment and return.  SYN segments are excluded —
+        // step 4 (SYN processing / challenge ACK) precedes step 5.
+        if matches!(self.state,
+            State::Established | State::FinWait1 | State::FinWait2
+            | State::CloseWait | State::Closing | State::LastAck)
+            && !seg.has_flag(TcpFlags::ACK)
+            && !seg.has_flag(TcpFlags::SYN)
+        {
+            return Ok(());
+        }
+
         match self.state {
             // ── LISTEN ──────────────────────────────────────────────────────
             State::Listen => {
