@@ -1186,3 +1186,47 @@ fn syn_received_ignores_bad_ack() -> TestResult {
 
     Ok(())
 }
+
+// ── established_rejects_no_ack_data ─────────────────────────────────────────
+//
+// RFC 9293 §3.10.7.4 step 5: in synchronized states, if the ACK bit is off,
+// drop the segment.  Data-only segments (no ACK, no SYN) must not deliver
+// payload or advance rcv_nxt.
+#[test]
+fn established_rejects_no_ack_data() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let rcv_nxt = pair.tcp_b().rcv_nxt();
+    let b_snd_nxt = pair.tcp_b().snd_nxt();
+
+    // Inject data segment without ACK flag (PSH only) via NetworkPair
+    // to bypass TcpSocketPair's TS patcher (we want a raw non-ACK frame).
+    // Include TS option so the missing-TS guard doesn't reject it first.
+    let frame = crate::packet::build_tcp_data_with_ts(
+        pair.mac_a, pair.mac_b,
+        pair.ip_a,  pair.ip_b,
+        12345, 80,
+        rcv_nxt, b_snd_nxt,
+        pair.clock_a.monotonic_ms() as u32,
+        pair.tcp_a().ts_recent(),
+        b"no-ack-data",
+    );
+    // Clear the ACK flag (byte 47, bit 4).
+    let mut frame = frame;
+    frame[47] &= !0x10; // clear ACK
+    frame[47] |= 0x08;  // set PSH
+    crate::packet::recompute_frame_tcp_checksum(&mut frame);
+    pair.net.inject_to_b(frame);
+    pair.transfer_one();
+
+    let rcv_nxt_after = pair.tcp_b().rcv_nxt();
+    assert_ok!(
+        rcv_nxt_after == rcv_nxt,
+        "rcv_nxt advanced ({rcv_nxt} → {rcv_nxt_after}) for data segment without ACK bit"
+    );
+
+    Ok(())
+}
