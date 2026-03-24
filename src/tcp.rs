@@ -2880,7 +2880,7 @@ impl TcpSocket {
 
         // ── Zero-window persist ──
         if self.persist_deadline.is_expired(now)
-            && self.state == State::Established
+            && matches!(self.state, State::Established | State::CloseWait)
         {
             // Send a 1-byte window probe (RFC 9293 §3.8.6.1: seq = SND.NXT - 1).
             if !self.send_buf.is_empty() {
