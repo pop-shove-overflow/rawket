@@ -2742,9 +2742,12 @@ impl TcpSocket {
     /// Reduce the effective MSS when a "Fragmentation Needed" ICMP is received
     /// for a segment sent by this socket (RFC 1191 Path MTU Discovery).
     pub(crate) fn update_pmtu(&mut self, new_mss: u16) {
-        if new_mss == 0 { return; }
-        if new_mss < self.peer_mss { self.peer_mss = new_mss; }
-        if new_mss < self.cfg.mss  { self.cfg.mss  = new_mss; }
+        // RFC 1191 §3: "A host MUST never reduce its estimate of the Path
+        // MTU below 68 octets."  Minimum MSS = 68 - 20 (IP) - 20 (TCP) = 28.
+        const MIN_MSS: u16 = 28;
+        let clamped = new_mss.max(MIN_MSS);
+        if clamped < self.peer_mss { self.peer_mss = clamped; }
+        if clamped < self.cfg.mss  { self.cfg.mss  = clamped; }
     }
 
     // ── Public API ───────────────────────────────────────────────────────────
