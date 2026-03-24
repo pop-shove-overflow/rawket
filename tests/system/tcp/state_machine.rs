@@ -1132,3 +1132,57 @@ fn listen_ignores_data_only() -> TestResult {
 
     Ok(())
 }
+
+// ── syn_received_ignores_bad_ack ────────────────────────────────────────────
+//
+// RFC 9293 §3.10.7.3: In SynReceived, an ACK with ack outside
+// (SND.UNA, SND.NXT] is unacceptable.  The socket must stay in SynReceived.
+#[test]
+fn syn_received_ignores_bad_ack() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    let listener = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {}, cfg,
+    )?;
+    let ib = np.add_tcp_b(listener);
+
+    // Send SYN to move B from Listen → SynReceived.
+    let syn = build_tcp_syn(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        5000, 0,
+        0x02, // SYN
+        Some(1460), None, None, false,
+    );
+    np.inject_to_b(syn);
+    np.transfer_one();
+
+    assert_ok!(
+        np.tcp_b(ib).state == State::SynReceived,
+        "B not in SynReceived after SYN: {:?}", np.tcp_b(ib).state
+    );
+
+    // Inject ACK with wrong ack number (0 — outside valid range).
+    let bad_ack = build_tcp_data(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        5001, 0, // ack=0, which is not in (SND.UNA, SND.NXT]
+        b"",
+    );
+    np.inject_to_b(bad_ack);
+    np.transfer_one();
+
+    assert_ok!(
+        np.tcp_b(ib).state == State::SynReceived,
+        "B left SynReceived after bad ACK: {:?}", np.tcp_b(ib).state
+    );
+
+    Ok(())
+}
