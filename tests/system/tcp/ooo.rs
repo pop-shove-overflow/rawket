@@ -660,3 +660,48 @@ fn recv_buf_exhaustion_in_fin_wait2() -> TestResult {
 
     Ok(())
 }
+
+// ── ooo_in_fin_wait1 ────────────────────────────────────────────────────────
+//
+// RFC 9293 §3.6: FinWait1 uses the same OOO reassembly as Established.
+// A sends FIN (enters FinWait1), B sends OOO data, gap fill delivers both.
+#[test]
+fn ooo_in_fin_wait1() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // A closes → FinWait1 (FIN not yet ACKed by B).
+    pair.blackhole_to_a(); // prevent B's FIN-ACK from reaching A
+    pair.tcp_a_mut().close()?;
+    pair.transfer_one(); // FIN departs
+    assert_state(pair.tcp_a(), State::FinWait1, "A FinWait1")?;
+
+    let a_rcv_nxt = pair.tcp_a().rcv_nxt();
+    let a_snd_nxt = pair.tcp_a().snd_nxt();
+    pair.clear_impairments();
+
+    // Inject OOO segment from B at rcv_nxt+1.
+    let ooo = crate::harness::b_to_a(&pair, a_rcv_nxt + 1, a_snd_nxt, b"B");
+    pair.inject_to_a(ooo);
+    pair.transfer_one();
+
+    assert_ok!(
+        pair.tcp_a().rcv_nxt() == a_rcv_nxt,
+        "rcv_nxt advanced on OOO in FinWait1"
+    );
+
+    // Fill the gap.
+    let fill = crate::harness::b_to_a(&pair, a_rcv_nxt, a_snd_nxt, b"A");
+    pair.inject_to_a(fill);
+    pair.transfer_one();
+
+    assert_ok!(
+        pair.tcp_a().rcv_nxt() == a_rcv_nxt + 2,
+        "rcv_nxt after gap fill in FinWait1: expected {}, got {}",
+        a_rcv_nxt + 2, pair.tcp_a().rcv_nxt()
+    );
+
+    Ok(())
+}
