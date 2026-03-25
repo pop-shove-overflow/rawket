@@ -176,3 +176,33 @@ fn probe_bw_down_decreases_rate() -> TestResult {
     assert_ok!(false, "ProbeBwDown found during transfer but not in final history");
     Ok(())
 }
+
+// ── zero_rate_sends_immediately ─────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.6.2: when pacing_rate is not yet estimated,
+// the sender must not block transmission.
+//
+// Immediately after handshake, first data segment must be sent without delay.
+#[test]
+fn zero_rate_sends_immediately() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"immediate")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let sent = cap.tcp()
+        .direction(Dir::AtoB)
+        .with_data()
+        .count();
+
+    assert_ok!(
+        sent >= 1,
+        "no data segment sent immediately after handshake (pacing gate blocked?)"
+    );
+
+    Ok(())
+}
