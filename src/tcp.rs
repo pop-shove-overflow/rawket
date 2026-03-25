@@ -2555,9 +2555,12 @@ impl TcpSocket {
                 let pdu           = &tcp_buf[payload_start..];
                 let has_fin       = seg.has_flag(TcpFlags::FIN);
 
-                // Process cumulative ACK (may ACK our FIN or earlier data).
-                if seg.has_flag(TcpFlags::ACK) && seq_gt(seg.ack, self.snd_una) {
-                    self.on_ack(seg.ack, &opts);
+                // Process cumulative ACK and window updates.
+                if seg.has_flag(TcpFlags::ACK) {
+                    self.snd_wnd_raw = seg.window;
+                    if seq_gt(seg.ack, self.snd_una) {
+                        self.on_ack(seg.ack, &opts);
+                    }
                 }
 
                 // Deliver payload + FIN using shared reassembly path.
@@ -2580,9 +2583,12 @@ impl TcpSocket {
                 let pdu           = &tcp_buf[payload_start..];
                 let has_fin       = seg.has_flag(TcpFlags::FIN);
 
-                // Process ACKs for any remaining retransmit state.
-                if seg.has_flag(TcpFlags::ACK) && seq_gt(seg.ack, self.snd_una) {
-                    self.on_ack(seg.ack, &opts);
+                // Process ACKs and window updates.
+                if seg.has_flag(TcpFlags::ACK) {
+                    self.snd_wnd_raw = seg.window;
+                    if seq_gt(seg.ack, self.snd_una) {
+                        self.on_ack(seg.ack, &opts);
+                    }
                 }
 
                 // Deliver payload + FIN using shared reassembly path.
