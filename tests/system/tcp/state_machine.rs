@@ -8,8 +8,8 @@ use crate::{
     assert::{assert_ack, assert_error_fired, assert_flags, assert_flags_exact, assert_state},
     capture::{Dir, ParsedFrameExt},
     harness::{setup_network_pair, setup_tcp_pair},
-    packet::{build_tcp_data, build_tcp_data_with_flags, build_tcp_rst, build_tcp_syn,
-             build_udp_data},
+    packet::{build_tcp_data, build_tcp_data_with_flags, build_tcp_data_with_ts,
+             build_tcp_rst, build_tcp_syn, build_udp_data},
 };
 
 // RFC 9293 §3.5 (Connection Establishment): Three-way handshake SYN, SYN-ACK, ACK.
@@ -1900,6 +1900,79 @@ fn syn_ack_retransmit() -> TestResult {
 
     // B should still be in SynReceived.
     assert_state(np.tcp_b(ib), State::SynReceived, "B still SynReceived after SYN-ACK retransmit")?;
+
+    Ok(())
+}
+
+// ── fin_on_completing_ack ───────────────────────────────────────────────────
+//
+// RFC 9293 §3.10.7.3: In SynReceived, a valid ACK moves to Established.
+// If that same segment carries a FIN, the FIN is processed in the new
+// Established state, transitioning immediately to CloseWait.
+#[test]
+fn fin_on_completing_ack() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    // Drop RSTs from A (no A-side socket to handle SYN-ACK).
+    np.add_impairment_to_b(Impairment::Drop(PacketSpec::matching(filter::tcp::rst())));
+
+    let server = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {}, cfg,
+    )?;
+    let ib = np.add_tcp_b(server);
+
+    // Inject SYN from A.
+    let isn_a = 0x7000_0000u32;
+    let syn = build_tcp_syn(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a, 0,
+        0x02,
+        Some(1460), Some(4),
+        Some((100, 0)),
+        true,
+    );
+    np.inject_to_b(syn);
+    np.transfer_one();
+
+    assert_state(np.tcp_b(ib), State::SynReceived, "B SynReceived after SYN")?;
+
+    let cap = np.drain_captured();
+    let syn_ack = cap.tcp().from_b()
+        .with_tcp_flags(TcpFlags::SYN)
+        .with_tcp_flags(TcpFlags::ACK)
+        .next()
+        .ok_or_else(|| crate::assert::TestFail::new("no SYN-ACK from B"))?;
+    let b_isn = syn_ack.tcp.seq;
+    let b_tsval = syn_ack.tcp.opts.timestamps.map(|(v, _)| v).unwrap_or(0);
+
+    // Build completing ACK with FIN flag (ACK|FIN).
+    let ack_fin = build_tcp_data_with_ts(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a + 1,
+        b_isn + 1,
+        200,        // TSval
+        b_tsval,    // TSecr echoes B's TSval
+        &[],
+    );
+    // Patch flags: set FIN|ACK (0x11).
+    let mut ack_fin = ack_fin;
+    ack_fin[47] = 0x11; // FIN|ACK
+    crate::packet::recompute_frame_tcp_checksum(&mut ack_fin);
+
+    np.inject_to_b(ack_fin);
+    np.transfer_one();
+
+    // B should have transitioned: SynReceived → Established → CloseWait.
+    assert_state(np.tcp_b(ib), State::CloseWait, "B should be CloseWait after ACK+FIN")?;
 
     Ok(())
 }
