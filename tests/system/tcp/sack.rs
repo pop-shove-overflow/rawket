@@ -790,3 +790,48 @@ fn sack_renege_retransmits() -> TestResult {
 
     Ok(())
 }
+
+// ── dsack_on_oow_duplicate ──────────────────────────────────────────────────
+//
+// RFC 2883 §3: when an in-order segment that was already received (seq < rcv_nxt)
+// arrives again, B should respond with a D-SACK indicating the duplicate range.
+#[test]
+fn dsack_on_oow_duplicate() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Send data so B advances rcv_nxt past it.
+    pair.tcp_a_mut().send(b"original")?;
+    pair.transfer_while(|p| p.tcp_a(0).snd_una() != p.tcp_a(0).snd_nxt());
+
+    let rcv_nxt = pair.tcp_b().rcv_nxt();
+    let b_snd_nxt = pair.tcp_b().snd_nxt();
+
+    // Re-inject the same data (seq < rcv_nxt — duplicate).
+    let dup_seq = rcv_nxt.wrapping_sub(8); // "original" = 8 bytes, back to start
+    let dup = a_to_b(&pair, dup_seq, b_snd_nxt, b"original");
+    pair.clear_capture();
+    pair.inject_to_b(dup);
+    pair.transfer_one();
+
+    // B must send a D-SACK: first block covers the duplicate range [dup_seq, dup_seq+8).
+    let cap = pair.drain_captured();
+    let dsack = cap.tcp().from_b()
+        .find(|f| !f.tcp.opts.sack_blocks.is_empty());
+    assert_ok!(dsack.is_some(), "B did not send D-SACK for duplicate data");
+    let blocks = &dsack.unwrap().tcp.opts.sack_blocks;
+    assert_ok!(
+        blocks[0].0 == dup_seq && blocks[0].1 == dup_seq.wrapping_add(8),
+        "D-SACK block {:?} does not match duplicate range [{dup_seq}, {})",
+        blocks[0], dup_seq.wrapping_add(8)
+    );
+
+    // rcv_nxt must not change (duplicate data).
+    assert_ok!(
+        pair.tcp_b().rcv_nxt() == rcv_nxt,
+        "rcv_nxt changed after duplicate: {} → {}", rcv_nxt, pair.tcp_b().rcv_nxt()
+    );
+
+    Ok(())
+}
