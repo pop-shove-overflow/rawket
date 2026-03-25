@@ -327,3 +327,79 @@ fn drain_pacing_gain() -> TestResult {
 
     Ok(())
 }
+
+// ── pacing_deadline_gates_transmission ────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.6.2: pacing deadline gates segment departure.
+//
+// After BBR measures BW, consecutive data segments should not all appear at
+// the same timestamp (pacing must gate transmission).
+#[test]
+fn pacing_deadline_gates_transmission() -> TestResult {
+    use rawket::bridge::LinkProfile;
+
+    // 100 Mbps link with 10 ms latency.  Pacing gaps between 1460-byte segments
+    // are ~117 µs — observable in nanosecond capture timestamps.
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::ethernet_100m())
+        .connect();
+
+    // Phase 1: warm up BBR to establish a bandwidth estimate.
+    pair.tcp_a_mut().send(&vec![0x33u8; 200_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() < 100_000 {
+            let _ = p.tcp_a_mut(0).send(&vec![0x33u8; 100_000]);
+        }
+        p.tcp_a(0).bbr_pacing_rate_bps() < 1_000_000
+    });
+
+    let rate = pair.tcp_a().bbr_pacing_rate_bps();
+    assert_ok!(rate > 0, "pacing rate is 0 after warmup");
+
+    // Phase 2: send a burst and capture paced segment departures.
+    pair.clear_capture();
+    pair.tcp_a_mut().send(&vec![0x44u8; 50_000])?;
+    pair.transfer_while(|p| p.tcp_a(0).send_buf_len() > 0);
+
+    let cap = pair.drain_captured();
+    let segments: Vec<_> = cap.tcp()
+        .direction(Dir::AtoB)
+        .with_data()
+        .collect();
+
+    assert_ok!(
+        segments.len() >= 4,
+        "only {} data segments captured — need ≥4 for gap analysis",
+        segments.len()
+    );
+
+    // Interval-based validation: each gap should be consistent with the
+    // pacing interval (MSS * 1e9 / rate).  BBR rate evolves, so use
+    // pre- and post-burst rates to define the tolerance band.
+    let rate_end = pair.tcp_a().bbr_pacing_rate_bps();
+    let mss = pair.tcp_cfg.mss as u64;
+    let interval_lo = mss * 1_000_000_000 / rate.max(rate_end).max(1);
+    let interval_hi = mss * 1_000_000_000 / rate.min(rate_end).max(1);
+
+    let mut within_tolerance = 0usize;
+    let mut total_comparable = 0usize;
+    for w in segments.windows(2) {
+        let gap_ns = w[1].ts_ns.saturating_sub(w[0].ts_ns);
+        if gap_ns == 0 { continue; }
+        total_comparable += 1;
+        if gap_ns >= interval_lo / 3 && gap_ns <= interval_hi * 3 {
+            within_tolerance += 1;
+        }
+    }
+    assert_ok!(
+        total_comparable >= 3,
+        "only {total_comparable} comparable gaps — test scenario too small"
+    );
+    assert_ok!(
+        within_tolerance * 2 >= total_comparable,
+        "only {within_tolerance}/{total_comparable} gaps within tolerance of pacing interval \
+         (rate=[{rate}, {rate_end}], interval=[{interval_lo}ns, {interval_hi}ns])"
+    );
+
+    Ok(())
+}
