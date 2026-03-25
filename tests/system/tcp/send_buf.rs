@@ -189,3 +189,69 @@ fn send_buf_drains_as_acked() -> TestResult {
 
     Ok(())
 }
+
+// ── flow_control_window_grows ─────────────────────────────────────────────────
+//
+// RFC 9293 §3.8 (Data Communication): During a 30 KB bulk transfer, B's
+// advertised window should always be > 0 and all data delivered.
+#[test]
+fn flow_control_window_grows() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let data = vec![0xABu8; 30_000];
+    pair.tcp_a_mut().send(&data)?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let windows: Vec<u16> = cap.tcp()
+        .direction(Dir::BtoA)
+        .with_tcp_flags(TcpFlags::ACK)
+        .without_tcp_flags(TcpFlags::SYN)
+        .map(|f| f.tcp.window_raw)
+        .collect();
+    assert_ok!(!windows.is_empty(), "no ACKs from B");
+
+    let all_nonzero = windows.iter().all(|&w| w > 0);
+    assert_ok!(
+        all_nonzero,
+        "B advertised zero window during transfer — windows: {:?}", &windows[..windows.len().min(10)]
+    );
+
+    // Window should show growth: max > min (receiver opens window as data is consumed).
+    let min_w = *windows.iter().min().unwrap();
+    let max_w = *windows.iter().max().unwrap();
+    assert_ok!(
+        max_w > min_w,
+        "window did not grow during transfer — all values equal ({min_w})"
+    );
+
+    let total: usize = cap.tcp()
+        .direction(Dir::AtoB)
+        .with_data()
+        .map(|f| f.payload_len)
+        .sum();
+    assert_ok!(
+        total == 30_000,
+        "expected 30000 bytes delivered, got {total}"
+    );
+
+    // Send buffer should be fully drained.
+    let buf_len = pair.tcp_a().send_buf_len();
+    assert_ok!(buf_len == 0, "send_buf not fully drained: {buf_len} bytes remaining");
+
+    // Verify A's effective (scaled) send window is non-zero and > MSS.
+    // The raw window check above only proves the 16-bit field is non-zero;
+    // this proves the actual usable window (with scaling applied) is meaningful.
+    let snd_wnd = pair.tcp_a().snd_wnd();
+    let mss = pair.tcp_a().peer_mss() as u32;
+    assert_ok!(
+        snd_wnd >= mss,
+        "scaled snd_wnd ({snd_wnd}) < MSS ({mss}) after 30KB transfer — \
+         window should have grown"
+    );
+
+    Ok(())
+}
