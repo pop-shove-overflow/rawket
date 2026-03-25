@@ -1976,3 +1976,88 @@ fn fin_on_completing_ack() -> TestResult {
 
     Ok(())
 }
+
+// ── rst_in_closing ──────────────────────────────────────────────────────────
+//
+// RFC 9293 §3.5.3 (Reset Processing): RST with SEQ == RCV.NXT in Closing
+// state must immediately close the connection.
+//
+// Drive to Closing via simultaneous close: both sides call close() with
+// blackholed links, then manually deliver cross-FINs so both reach Closing
+// (FIN received, own FIN not yet ACKed).  Inject exact RST to verify Closed.
+#[test]
+fn rst_in_closing() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Record seq/ack before closing.
+    let a_snd_nxt = pair.tcp_a().snd_nxt();
+    let b_snd_nxt = pair.tcp_b().snd_nxt();
+
+    // Blackhole both directions so nothing crosses.
+    pair.blackhole_both();
+
+    // Both sides close → FinWait1 (FINs queued but blackholed).
+    pair.tcp_a_mut().close()?;
+    pair.tcp_b_mut().close()?;
+    pair.transfer_one();
+
+    assert_state(pair.tcp_a(), State::FinWait1, "A FinWait1")?;
+    assert_state(pair.tcp_b(), State::FinWait1, "B FinWait1")?;
+
+    // Build cross-FINs and inject directly (bypassing impairments).
+    // B's FIN → A: FIN|ACK from B, seq=b_snd_nxt, ack=a_snd_nxt
+    let fin_b_to_a = build_tcp_data_with_ts(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        b_snd_nxt, a_snd_nxt,
+        pair.clock_b.monotonic_ms() as u32,
+        pair.tcp_b().ts_recent(),
+        &[],
+    );
+    let mut fin_b_to_a = fin_b_to_a;
+    fin_b_to_a[47] = 0x11; // FIN|ACK
+    crate::packet::recompute_frame_tcp_checksum(&mut fin_b_to_a);
+    pair.net.inject_to_a(fin_b_to_a);
+
+    // A's FIN → B: FIN|ACK from A, seq=a_snd_nxt, ack=b_snd_nxt
+    let fin_a_to_b = build_tcp_data_with_ts(
+        pair.mac_a, pair.mac_b,
+        pair.ip_a,  pair.ip_b,
+        12345, 80,
+        a_snd_nxt, b_snd_nxt,
+        pair.clock_a.monotonic_ms() as u32,
+        pair.tcp_a().ts_recent(),
+        &[],
+    );
+    let mut fin_a_to_b = fin_a_to_b;
+    fin_a_to_b[47] = 0x11; // FIN|ACK
+    crate::packet::recompute_frame_tcp_checksum(&mut fin_a_to_b);
+    pair.net.inject_to_b(fin_a_to_b);
+
+    pair.transfer_one();
+
+    // Both should be in Closing (received peer FIN, own FIN not yet ACKed).
+    assert_state(pair.tcp_a(), State::Closing, "A Closing")?;
+    assert_state(pair.tcp_b(), State::Closing, "B Closing")?;
+
+    // Inject exact-match RST to A.
+    {
+        let rcv_nxt = pair.tcp_a().rcv_nxt();
+        let rst = build_tcp_rst(
+            pair.mac_b, pair.mac_a,
+            pair.ip_b,  pair.ip_a,
+            80, 12345,
+            rcv_nxt,
+        );
+        pair.net.inject_to_a(rst);
+        pair.transfer_one();
+        assert_state(pair.tcp_a(), State::Closed, "A Closed after RST in Closing")?;
+        assert_error_fired(pair.tcp_a(), TcpError::Reset, "A error = Reset")?;
+    }
+
+    Ok(())
+}
