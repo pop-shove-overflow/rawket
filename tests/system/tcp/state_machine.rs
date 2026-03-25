@@ -2104,3 +2104,41 @@ fn rst_in_last_ack() -> TestResult {
 
     Ok(())
 }
+
+// ── close_noop_in_listen ────────────────────────────────────────────────────
+//
+// close() in Listen is a no-op — the socket stays in Listen without
+// sending any segment or changing state.
+#[test]
+fn close_noop_in_listen() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    let listener = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {}, cfg,
+    )?;
+    let ib = np.add_tcp_b(listener);
+    assert_ok!(np.tcp_b(ib).state == State::Listen, "B not in Listen");
+
+    np.clear_capture();
+    let result = np.tcp_b_mut(ib).close();
+    assert_ok!(result.is_ok(), "close() in Listen returned error");
+
+    // State unchanged — close() is a no-op in Listen.
+    assert_ok!(
+        np.tcp_b(ib).state == State::Listen,
+        "B left Listen after close(): {:?}", np.tcp_b(ib).state
+    );
+
+    // No segment should be sent.
+    np.transfer_one();
+    let cap = np.drain_captured();
+    let b_sent = cap.tcp().from_b().count();
+    assert_ok!(b_sent == 0, "B sent {b_sent} segment(s) after close() in Listen");
+
+    Ok(())
+}
