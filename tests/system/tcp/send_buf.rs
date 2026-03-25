@@ -296,3 +296,66 @@ fn cwnd_gate_limits_inflight() -> TestResult {
 
     Ok(())
 }
+
+// ── send_buf_data_ordering ────────────────────────────────────────────────────
+//
+// RFC 9293 §3.8 (Data Communication): Send "AAAA" then "BBBB"; data frames
+// must appear in monotonically non-decreasing sequence order with contiguous
+// coverage.
+#[test]
+fn send_buf_data_ordering() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"AAAA")?;
+    pair.tcp_a_mut().send(b"BBBB")?;
+    let result = pair.transfer();
+
+    // End-to-end payload content integrity: verify B received "AAAABBBB".
+    let received = result.b.get(&0).cloned().unwrap_or_default();
+    assert_ok!(
+        received == b"AAAABBBB",
+        "B received {:?}, expected b\"AAAABBBB\" — payload content corrupted or reordered",
+        core::str::from_utf8(&received).unwrap_or("<non-utf8>")
+    );
+
+    let cap = pair.drain_captured();
+    let total: usize = cap.tcp()
+        .direction(Dir::AtoB)
+        .with_data()
+        .map(|f| f.payload_len)
+        .sum();
+    assert_ok!(total == 8, "expected 8 bytes sent, got {total}");
+
+    // Collect transmitted segments and verify monotonically non-decreasing
+    // sequence numbers.  Retransmits (same seq as previous) are allowed but
+    // sequence regressions are not.
+    let frames: Vec<(u32, usize)> = cap.tcp()
+        .direction(Dir::AtoB)
+        .with_data()
+        .map(|f| (f.tcp.seq, f.payload_len))
+        .collect();
+    for i in 1..frames.len() {
+        // Allow retransmits: same seq as the previous frame is OK.
+        if frames[i].0 == frames[i - 1].0 {
+            continue;
+        }
+        let diff = frames[i].0.wrapping_sub(frames[i - 1].0);
+        assert_ok!(
+            diff < 0x8000_0000,
+            "data frame {} seq ({}) < frame {} seq ({}) — ordering violated",
+            i, frames[i].0, i - 1, frames[i - 1].0
+        );
+        let expected_seq = frames[i - 1].0.wrapping_add(frames[i - 1].1 as u32);
+        let gap = frames[i].0.wrapping_sub(expected_seq);
+        assert_ok!(
+            gap < 0x8000_0000,
+            "gap in sequence space between frame {} and {}: expected seq {expected_seq}, got {}",
+            i - 1, i, frames[i].0
+        );
+    }
+
+    Ok(())
+}
