@@ -157,3 +157,35 @@ fn flow_control_window() -> TestResult {
 
     Ok(())
 }
+
+// ── send_buf_drains_as_acked ──────────────────────────────────────────────────
+//
+// RFC 9293 §3.8 (Data Communication): After B ACKs 100 bytes, a subsequent
+// 100-byte send must succeed.
+#[test]
+fn send_buf_drains_as_acked() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let data = vec![0u8; 100];
+    pair.tcp_a_mut().send(&data)?;
+    pair.transfer();
+
+    pair.tcp_a_mut().send(&data)?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let total_bytes: usize = cap.tcp()
+        .direction(Dir::AtoB)
+        .map(|f| f.payload_len)
+        .sum();
+    assert_ok!(total_bytes >= 200, "expected ≥200 bytes from A, got {total_bytes}");
+
+    // Buffer must be fully drained after ACKs.
+    let buf_len = pair.tcp_a().send_buf_len();
+    assert_ok!(buf_len == 0, "send_buf not drained after ACKs: {buf_len} bytes remaining");
+
+    Ok(())
+}
