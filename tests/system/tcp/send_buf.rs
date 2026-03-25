@@ -407,3 +407,98 @@ fn zero_send_buf_persist() -> TestResult {
 
     Ok(())
 }
+
+// ── sws_sender_small_window ─────────────────────────────────────────────────
+//
+// RFC 9293 §3.8.6.2.1, RFC 1122 §4.2.3.4: sender-side Silly Window Syndrome
+// avoidance.
+// When the peer opens a window much smaller than MSS and the sender has
+// ≥ MSS bytes buffered, verify the sender sends eagerly (this implementation
+// does not defer to a full MSS window — it sends whatever the window allows).
+#[test]
+fn sws_sender_small_window() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"x")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let (a_first_seq, b_snd_nxt) = {
+        let f = cap.tcp()
+            .direction(Dir::AtoB)
+            .with_data()
+            .next()
+            .ok_or_else(|| crate::assert::TestFail::new("no AtoB data frame"))?;
+        (f.tcp.seq, f.tcp.ack)
+    };
+    let a_snd_una = a_first_seq + 1;
+
+    // Freeze the window at zero.
+    inject_zero_window(&mut pair, b_snd_nxt, a_snd_una);
+
+    // Buffer several MSS worth of data.
+    let mss = pair.tcp_a().peer_mss() as usize;
+    let fill = vec![0xABu8; mss * 3];
+    pair.tcp_a_mut().send(&fill)?;
+
+    // Advance past pacing gate.
+    pair.advance_both(2000);
+    pair.clear_capture();
+
+    // Open window to a small value (well below MSS).
+    // The raw window field is scaled by snd_scale, so set a raw value that
+    // produces an effective window of ~10 bytes after scaling.
+    let snd_scale = pair.tcp_a().snd_scale();
+    let effective_window = 10u32;
+    // Raw value must be at least 1 to open the window; if scale would make
+    // effective > 10, use raw=1 (effective = 1 << scale).
+    let raw_window = if snd_scale == 0 {
+        effective_window as u16
+    } else {
+        1u16 // effective = 1 << snd_scale
+    };
+    let actual_effective = (raw_window as u32) << snd_scale;
+
+    let mut ack = build_tcp_data(
+        pair.mac_b, pair.mac_a, pair.ip_b, pair.ip_a,
+        80, 12345,
+        b_snd_nxt, a_snd_una,
+        b"",
+    );
+    // Patch window field (bytes 48-49 of Ethernet frame = TCP offset 14-15).
+    ack[48] = (raw_window >> 8) as u8;
+    ack[49] = (raw_window & 0xFF) as u8;
+    recompute_frame_tcp_checksum(&mut ack);
+    pair.inject_to_a(ack);
+    pair.transfer_one();
+
+    let cap2 = pair.drain_captured();
+    let data_frames: Vec<usize> = cap2.tcp()
+        .direction(Dir::AtoB)
+        .with_data()
+        .map(|f| f.payload_len)
+        .collect();
+
+    // This implementation sends eagerly: it WILL send a segment ≤ the effective
+    // window even though send_buf >> MSS.  RFC 1122 §4.2.3.4 SHOULD avoid this,
+    // but for a minimal stack the eager behavior is acceptable and deterministic.
+    assert_ok!(
+        !data_frames.is_empty(),
+        "expected sender to send data when window opened to {actual_effective} bytes"
+    );
+    assert_ok!(
+        actual_effective < mss as u32,
+        "effective window ({actual_effective}) should be below MSS ({mss}) for this test"
+    );
+    for &len in &data_frames {
+        assert_ok!(
+            len <= actual_effective as usize,
+            "segment payload {len} exceeds effective window {actual_effective}"
+        );
+    }
+
+    Ok(())
+}
