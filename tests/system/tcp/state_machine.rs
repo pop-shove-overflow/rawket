@@ -1443,3 +1443,55 @@ fn syn_challenge_ack_in_fin_wait2() -> TestResult {
 
     Ok(())
 }
+
+// ── rst_in_syn_received ─────────────────────────────────────────────────────
+//
+// RFC 9293 §3.10.7.3: RST in SynReceived with SEQ == RCV.NXT aborts the
+// connection back to Listen (passive open) or Closed (active open).
+// Our implementation always goes to Closed.
+#[test]
+fn rst_in_syn_received() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    let listener = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {}, cfg,
+    )?;
+    let ib = np.add_tcp_b(listener);
+
+    // Send SYN → B enters SynReceived.
+    let isn_a: u32 = 7000;
+    let syn = build_tcp_syn(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a, 0, 0x02,
+        Some(1460), None, None, false,
+    );
+    np.inject_to_b(syn);
+    np.transfer_one();
+    assert_ok!(np.tcp_b(ib).state == State::SynReceived, "B not SynReceived");
+
+    let rcv_nxt = np.tcp_b(ib).rcv_nxt();
+
+    // Inject exact-match RST.
+    let rst = build_tcp_rst(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        rcv_nxt,
+    );
+    np.inject_to_b(rst);
+    np.transfer_one();
+
+    assert_ok!(
+        np.tcp_b(ib).state == State::Closed,
+        "B not Closed after RST in SynReceived: {:?}", np.tcp_b(ib).state
+    );
+
+    Ok(())
+}
