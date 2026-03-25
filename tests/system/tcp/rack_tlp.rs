@@ -457,3 +457,81 @@ fn tlp_not_if_rto_sooner() -> TestResult {
 
     Ok(())
 }
+
+// RFC 8985 §3.3.2: reo_wnd adapts after D-SACK events.  The decay formula
+// (reo_wnd -= reo_wnd/8 + 1 per round) is implementation-specific; RFC 8985
+// uses a reo_wnd_mult/reo_wnd_persist counter mechanism instead.
+#[test]
+fn rack_reo_wnd_decay() -> TestResult {
+    let mut pair = setup_tcp_pair().profile(LinkProfile::leased_line_100m()).connect();
+
+    // Warm up BBR.
+    pair.tcp_a_mut().send(&[0xaau8; 1000])?;
+    pair.transfer();
+
+    pair.clear_capture();
+    pair.tcp_a_mut().send(&[0xbbu8; 100])?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let bta = cap.tcp().from_b().last()
+        .ok_or_else(|| TestFail::new("no B→A ACK frame for D-SACK setup"))?;
+    let (b_seq, a_snd_una) = (bta.tcp.seq, bta.tcp.ack);
+    let (b_src_port, a_dst_port) = (bta.src_port, bta.dst_port);
+
+    // Inject D-SACK.
+    let dsack = build_tcp_data_with_sack_ts(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        b_src_port, a_dst_port,
+        b_seq, a_snd_una,
+        0, 0, // timestamps patched by inject_to_a
+        &[(a_snd_una.wrapping_sub(100), a_snd_una)],
+        &[],
+    );
+    pair.inject_to_a(dsack);
+    pair.transfer_one();
+
+    let reo_wnd_after_dsack = pair.tcp_a().rack_reo_wnd_ns();
+    assert_ok!(reo_wnd_after_dsack > 0, "reo_wnd should be >0 after D-SACK, got {reo_wnd_after_dsack}");
+
+    // Drive clean ACK rounds — each send+transfer completes a round.
+    let mut reo_samples = vec![reo_wnd_after_dsack];
+    for _ in 0..20 {
+        pair.tcp_a_mut().send(&[0xccu8; 100])?;
+        pair.transfer();
+        reo_samples.push(pair.tcp_a().rack_reo_wnd_ns());
+    }
+
+    let reo_wnd_after_decay = *reo_samples.last().unwrap();
+    assert_ok!(
+        reo_wnd_after_decay < reo_wnd_after_dsack,
+        "reo_wnd did not decay: after_dsack={reo_wnd_after_dsack}, after={reo_wnd_after_decay}"
+    );
+
+    // Verify decay rate: reo_wnd -= reo_wnd/8 + 1 per round.
+    // Check consecutive pairs where decay actually occurred (reo_wnd changed).
+    let mut verified_decays = 0;
+    for w in reo_samples.windows(2) {
+        let (prev, cur) = (w[0], w[1]);
+        if prev == cur || prev == 0 { continue; }
+        let expected_decay = prev.saturating_sub(prev / 8 + 1);
+        assert_ok!(
+            cur == expected_decay,
+            "reo_wnd decay mismatch: {prev} -> {cur}, expected {expected_decay} \
+             (prev - prev/8 - 1); samples: {reo_samples:?}"
+        );
+        verified_decays += 1;
+    }
+    assert_ok!(
+        verified_decays >= 3,
+        "too few decay steps verified ({verified_decays}); samples: {reo_samples:?}"
+    );
+
+    assert_ok!(
+        pair.tcp_a().state == rawket::tcp::State::Established,
+        "A not Established: {:?}", pair.tcp_a().state
+    );
+
+    Ok(())
+}
