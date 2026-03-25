@@ -273,3 +273,53 @@ fn tlp_probe_advances_connection() -> TestResult {
 
     Ok(())
 }
+
+// RFC 8985: RACK should detect multiple losses within a single window.
+// Drop segments #1 and #2 (both consecutive); verify A retransmits both.
+#[test]
+fn multiple_losses_detected() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Seed BBR/SRTT.
+    pair.tcp_a_mut().send(b"init-phase-data-xxxx")?;
+    pair.transfer();
+    pair.clear_capture();
+
+    // Drop the first 2 data segments.
+    pair.add_impairment_to_b(Impairment::Drop(PacketSpec::nth_matching(1, filter::tcp::has_data())));
+    pair.add_impairment_to_b(Impairment::Drop(PacketSpec::nth_matching(1, filter::tcp::has_data())));
+
+    // Send enough for 3+ segments. Impairments drop during transfer, then exhaust.
+    // After both nth_matching(1) fire, remaining segments + retransmits go through.
+    pair.tcp_a_mut().send(&[0xaau8; 5000])?;
+    pair.transfer();
+
+    assert_ok!(
+        pair.tcp_a().state == rawket::tcp::State::Established,
+        "A not Established after multiple losses: {:?}", pair.tcp_a().state
+    );
+
+    // Verify data was eventually delivered (retransmits happened).
+    let cap = pair.drain_captured();
+    let total_data: usize = cap.tcp().from_a().with_data().map(|f| f.payload_len).sum();
+    assert_ok!(total_data >= 3000, "expected ≥3000 bytes delivered after loss recovery, got {total_data}");
+
+    // Verify ≥2 segments were dropped and both retransmitted.
+    let dropped_seqs: Vec<u32> = cap.all_tcp().from_a().dropped().with_data()
+        .map(|f| f.tcp.seq)
+        .collect();
+    assert_ok!(
+        dropped_seqs.len() >= 2,
+        "expected ≥2 dropped segments, got {}: {:?}", dropped_seqs.len(), dropped_seqs
+    );
+    for &seq in &dropped_seqs {
+        let retx = cap.all_tcp().from_a().delivered().with_data()
+            .filter(|f| f.tcp.seq == seq)
+            .count();
+        assert_ok!(retx >= 1, "dropped segment seq={seq} was never retransmitted");
+    }
+
+    Ok(())
+}
