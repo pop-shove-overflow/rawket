@@ -359,3 +359,51 @@ fn send_buf_data_ordering() -> TestResult {
 
     Ok(())
 }
+
+// ── zero_send_buf_persist ─────────────────────────────────────────────────────
+//
+// RFC 9293 §3.8 (Data Communication): Empty send_buf + zero window: persist
+// timer must NOT arm (nothing to probe).
+#[test]
+fn zero_send_buf_persist() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"x")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let (a_snd_una, b_snd_nxt) = {
+        let f = cap.tcp()
+            .direction(Dir::AtoB)
+            .with_data()
+            .next()
+            .ok_or_else(|| crate::assert::TestFail::new("no AtoB data frame"))?;
+        (f.tcp.seq + 1, f.tcp.ack)
+    };
+
+    inject_zero_window(&mut pair, b_snd_nxt, a_snd_una);
+    pair.clear_capture();
+
+    // Persist should NOT be armed (send_buf is empty).
+    let timers = pair.tcp_a().timer_state();
+    assert_ok!(timers.persist_ns.is_none(), "persist armed with empty send_buf: {timers:?}");
+
+    let rto = pair.tcp_a().rto_ms() as i64;
+    pair.advance_both(rto * 4);
+    pair.transfer_one();
+
+    // Check all A→B frames (not just with_data — persist probes may be 0 or 1 byte).
+    let cap2 = pair.drain_captured();
+    let a_frames = cap2.tcp()
+        .direction(Dir::AtoB)
+        .count();
+    assert_ok!(
+        a_frames == 0,
+        "frames sent from A with empty send_buf ({a_frames} frames) — persist should not arm"
+    );
+
+    Ok(())
+}
