@@ -1495,3 +1495,34 @@ fn rst_in_syn_received() -> TestResult {
 
     Ok(())
 }
+
+// ── rst_in_fin_wait2 ────────────────────────────────────────────────────────
+//
+// RFC 9293 §3.10.7.4: exact-match RST in a teardown state resets to Closed.
+// Tests the shared RST handler from a non-Established state.
+#[test]
+fn rst_in_fin_wait2() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().close()?;
+    pair.transfer_while(|p| p.tcp_a(0).state != State::FinWait2);
+    assert_state(pair.tcp_a(), State::FinWait2, "A FinWait2")?;
+
+    let rcv_nxt = pair.tcp_a().rcv_nxt();
+    let rst = build_tcp_rst(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        rcv_nxt,
+    );
+    pair.inject_to_a(rst);
+    pair.transfer_one();
+
+    assert_state(pair.tcp_a(), State::Closed, "A Closed after RST in FinWait2")?;
+    assert_error_fired(pair.tcp_a(), TcpError::Reset, "A error = Reset")?;
+
+    Ok(())
+}
