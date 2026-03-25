@@ -535,3 +535,51 @@ fn rack_reo_wnd_decay() -> TestResult {
 
     Ok(())
 }
+
+// RFC 8985 §7.3: TLP retransmits the last unacked segment (verified by seq number match).
+//
+// Uses a leased-line profile so the handshake establishes SRTT > 0 —
+// TLP is only armed when SRTT is known.
+#[test]
+fn tlp_probe_is_tail_segment() -> TestResult {
+    let mut pair = setup_tcp_pair().profile(LinkProfile::leased_line_100m()).connect();
+
+    // Warm up SRTT with a data exchange.
+    pair.tcp_a_mut().send(b"warmup")?;
+    pair.transfer();
+    pair.clear_capture();
+
+    let srtt = pair.tcp_a().srtt_ms();
+    assert_ok!(srtt > 0, "SRTT not established after warmup");
+
+    // Drop B's first ACK so TLP fires. nth_matching(1) only drops the first.
+    pair.add_impairment_to_a(Impairment::Drop(PacketSpec::nth_matching(1, filter::tcp::ack())));
+    pair.tcp_a_mut().send(b"tail-probe-test")?;
+
+    // transfer() drives: data→B, B's ACK dropped, TLP fires, B ACKs probe.
+    pair.transfer();
+
+    // Collect all AtoB data frames — expect original + TLP probe.
+    let cap = pair.drain_captured();
+    let data_seq = cap.tcp().from_a().with_data().next()
+        .map(|f| f.tcp.seq)
+        .ok_or_else(|| TestFail::new("no AtoB data"))?;
+    let probe_count = cap.all_tcp().from_a().delivered().with_data()
+        .filter(|f| f.tcp.seq == data_seq)
+        .count();
+
+    // Expect ≥2: the original send + at least one TLP probe retransmit.
+    assert_ok!(
+        probe_count >= 2,
+        "expected ≥2 frames with seq={data_seq} (original + TLP probe), got {probe_count}"
+    );
+
+    // RFC 7323 §3.2: TLP probe must carry timestamps.
+    let probe = cap.all_tcp().from_a().delivered().with_data()
+        .filter(|f| f.tcp.seq == data_seq)
+        .last()
+        .ok_or_else(|| TestFail::new("no TLP probe frame found"))?;
+    assert_timestamps_present(&probe, "TLP probe")?;
+
+    Ok(())
+}
