@@ -631,3 +631,66 @@ fn rack_loss_triggers_bbr_on_loss() -> TestResult {
 
     Ok(())
 }
+
+// Numerical verification of the RACK time-based threshold per RFC 8985 §6.2.
+//
+// RACK declares a segment lost when:
+//   now >= seg.last_sent_ns + rack_rtt + reorder_window
+// where reorder_window = min_rtt/4 on a clean link (no D-SACK).
+//
+// To isolate the time criterion from the packet-count criterion (≥3 SACKed
+// after hole), we send exactly two segments — one dropped, one delivered —
+// staggered in time by more than reo_wnd so the time check fires on the
+// first SACK.
+#[test]
+fn rack_threshold_formula() -> TestResult {
+    // Stable 100 Mbps / 10 ms one-way → 20 ms RTT, no jitter.
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Phase 1: seed RTT with a lossless transfer.
+    pair.tcp_a_mut().send(&[0xAAu8; 5000])?;
+    pair.transfer();
+
+    let min_rtt_ms = pair.tcp_a().bbr_min_rtt_ns() / 1_000_000;
+    assert_ok!(min_rtt_ms > 0, "no RTT sample — test scenario invalid");
+
+    // reo_wnd = min_rtt/4 = 5 ms.  Stagger seg1→seg2 by reo_wnd + 5 ms
+    // so the time criterion fires when seg2's SACK arrives.
+    let reo_wnd_ms = (min_rtt_ms / 4).max(1);
+    let stagger_ms = reo_wnd_ms + 5;
+
+    // Phase 2: two staggered segments — seg1 dropped, seg2 delivered.
+    // Only 1 segment SACKed after hole → packet-count criterion (≥3) cannot
+    // fire, isolating the time-based threshold.
+    pair.clear_capture();
+    pair.drop_next_data_to_b();
+    pair.tcp_a_mut().send(&[0xBBu8; 1460])?;     // seg1 (dropped)
+    pair.advance_both(stagger_ms as i64);
+    pair.tcp_a_mut().send(&[0xCCu8; 1460])?;     // seg2 (delivered)
+    pair.transfer();
+
+    // Find dropped seg1 and its RACK retransmit (same seq).
+    let cap = pair.drain_captured();
+    let dropped = cap.all_tcp().from_a().dropped().with_data().next()
+        .ok_or_else(|| TestFail::new("no dropped segment — impairment didn't fire"))?;
+    let retx = cap.all_tcp().from_a().delivered().with_data()
+        .find(|f| f.tcp.seq == dropped.tcp.seq)
+        .ok_or_else(|| TestFail::new(
+            "RACK retransmit never delivered — time criterion may not have fired"
+        ))?;
+
+    // Gap = stagger + RTT (seg2 must traverse to B and SACK must return).
+    // Expected: stagger_ms + min_rtt_ms.
+    let gap = retx.ms_since(&dropped);
+    let expected = stagger_ms + min_rtt_ms;
+    assert_ok!(
+        gap >= expected - 2 && gap <= expected + 2,
+        "RACK retransmit gap {gap}ms outside [{}, {}]ms \
+         (stagger={stagger_ms}ms, min_rtt={min_rtt_ms}ms, expected={expected}ms)",
+        expected - 2, expected + 2
+    );
+
+    Ok(())
+}
