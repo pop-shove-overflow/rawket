@@ -1628,3 +1628,67 @@ fn send_in_syn_received() -> TestResult {
 
     Ok(())
 }
+
+// ── last_ack_rejects_stale_ack ──────────────────────────────────────────────
+//
+// RFC 9293 §3.10.7.4: LastAck → Closed only when ACK covers our FIN
+// (seg.ack >= snd_nxt).  A stale ACK must not trigger premature close.
+#[test]
+fn last_ack_rejects_stale_ack() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // B closes first → A enters CloseWait.
+    pair.tcp_b_mut().close()?;
+    pair.transfer_while(|p| p.tcp_a(0).state != State::CloseWait);
+    assert_state(pair.tcp_a(), State::CloseWait, "A CloseWait")?;
+
+    // A closes → LastAck (FIN sent, waiting for ACK).
+    pair.blackhole_to_b(); // prevent B's ACK from reaching A
+    pair.tcp_a_mut().close()?;
+    pair.transfer_one(); // FIN departs
+    assert_state(pair.tcp_a(), State::LastAck, "A LastAck")?;
+
+    let snd_nxt = pair.tcp_a().snd_nxt();
+    let rcv_nxt = pair.tcp_a().rcv_nxt();
+    pair.clear_impairments();
+
+    // Inject stale ACK (ack < snd_nxt — doesn't cover our FIN).
+    let stale = crate::packet::build_tcp_data_with_ts(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        rcv_nxt,
+        snd_nxt.wrapping_sub(1), // stale: doesn't cover FIN
+        0, 0,
+        b"",
+    );
+    pair.inject_to_a(stale);
+    pair.transfer_one();
+
+    // Must still be in LastAck — stale ACK rejected, no error.
+    assert_state(pair.tcp_a(), State::LastAck, "A still LastAck after stale ACK")?;
+    assert_ok!(
+        pair.tcp_a().last_error.is_none(),
+        "error fired on stale ACK in LastAck — should be silently ignored"
+    );
+
+    // Positive path: inject valid ACK covering FIN → Closed.
+    pair.clear_impairments();
+    let valid = crate::packet::build_tcp_data_with_ts(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        rcv_nxt,
+        snd_nxt, // covers FIN
+        0, 0,
+        b"",
+    );
+    pair.inject_to_a(valid);
+    pair.transfer_one();
+    assert_state(pair.tcp_a(), State::Closed, "A Closed after valid ACK in LastAck")?;
+
+    Ok(())
+}
