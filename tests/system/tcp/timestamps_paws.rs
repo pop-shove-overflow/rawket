@@ -758,3 +758,76 @@ fn missing_ts_rejected_after_negotiation() -> TestResult {
 
     Ok(())
 }
+
+// ── time_wait_accepts_old_timestamps ────────────────────────────────────────
+//
+// RFC 7323 §5.3 R2: PAWS processing MUST NOT apply to RST segments.
+// Additionally, in TIME-WAIT, a retransmitted FIN (duplicate of the
+// peer's already-processed FIN) may arrive with an old TSval.  Per
+// RFC 9293 §3.10.7.4 (TIME-WAIT processing): a duplicate FIN in
+// TimeWait resets the 2MSL timer and elicits an ACK — it must NOT be
+// PAWS-rejected.
+#[test]
+fn time_wait_accepts_old_timestamps() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    use rawket::tcp::State;
+
+    let mut pair = setup_tcp_pair()
+        .time_wait_ms(500)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Drive A to TimeWait: A closes, then B closes.
+    pair.tcp_a_mut().close()?;
+    pair.transfer();
+    assert_state(pair.tcp_a(), State::FinWait2, "A should reach FinWait2")?;
+
+    pair.tcp_b_mut().close()?;
+    pair.transfer_while(|p| p.tcp_a(0).state != State::TimeWait);
+    assert_state(pair.tcp_a(), State::TimeWait, "A should be in TimeWait")?;
+
+    // Capture the last ts_recent from A (the current clock value).
+    let ts_recent = pair.tcp_a().ts_recent();
+    let rcv_nxt = pair.tcp_a().rcv_nxt();
+    let a_snd_nxt = pair.tcp_a().snd_nxt();
+
+    pair.clear_capture();
+
+    // Inject a duplicate FIN from B with an OLD TSval (well behind ts_recent).
+    // This simulates a retransmitted FIN arriving late.
+    let old_tsval = ts_recent.wrapping_sub(5000);
+    let dup_fin = build_tcp_data_with_ts(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        rcv_nxt.wrapping_sub(1),  // FIN seq = rcv_nxt - 1 (duplicate FIN)
+        a_snd_nxt,
+        old_tsval,                // stale TSval
+        pair.clock_a.monotonic_ms() as u32,
+        &[],
+    );
+    // Patch flags to FIN|ACK (0x11).
+    let mut dup_fin = dup_fin;
+    dup_fin[47] = 0x11;
+    recompute_frame_tcp_checksum(&mut dup_fin);
+
+    pair.net.inject_to_a(dup_fin);
+    pair.transfer_one();
+
+    // A must stay in TimeWait (not PAWS-rejected, not Closed).
+    assert_state(pair.tcp_a(), State::TimeWait, "A should stay in TimeWait after old-TS FIN")?;
+
+    // A must send an ACK in response to the duplicate FIN.
+    let cap = pair.drain_captured();
+    let ack = cap.tcp().from_a()
+        .with_tcp_flags(TcpFlags::ACK)
+        .without_tcp_flags(TcpFlags::SYN)
+        .without_tcp_flags(TcpFlags::RST)
+        .next();
+    assert_ok!(
+        ack.is_some(),
+        "A did not send ACK for duplicate FIN with old TSval in TimeWait"
+    );
+
+    Ok(())
+}
