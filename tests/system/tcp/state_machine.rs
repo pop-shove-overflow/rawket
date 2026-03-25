@@ -2061,3 +2061,46 @@ fn rst_in_closing() -> TestResult {
 
     Ok(())
 }
+
+// ── rst_in_last_ack ─────────────────────────────────────────────────────────
+//
+// RFC 9293 §3.5.3 (Reset Processing): RST with SEQ == RCV.NXT in LastAck
+// state must immediately close the connection.
+//
+// B closes first → A enters CloseWait, A closes → LastAck.  Blackhole
+// B→A so B's final ACK never arrives, leaving A in LastAck.  Inject RST.
+#[test]
+fn rst_in_last_ack() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // B closes → A enters CloseWait.
+    pair.tcp_b_mut().close()?;
+    pair.transfer_while(|p| p.tcp_a(0).state != State::CloseWait);
+    assert_state(pair.tcp_a(), State::CloseWait, "A CloseWait")?;
+
+    // Blackhole B→A so B's ACK of A's FIN never arrives.
+    pair.blackhole_to_a();
+
+    // A closes → LastAck (FIN sent but not ACKed because blackholed).
+    pair.tcp_a_mut().close()?;
+    pair.transfer_one();
+    assert_state(pair.tcp_a(), State::LastAck, "A LastAck")?;
+
+    // Inject exact-match RST from B.
+    let rcv_nxt = pair.tcp_a().rcv_nxt();
+    let rst = build_tcp_rst(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        rcv_nxt,
+    );
+    pair.net.inject_to_a(rst);
+    pair.transfer_one();
+
+    assert_state(pair.tcp_a(), State::Closed, "A Closed after RST in LastAck")?;
+
+    Ok(())
+}
