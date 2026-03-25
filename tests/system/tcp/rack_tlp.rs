@@ -7,8 +7,8 @@ use crate::{
     assert::{TestFail, assert_timestamps_present},
     assert_ok,
     capture::ParsedFrameExt,
-    harness::{fast_tcp_cfg, setup_network_pair, setup_tcp_pair},
-    packet::build_tcp_data_with_sack,
+    harness::{setup_network_pair, setup_tcp_pair},
+    packet::build_tcp_data_with_sack_ts,
     TestResult,
 };
 use std::net::Ipv4Addr;
@@ -101,6 +101,69 @@ fn rack_basic_loss_detection() -> TestResult {
     assert_ok!(
         gap_ms < rto,
         "original→retransmit gap {gap_ms}ms >= RTO ({rto}ms) — looks like RTO, not RACK"
+    );
+
+    Ok(())
+}
+
+// RFC 8985 §3.3.2 (Reordering Window Adaptation): reorder window adapts after
+// D-SACK events. Inject D-SACK to A, verify reo_wnd increased from its
+// initial value.
+#[test]
+fn rack_reorder_window_adapts() -> TestResult {
+    let mut pair = setup_tcp_pair().profile(LinkProfile::leased_line_100m()).connect();
+
+    // Seed SRTT + BW with clean exchanges.
+    pair.tcp_a_mut().send(&[0x55u8; 1000])?;
+    pair.transfer();
+
+    pair.clear_capture();
+    pair.tcp_a_mut().send(&[0x66u8; 100])?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let bta = cap.tcp().from_b().last()
+        .ok_or_else(|| TestFail::new("no B→A ACK frame found for D-SACK setup"))?;
+    let (b_seq, a_snd_una) = (bta.tcp.seq, bta.tcp.ack);
+    let (b_src_port, a_dst_port) = (bta.src_port, bta.dst_port);
+
+    let reo_wnd_before = pair.tcp_a().rack_reo_wnd_ns();
+
+    // Inject D-SACK: SACK block below snd_una triggers spurious retransmit detection.
+    let dsack = build_tcp_data_with_sack_ts(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        b_src_port, a_dst_port,
+        b_seq, a_snd_una,
+        0, 0, // timestamps patched by inject_to_a
+        &[(a_snd_una.wrapping_sub(100), a_snd_una)],
+        &[],
+    );
+    pair.inject_to_a(dsack);
+    pair.transfer_one();
+
+    let reo_wnd_after = pair.tcp_a().rack_reo_wnd_ns();
+    assert_ok!(reo_wnd_after > 0, "RACK reo_wnd is 0 after D-SACK — should have been bumped");
+    assert_ok!(
+        reo_wnd_after > reo_wnd_before,
+        "RACK reo_wnd did not increase after D-SACK: before={reo_wnd_before}, after={reo_wnd_after}"
+    );
+
+    // Implementation-specific: D-SACK increments reo_wnd by min_rtt/4 (capped
+    // at SRTT).  RFC 8985 §6.2 step 4 uses a reo_wnd_mult counter instead.
+    let min_rtt_ns = pair.tcp_a().bbr_min_rtt_ns();
+    let srtt_ns = pair.tcp_a().srtt_ns();
+    let expected_inc = (min_rtt_ns / 4).max(1);
+    let expected = (reo_wnd_before + expected_inc).min(srtt_ns);
+    assert_ok!(
+        reo_wnd_after == expected,
+        "reo_wnd after D-SACK = {reo_wnd_after} ns, expected {expected} ns \
+         (before={reo_wnd_before} + min_rtt/4={expected_inc}, cap=srtt={srtt_ns})"
+    );
+
+    assert_ok!(
+        pair.tcp_a().state == rawket::tcp::State::Established,
+        "A not Established after D-SACK: {:?}", pair.tcp_a().state
     );
 
     Ok(())
