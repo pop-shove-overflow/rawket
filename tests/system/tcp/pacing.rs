@@ -206,3 +206,67 @@ fn zero_rate_sends_immediately() -> TestResult {
 
     Ok(())
 }
+
+// ── startup_pacing_gain ──────────────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.3.1: Startup pacing_gain = 2/ln(2) ~ 2.885.
+//
+// BBR Startup gain = 2.77 (4*ln(2)); ≥20 KB should transmit within 20 rounds.
+#[test]
+fn startup_pacing_gain() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    assert_ok!(
+        pair.tcp_a().bbr_phase() == BbrPhase::Startup,
+        "BBR not in Startup after establish: {:?}", pair.tcp_a().bbr_phase()
+    );
+
+    // Keep the pipe full so BBR gets ACK-driven bandwidth samples during Startup.
+    pair.tcp_a_mut().send(&vec![0xAAu8; 50_000])?;
+    let mut saw_startup_bw = false;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0xAAu8; 10_000]);
+        }
+        for snap in p.tcp_a(0).bbr_history() {
+            if snap.phase == BbrPhase::Startup && snap.max_bw > 0 {
+                saw_startup_bw = true;
+            }
+        }
+        // Stop once we have a Startup snapshot with measured BW, or leave Startup.
+        !saw_startup_bw && p.tcp_a(0).bbr_phase() == BbrPhase::Startup
+    });
+
+    let cap = pair.drain_captured();
+    let total: usize = cap.tcp()
+        .direction(Dir::AtoB)
+        .with_data()
+        .map(|f| f.payload_len)
+        .sum();
+
+    assert_ok!(
+        total >= 40_000,
+        "expected ≥40000 bytes in Startup pacing (got {total}) — pacing gain may be too low"
+    );
+
+    // BBRv3 §4.3.1: Startup pacing_gain = 2/ln(2) ≈ 2.885.
+    // Verify via bbr_history: Startup snapshot must have pacing_rate ≈ 2.885 * max_bw.
+    let snap = pair.tcp_a().bbr_history().iter()
+        .find(|s| s.phase == BbrPhase::Startup && s.max_bw > 0)
+        .cloned();
+    assert_ok!(snap.is_some(), "no Startup snapshot with max_bw > 0 in bbr_history()");
+    let snap = snap.unwrap();
+    let ratio_pct = snap.pacing_rate_bps * 100 / snap.max_bw.max(1);
+    // 2.885 → 288%. Allow [260%, 310%] for rounding.
+    assert_ok!(
+        ratio_pct >= 260 && ratio_pct <= 310,
+        "Startup pacing_gain ratio {ratio_pct}% not in [260%, 310%] \
+         (expected ~288% = 2/ln(2)): rate={}, bw={}",
+        snap.pacing_rate_bps, snap.max_bw
+    );
+
+    Ok(())
+}
