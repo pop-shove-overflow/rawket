@@ -385,3 +385,75 @@ fn rack_updates_from_sack() -> TestResult {
 
     Ok(())
 }
+
+// RFC 8985 §7.2: PTO is capped so it does not exceed the RTO expiration.
+// With SRTT==0, our implementation uses a 10ms TLP fallback (RFC 8985 §7.2
+// specifies 1 second; this is an implementation-specific choice).
+// Set rto_min=5ms so RTO(5ms) < TLP fallback(10ms). Verify RTO fires first.
+#[test]
+fn tlp_not_if_rto_sooner() -> TestResult {
+    let mut np = setup_network_pair();
+    let cfg = TcpConfig::default().rto_min_ms(5);
+    let rto_min = cfg.rto_min_ms as i64;
+
+    let client = TcpSocket::connect_now(
+        np.iface_a(),
+        "10.0.0.1:12345".parse().unwrap(),
+        "10.0.0.2:80".parse().unwrap(),
+        Ipv4Addr::from([10, 0, 0, 2]),
+        |_| {}, |_| {},
+        cfg.clone(),
+    )?;
+    np.add_tcp_a(client);
+
+    let server = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {}, cfg,
+    )?;
+    np.add_tcp_b(server);
+
+    np.transfer_one();
+    np.transfer_one();
+    np.transfer_one();
+    np.clear_capture();
+
+    // Precondition: instant link produces no RTT sample during handshake,
+    // so SRTT==0 and TLP uses the implementation's 10ms fallback (RFC 8985
+    // §7.2 specifies 1 second; see header comment).  If SRTT > 0, TLP
+    // deadline = 2*SRTT which may be < rto_min, breaking the test.
+    let srtt = np.tcp_a(0).srtt_ms();
+    assert_ok!(srtt == 0, "SRTT should be 0 after instant-link handshake, got {srtt} ms");
+
+    // Drop all A→B data.
+    np.add_impairment_to_b(Impairment::Drop(PacketSpec::matching(filter::tcp::has_data())));
+
+    np.tcp_a_mut(0).send(b"rto-vs-tlp")?;
+    np.transfer_one();
+
+    // Advance past RTO but before TLP fallback(10ms).
+    np.advance_both(rto_min + 2);
+    np.transfer_one();
+
+    // Count dropped data frames: expect 2 (original + RTO retransmit).
+    let cap = np.drain_captured();
+    let count_after_rto = cap.all_tcp().from_a().dropped().with_data().count();
+    assert_ok!(
+        count_after_rto == 2,
+        "expected 2 dropped data frames after RTO (original + retransmit), got {count_after_rto}; \
+         TLP may have fired despite RTO being sooner (RFC 8985 §7.3 violation)"
+    );
+
+    // Advance past TLP(10ms) but before backed-off RTO (2*rto_min): no new frames.
+    np.advance_both(rto_min);
+    np.transfer_one();
+
+    let cap2 = np.drain_captured();
+    let count_at_12 = cap2.all_tcp().from_a().dropped().with_data().count();
+    assert_ok!(
+        count_at_12 == 0,
+        "extra retransmit(s) at t=7..12ms ({count_at_12}) — TLP not disarmed by RTO"
+    );
+
+    Ok(())
+}
