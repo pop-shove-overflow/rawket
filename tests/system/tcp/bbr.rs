@@ -1501,3 +1501,42 @@ fn probe_bw_up_cwnd_gain() -> TestResult {
     assert_ok!(false, "ProbeBwUp found during transfer but not in final history");
     Ok(())
 }
+
+// ── app_limited_marking ─────────────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §5.2: CheckIfApplicationLimited sets app_limited
+// when send_buf is empty with cwnd headroom.  Delivery-rate samples taken
+// during app-limited periods are discounted.
+#[test]
+fn app_limited_marking() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Send a small amount and let it drain — send_buf empties with cwnd room.
+    pair.tcp_a_mut().send(b"small")?;
+    pair.transfer_while(|p| p.tcp_a(0).snd_una() != p.tcp_a(0).snd_nxt());
+
+    // After all data acked and send_buf empty, app_limited should be set.
+    assert_ok!(
+        pair.tcp_a().bbr_app_limited() > 0,
+        "app_limited not set after send_buf drained with cwnd headroom"
+    );
+
+    // Sending more data should eventually clear app_limited once enough
+    // delivery occurs.
+    pair.tcp_a_mut().send(&vec![0xBBu8; 100_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() < 50_000 {
+            let _ = p.tcp_a_mut(0).send(&vec![0xBBu8; 50_000]);
+        }
+        p.tcp_a(0).bbr_app_limited() > 0
+    });
+
+    assert_ok!(
+        pair.tcp_a().bbr_app_limited() == 0,
+        "app_limited not cleared after sustained sending"
+    );
+
+    Ok(())
+}
