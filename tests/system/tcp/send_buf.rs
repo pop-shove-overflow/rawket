@@ -255,3 +255,44 @@ fn flow_control_window_grows() -> TestResult {
 
     Ok(())
 }
+
+// ── cwnd_gate_limits_inflight ─────────────────────────────────────────────────
+//
+// RFC 9293 §3.8 (Data Communication): Verify inflight bytes do not exceed
+// cwnd + 1 MSS.
+#[test]
+fn cwnd_gate_limits_inflight() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let mss = pair.tcp_a().peer_mss() as u32;
+    let mut max_overshoot: i64 = 0;
+    let mut checks = 0u32;
+
+    pair.tcp_a_mut().send(&vec![0xCCu8; 100_000])?;
+
+    // Verify the invariant continuously during transfer, not just at one snapshot.
+    pair.transfer_while(|p| {
+        let cwnd = p.tcp_a(0).bbr_cwnd();
+        let inflight = p.tcp_a(0).bytes_in_flight();
+        if cwnd > 0 && inflight > 0 {
+            let overshoot = inflight as i64 - (cwnd + mss) as i64;
+            if overshoot > max_overshoot {
+                max_overshoot = overshoot;
+            }
+            checks += 1;
+        }
+        p.tcp_a(0).send_buf_len() > 0 || p.tcp_a(0).bytes_in_flight() > 0
+    });
+
+    assert_ok!(checks >= 5, "too few inflight/cwnd checks ({checks}) — test may be vacuous");
+    assert_ok!(
+        max_overshoot <= 0,
+        "inflight exceeded cwnd + MSS by {max_overshoot} bytes during transfer — \
+         cwnd gate not enforced continuously"
+    );
+
+    Ok(())
+}
