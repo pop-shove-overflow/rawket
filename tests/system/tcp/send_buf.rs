@@ -87,3 +87,73 @@ fn backpressure_would_block() -> TestResult {
 
     Ok(())
 }
+
+// ── flow_control_window ───────────────────────────────────────────────────────
+//
+// RFC 9293 §3.7.2 (SWS Avoidance): After zero-window, buffered data stays.
+// Opening the window flushes it.
+#[test]
+fn flow_control_window() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"hello")?;
+    pair.transfer();
+
+    let cap = pair.drain_captured();
+    let (a_snd_una_after_hello, b_snd_nxt) = {
+        let f = cap.tcp()
+            .direction(Dir::AtoB)
+            .with_data()
+            .next()
+            .ok_or_else(|| crate::assert::TestFail::new("no AtoB data frame"))?;
+        (f.tcp.seq, f.tcp.ack)
+    };
+    let a_snd_una = a_snd_una_after_hello + 5;
+
+    inject_zero_window(&mut pair, b_snd_nxt, a_snd_una);
+    assert_ok!(
+        pair.tcp_a().snd_wnd() == 0,
+        "snd_wnd not zero after zero-window inject: {}", pair.tcp_a().snd_wnd()
+    );
+
+    pair.tcp_a_mut().send(b"world")?;
+
+    pair.clear_capture();
+    pair.transfer_one();
+
+    let cap1 = pair.drain_captured();
+    let data_after_zw = cap1.tcp()
+        .direction(Dir::AtoB)
+        .with_data()
+        .count();
+    assert_ok!(data_after_zw == 0, "A sent data while window was zero ({data_after_zw} frames)");
+
+    // Advance to expire pacing gate.
+    pair.advance_both(2000);
+
+    inject_open_window(&mut pair, b_snd_nxt, a_snd_una);
+    pair.transfer_one();
+
+    let cap2 = pair.drain_captured();
+    let data_after_open = cap2.tcp()
+        .direction(Dir::AtoB)
+        .with_data()
+        .count();
+    assert_ok!(data_after_open >= 1, "A did not send buffered 'world' after window opened");
+
+    // Verify all 5 bytes of "world" were transmitted.
+    let total_bytes: usize = cap2.tcp()
+        .direction(Dir::AtoB)
+        .with_data()
+        .map(|f| f.payload_len)
+        .sum();
+    assert_ok!(
+        total_bytes >= 5,
+        "expected all 5 bytes of 'world' sent after window opened, got {total_bytes}"
+    );
+
+    Ok(())
+}
