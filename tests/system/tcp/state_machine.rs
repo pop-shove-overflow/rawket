@@ -1728,3 +1728,33 @@ fn syn_challenge_ack_in_close_wait() -> TestResult {
 
     Ok(())
 }
+
+// ── rst_in_close_wait ───────────────────────────────────────────────────────
+//
+// RFC 9293 §3.10.7.4: exact-match RST in CloseWait resets to Closed.
+#[test]
+fn rst_in_close_wait() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_b_mut().close()?;
+    pair.transfer_while(|p| p.tcp_a(0).state != State::CloseWait);
+    assert_state(pair.tcp_a(), State::CloseWait, "A CloseWait")?;
+
+    let rcv_nxt = pair.tcp_a().rcv_nxt();
+    let rst = build_tcp_rst(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        rcv_nxt,
+    );
+    pair.inject_to_a(rst);
+    pair.transfer_one();
+
+    assert_state(pair.tcp_a(), State::Closed, "A Closed after RST in CloseWait")?;
+    assert_error_fired(pair.tcp_a(), TcpError::Reset, "A error = Reset")?;
+
+    Ok(())
+}
