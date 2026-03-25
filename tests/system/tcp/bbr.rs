@@ -1658,3 +1658,90 @@ fn reno_coex_round_trigger() -> TestResult {
 
     Ok(())
 }
+
+// ── probe_bw_up_exit_requires_inflight_threshold ──────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.3.3.7 (ProbeBW_UP): BBR exits ProbeBW_UP
+// only after spending at least min_rtt in the phase AND reaching the
+// inflight target.  Verify by monitoring bbr_history during ProbeBwUp:
+// the phase duration (from cycle_stamp_ns to exit) must be >= min_rtt.
+#[test]
+fn probe_bw_up_exit_requires_inflight_threshold() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Drive to ProbeBW first.
+    drive_to_probe_bw(&mut pair)?;
+
+    // Continue driving data and look for ProbeBwUp entry and exit.
+    let mut up_entered = false;
+    let mut up_cycle_stamp_ns: u64 = 0;
+    let mut up_min_rtt_ns: u64 = 0;
+    let mut up_max_bw: u64 = 0;
+    let mut exit_cycle_stamp_ns: u64 = 0;
+    let mut exit_inflight: u32 = 0;
+    let mut saw_exit = false;
+    let mut last_was_up = false;
+    let mut last_up_snap_inflight: u32 = 0;
+
+    pair.tcp_a_mut().send(&vec![0xAAu8; 2_000])?;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0xAAu8; 2_000]);
+        }
+        for snap in p.tcp_a(0).bbr_history() {
+            if snap.phase == BbrPhase::ProbeBwUp {
+                if !up_entered {
+                    up_entered = true;
+                    up_cycle_stamp_ns = snap.cycle_stamp_ns;
+                    up_min_rtt_ns = snap.min_rtt_ns;
+                    up_max_bw = snap.max_bw;
+                }
+                last_up_snap_inflight = snap.bytes_in_flight;
+                last_was_up = true;
+            } else {
+                if last_was_up && !saw_exit
+                    && matches!(snap.phase, BbrPhase::ProbeBwDown)
+                {
+                    saw_exit = true;
+                    exit_cycle_stamp_ns = snap.cycle_stamp_ns;
+                    exit_inflight = last_up_snap_inflight;
+                }
+                last_was_up = false;
+            }
+        }
+        !saw_exit
+    });
+
+    assert_ok!(up_entered, "never entered ProbeBwUp");
+    assert_ok!(saw_exit, "never exited ProbeBwUp");
+
+    // 1. Time condition: phase must last >= min_rtt.
+    let phase_duration_ns = exit_cycle_stamp_ns.saturating_sub(up_cycle_stamp_ns);
+    assert_ok!(
+        up_min_rtt_ns > 0 && up_min_rtt_ns < u64::MAX,
+        "min_rtt not measured: {up_min_rtt_ns}"
+    );
+    assert_ok!(
+        phase_duration_ns >= up_min_rtt_ns,
+        "ProbeBwUp duration ({} ms) < min_rtt ({} ms)",
+        phase_duration_ns / 1_000_000, up_min_rtt_ns / 1_000_000
+    );
+
+    // 2. Inflight condition: at exit, inflight should have reached ~1.25×BDP.
+    // BDP = max_bw × min_rtt (bytes). The 1.25× target is the UP cwnd_gain.
+    let bdp = (up_max_bw * up_min_rtt_ns / 1_000_000_000) as u32;
+    if bdp > 0 {
+        let target = bdp + bdp / 4; // 1.25 × BDP
+        // Inflight at exit should be near or above the target.
+        // Allow 50% tolerance — exact inflight depends on ACK timing.
+        assert_ok!(
+            exit_inflight >= target / 2,
+            "inflight at UP exit ({exit_inflight}) < 50% of 1.25×BDP ({target}) — \
+             inflight threshold not reached (bdp={bdp}, max_bw={up_max_bw})"
+        );
+    }
+
+    Ok(())
+}
