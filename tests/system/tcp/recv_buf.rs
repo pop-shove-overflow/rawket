@@ -84,3 +84,52 @@ fn recv_buf_exhaustion_drops_segment() -> TestResult {
 
     Ok(())
 }
+
+// ── recv_partial_read_and_drain ─────────────────────────────────────────────
+//
+// Verify the recv() API: partial reads, drain-on-read, and None when empty.
+#[test]
+fn recv_partial_read_and_drain() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .recv_buf_max(1024)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    let rcv_nxt = pair.tcp_b().rcv_nxt();
+    let b_snd_nxt = pair.tcp_b().snd_nxt();
+
+    // Inject 10 bytes into B's recv_buf (don't drain via transfer).
+    let data = build_tcp_data_with_ts(
+        pair.mac_a, pair.mac_b,
+        pair.ip_a,  pair.ip_b,
+        12345, 80,
+        rcv_nxt, b_snd_nxt,
+        0, 0,
+        b"0123456789",
+    );
+    pair.inject_to_b(data);
+    pair.transfer_one(); // processes into recv_buf, does NOT drain
+
+    // Partial read: 4-byte buffer reads first 4 bytes.
+    let mut buf = [0u8; 4];
+    let n = pair.tcp_b_mut().recv(&mut buf);
+    assert_ok!(n == Some(4), "partial recv returned {:?}, expected Some(4)", n);
+    assert_ok!(&buf == b"0123", "partial recv content: {:?}", buf);
+
+    // Second read: remaining 6 bytes, but buffer is 4 → reads 4.
+    let n = pair.tcp_b_mut().recv(&mut buf);
+    assert_ok!(n == Some(4), "second recv returned {:?}, expected Some(4)", n);
+    assert_ok!(&buf == b"4567", "second recv content: {:?}", buf);
+
+    // Third read: 2 bytes remaining.
+    let n = pair.tcp_b_mut().recv(&mut buf);
+    assert_ok!(n == Some(2), "third recv returned {:?}, expected Some(2)", n);
+    assert_ok!(&buf[..2] == b"89", "third recv content: {:?}", &buf[..2]);
+
+    // Fourth read: empty → None.
+    let n = pair.tcp_b_mut().recv(&mut buf);
+    assert_ok!(n.is_none(), "recv on empty buf returned {:?}, expected None", n);
+
+    Ok(())
+}
