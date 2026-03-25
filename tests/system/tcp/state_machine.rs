@@ -1758,3 +1758,39 @@ fn rst_in_close_wait() -> TestResult {
 
     Ok(())
 }
+
+// ── fin_retransmit_exhaustion_last_ack ──────────────────────────────────────
+//
+// RFC 9293 §3.8: max_retransmits timeout in LastAck aborts with Timeout.
+// Complement to fin_retransmit_exhaustion (FinWait1).
+#[test]
+fn fin_retransmit_exhaustion_last_ack() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .rto_min_ms(10)
+        .max_retransmits(3)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // B closes → A enters CloseWait.
+    pair.tcp_b_mut().close()?;
+    pair.transfer_while(|p| p.tcp_a(0).state != State::CloseWait);
+
+    // Blackhole, then A closes → LastAck (FIN never ACKed).
+    pair.blackhole_to_b();
+    pair.tcp_a_mut().close()?;
+    pair.transfer_one();
+    assert_state(pair.tcp_a(), State::LastAck, "A LastAck")?;
+
+    for _ in 0..10 {
+        let rto = pair.tcp_a().rto_ms().max(10);
+        pair.advance_both(rto as i64 + 5);
+        pair.transfer_one();
+        if pair.tcp_a().state == State::Closed { break; }
+    }
+
+    assert_state(pair.tcp_a(), State::Closed, "A Closed after LastAck retransmit exhaustion")?;
+    assert_error_fired(pair.tcp_a(), TcpError::Timeout, "A error = Timeout")?;
+
+    Ok(())
+}
