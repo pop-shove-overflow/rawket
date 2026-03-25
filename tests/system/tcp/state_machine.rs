@@ -1561,3 +1561,70 @@ fn fin_retransmit_exhaustion() -> TestResult {
 
     Ok(())
 }
+
+// ── send_in_syn_received ────────────────────────────────────────────────────
+//
+// RFC 9293 §3.10.2: send() in SynReceived queues data until Established.
+// The passive opener (server) calls send() before the completing ACK arrives.
+#[test]
+fn send_in_syn_received() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default();
+
+    // B listens, A connects actively.
+    let listener = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {}, cfg.clone(),
+    )?;
+    let ib = np.add_tcp_b(listener);
+
+    let client = TcpSocket::connect_now(
+        np.iface_a(),
+        "10.0.0.1:12345".parse().unwrap(),
+        "10.0.0.2:80".parse().unwrap(),
+        Ipv4Addr::from([10, 0, 0, 2]),
+        |_| {}, |_| {}, cfg,
+    )?;
+    let ia = np.add_tcp_a(client);
+
+    // Drive until B enters SynReceived (SYN arrives, SYN-ACK sent).
+    np.transfer_while(|p| p.tcp_b(ib).state != State::SynReceived);
+    assert_ok!(np.tcp_b(ib).state == State::SynReceived, "B not SynReceived");
+
+    // Queue data in SynReceived — must succeed.
+    np.tcp_b_mut(ib).send(b"queued-in-syn-rcvd")?;
+    assert_ok!(
+        np.tcp_b(ib).send_buf_len() == 18,
+        "data not queued in SynReceived: send_buf_len={}", np.tcp_b(ib).send_buf_len()
+    );
+
+    // Complete handshake and deliver queued data to A.
+    let result = np.transfer();
+
+    assert_ok!(
+        np.tcp_b(ib).state == State::Established,
+        "B not Established: {:?}", np.tcp_b(ib).state
+    );
+    assert_ok!(
+        np.tcp_a(ia).state == State::Established,
+        "A not Established: {:?}", np.tcp_a(ia).state
+    );
+
+    // Queued data must have been flushed.
+    assert_ok!(
+        np.tcp_b(ib).send_buf_len() == 0,
+        "send_buf not drained after handshake: {}", np.tcp_b(ib).send_buf_len()
+    );
+
+    // Verify A received the queued data (application-level delivery).
+    let received = result.a.get(&ia).map(|v| v.as_slice()).unwrap_or(&[]);
+    assert_ok!(
+        received == b"queued-in-syn-rcvd",
+        "A did not receive queued data: got {:?}", received
+    );
+
+    Ok(())
+}
