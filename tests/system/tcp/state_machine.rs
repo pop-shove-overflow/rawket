@@ -1836,3 +1836,70 @@ fn fin_retransmit_exhaustion_last_ack() -> TestResult {
 
     Ok(())
 }
+
+// ── syn_ack_retransmit ──────────────────────────────────────────────────────
+//
+// RFC 9293 §3.8.1: SYN-ACK retransmission.  B accepts, A sends SYN, B enters
+// SynReceived and sends SYN-ACK.  Drop the SYN-ACK on the A side, advance
+// past B's RTO, and verify B retransmits the SYN-ACK.
+#[test]
+fn syn_ack_retransmit() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut np = setup_network_pair()
+        .profile(LinkProfile::leased_line_100m());
+    let cfg = TcpConfig::default().rto_min_ms(50);
+
+    // B listens.
+    let server = TcpSocket::accept(
+        np.iface_b(),
+        "10.0.0.2:80".parse().unwrap(),
+        |_| {}, |_| {}, cfg,
+    )?;
+    let ib = np.add_tcp_b(server);
+
+    // Drop all frames toward A so SYN-ACK never arrives.
+    np.add_impairment_to_a(Impairment::Drop(PacketSpec::any()));
+
+    // Inject SYN from A.
+    let isn_a = 0x6000_0000u32;
+    let syn = build_tcp_syn(
+        np.mac_a, np.mac_b,
+        np.ip_a,  np.ip_b,
+        12345, 80,
+        isn_a, 0,
+        0x02,
+        Some(1460), Some(4),
+        Some((100, 0)),
+        true,
+    );
+    np.inject_to_b(syn);
+    np.transfer_one();
+
+    assert_state(np.tcp_b(ib), State::SynReceived, "B should be in SynReceived")?;
+
+    // Count initial SYN-ACKs.
+    let cap = np.drain_captured();
+    let initial_synacks: usize = cap.all_tcp().from_b()
+        .filter(|f| f.tcp.flags.has(TcpFlags::SYN) && f.tcp.flags.has(TcpFlags::ACK))
+        .count();
+    assert_ok!(initial_synacks >= 1, "B did not send initial SYN-ACK");
+
+    // Advance past RTO so B retransmits SYN-ACK.
+    np.clear_capture();
+    np.advance_both(200); // well past rto_min_ms=50
+    np.transfer_one();
+
+    let cap2 = np.drain_captured();
+    let retx_synacks: usize = cap2.all_tcp().from_b()
+        .filter(|f| f.tcp.flags.has(TcpFlags::SYN) && f.tcp.flags.has(TcpFlags::ACK))
+        .count();
+    assert_ok!(
+        retx_synacks >= 1,
+        "B did not retransmit SYN-ACK after RTO (got {retx_synacks} SYN-ACKs)"
+    );
+
+    // B should still be in SynReceived.
+    assert_state(np.tcp_b(ib), State::SynReceived, "B still SynReceived after SYN-ACK retransmit")?;
+
+    Ok(())
+}
