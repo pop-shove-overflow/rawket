@@ -1540,3 +1540,50 @@ fn app_limited_marking() -> TestResult {
 
     Ok(())
 }
+
+// ── inflight_longterm_caps_cwnd ─────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.4.2: BBRBoundCwndForModel caps cwnd using
+// inflight_longterm.  In Cruise/ProbeRTT, headroom factor is 0.85.
+// Induce loss during Startup to set inflight_longterm, then verify cwnd
+// in ProbeBwCruise respects the cap.
+#[test]
+fn inflight_longterm_caps_cwnd() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .max_retransmits(100)
+        .rto_max_ms(200)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Apply 10% loss to trigger Startup exit via loss detection.
+    pair.loss_to_b(0.10);
+
+    pair.tcp_a_mut().send(&vec![0xCCu8; 2_000])?;
+    let mut saw_cruise = false;
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() == 0 {
+            let _ = p.tcp_a_mut(0).send(&vec![0xCCu8; 2_000]);
+        }
+        if p.tcp_a(0).bbr_phase() == BbrPhase::ProbeBwCruise {
+            saw_cruise = true;
+        }
+        // Run until we've been in Cruise and inflight_longterm is set.
+        !(saw_cruise && p.tcp_a(0).bbr_inflight_longterm() > 0)
+    });
+
+    let ilt = pair.tcp_a().bbr_inflight_longterm();
+    assert_ok!(ilt > 0, "inflight_longterm not set after loss-driven Startup exit");
+
+    // In Cruise, cwnd should be bounded by ~0.85 * inflight_longterm.
+    let cwnd = pair.tcp_a().bbr_cwnd();
+    let cap = (ilt as u64 * 85 / 100) as u32;
+    let mss = pair.tcp_cfg.mss as u32;
+    let min_cwnd = 4 * mss;
+    let expected_max = cap.max(min_cwnd);
+    assert_ok!(
+        cwnd <= expected_max + mss, // +1 MSS tolerance for rounding
+        "cwnd ({cwnd}) exceeds 0.85 * inflight_longterm ({cap}) + tolerance in Cruise"
+    );
+
+    Ok(())
+}
