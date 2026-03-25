@@ -1526,3 +1526,38 @@ fn rst_in_fin_wait2() -> TestResult {
 
     Ok(())
 }
+
+// ── fin_retransmit_exhaustion ───────────────────────────────────────────────
+//
+// RFC 9293 §3.8: after max_retransmits RTO expirations, the connection is
+// aborted with TcpError::Timeout.  Verify this works in FinWait1 (FIN
+// retransmit), not just Established.
+#[test]
+fn fin_retransmit_exhaustion() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .rto_min_ms(10)
+        .max_retransmits(3)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Blackhole B→A so FIN is never ACKed.
+    pair.blackhole_to_a();
+    pair.tcp_a_mut().close()?;
+    pair.transfer_one(); // FIN departs
+
+    assert_state(pair.tcp_a(), State::FinWait1, "A FinWait1")?;
+
+    // Drive RTO retransmits until max_retransmits exhausted.
+    for _ in 0..10 {
+        let rto = pair.tcp_a().rto_ms().max(10);
+        pair.advance_both(rto as i64 + 5);
+        pair.transfer_one();
+        if pair.tcp_a().state == State::Closed { break; }
+    }
+
+    assert_state(pair.tcp_a(), State::Closed, "A Closed after FIN retransmit exhaustion")?;
+    assert_error_fired(pair.tcp_a(), TcpError::Timeout, "A error = Timeout")?;
+
+    Ok(())
+}
