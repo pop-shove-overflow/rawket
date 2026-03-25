@@ -1693,6 +1693,48 @@ fn last_ack_rejects_stale_ack() -> TestResult {
     Ok(())
 }
 
+// ── closing_rejects_stale_ack ───────────────────────────────────────────────
+//
+// RFC 9293 §3.10.7.4: Closing → TimeWait only when ACK covers our FIN.
+#[test]
+fn closing_rejects_stale_ack() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Simultaneous close: both sides call close().
+    pair.tcp_a_mut().close()?;
+    pair.tcp_b_mut().close()?;
+    // Drive until A reaches Closing (A's FIN not yet ACKed, B's FIN received).
+    pair.transfer_while(|p| p.tcp_a(0).state != State::Closing);
+    assert_state(pair.tcp_a(), State::Closing, "A Closing")?;
+
+    let snd_nxt = pair.tcp_a().snd_nxt();
+    let rcv_nxt = pair.tcp_a().rcv_nxt();
+
+    // Inject stale ACK (doesn't cover our FIN).
+    let stale = crate::packet::build_tcp_data_with_ts(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        rcv_nxt,
+        snd_nxt.wrapping_sub(1),
+        0, 0,
+        b"",
+    );
+    pair.inject_to_a(stale);
+    pair.transfer_one();
+
+    assert_state(pair.tcp_a(), State::Closing, "A still Closing after stale ACK")?;
+    assert_ok!(
+        pair.tcp_a().last_error.is_none(),
+        "error fired on stale ACK in Closing"
+    );
+
+    Ok(())
+}
+
 // ── syn_challenge_ack_in_close_wait ─────────────────────────────────────────
 //
 // RFC 5961 §4: SYN challenge ACK in CloseWait (complement to FinWait2 test).
