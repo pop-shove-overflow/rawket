@@ -694,3 +694,82 @@ fn keepalive_exception_at_rcv_nxt_minus_one() -> TestResult {
 
     Ok(())
 }
+
+// ── window_update_in_fin_wait1 ──────────────────────────────────────────────
+//
+// RFC 9293 §3.10.7.4 (Window Update): Even in FinWait1, A must process
+// window updates from peer ACKs.  Inject a zero-window ACK, verify
+// snd_wnd==0, then inject a window-open ACK, verify snd_wnd>0.
+#[test]
+fn window_update_in_fin_wait1() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    use rawket::tcp::State;
+
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // A closes → FinWait1.
+    pair.tcp_a_mut().close()?;
+    pair.transfer_one();
+    assert_state(pair.tcp_a(), State::FinWait1, "A should be in FinWait1")?;
+
+    // Capture FIN from A to get its seq/ack for crafting responses.
+    let cap = pair.drain_captured();
+    let fin = cap.tcp().from_a()
+        .with_tcp_flags(TcpFlags::FIN)
+        .next()
+        .ok_or_else(|| crate::assert::TestFail::new("no FIN from A"))?;
+    let fin_seq = fin.tcp.seq;
+    let fin_ack = fin.tcp.ack;
+
+    pair.clear_capture();
+
+    // Inject zero-window ACK from B (ACKs the FIN, window=0).
+    let zero_win = build_tcp_data_with_ts(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        fin_ack,          // B's seq = A's ack
+        fin_seq + 1,      // ACK the FIN (seq+1 for FIN)
+        0, 0,             // timestamps patched by inject_to_a
+        &[],
+    );
+    // Patch window field to 0 (bytes 48-49 of the frame).
+    let mut zero_win = zero_win;
+    zero_win[48] = 0;
+    zero_win[49] = 0;
+    crate::packet::recompute_frame_tcp_checksum(&mut zero_win);
+    pair.inject_to_a(zero_win);
+    pair.transfer_one();
+
+    assert_ok!(
+        pair.tcp_a().snd_wnd() == 0,
+        "snd_wnd should be 0 after zero-window ACK, got {}", pair.tcp_a().snd_wnd()
+    );
+
+    // Inject window-open ACK from B (same ack, window=1000).
+    let open_win = build_tcp_data_with_ts(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        fin_ack,
+        fin_seq + 1,
+        0, 0,
+        &[],
+    );
+    let mut open_win = open_win;
+    let window_val: u16 = 1000;
+    open_win[48] = (window_val >> 8) as u8;
+    open_win[49] = window_val as u8;
+    crate::packet::recompute_frame_tcp_checksum(&mut open_win);
+    pair.inject_to_a(open_win);
+    pair.transfer_one();
+
+    assert_ok!(
+        pair.tcp_a().snd_wnd() > 0,
+        "snd_wnd should be > 0 after window-open ACK, got {}", pair.tcp_a().snd_wnd()
+    );
+
+    Ok(())
+}
