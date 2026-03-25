@@ -87,3 +87,66 @@ fn single_ooo_segment() -> TestResult {
 
     Ok(())
 }
+
+// ── fin_in_ooo ───────────────────────────────────────────────────────────────
+//
+// RFC 9293 §3.10.7.4: segments queued out-of-order are processed after
+// the gap is filled; a FIN in the OOO queue is deferred until then.
+//
+// OOO data and a FIN arrive while a gap exists.  Injecting the gap filler
+// should let B drain OOO data, deliver it in order, then process the
+// deferred FIN → CloseWait.
+#[test]
+fn fin_in_ooo() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    let (b_rcv_nxt, b_snd_nxt) = baseline_seqs(&mut pair)?;
+
+    let ooo = a_to_b(&pair, b_rcv_nxt + 1, b_snd_nxt, b"B");
+    pair.inject_to_b(ooo);
+    pair.transfer_one();
+
+    let fin = build_tcp_data_with_flags(
+        pair.mac_a, pair.mac_b,
+        pair.ip_a,  pair.ip_b,
+        12345, 80,
+        b_rcv_nxt + 2, b_snd_nxt,
+        0x11, // FIN|ACK
+        65535,
+        b"",
+    );
+    pair.inject_to_b(fin);
+    pair.transfer_one();
+
+    // B should still be Established — FIN is deferred until gap is filled.
+    assert_ok!(
+        pair.tcp_b().state == State::Established,
+        "B should still be Established before gap fill, got {:?}", pair.tcp_b().state
+    );
+
+    // Inject gap filler "A" at b_rcv_nxt and run to completion.
+    let gap_fill = a_to_b(&pair, b_rcv_nxt, b_snd_nxt, b"A");
+    pair.inject_to_b(gap_fill);
+    let result = pair.transfer();
+
+    // Data must be delivered in order before FIN processing.
+    // "A" (gap fill) + "B" (OOO) = "AB".
+    // (baseline "a" was consumed by drain_b in baseline_seqs.)
+    let received = result.b.get(&0).map(|v| v.as_slice()).unwrap_or(&[]);
+    assert_ok!(received.len() == 2, "expected 2 bytes delivered to B (A + B), got {}", received.len());
+    assert_ok!(
+        received == b"AB",
+        "delivered payload {:?} != expected {:?} — OOO reorder before FIN incorrect",
+        received, b"AB"
+    );
+
+    let b_state = pair.tcp_b().state;
+    assert_ok!(
+        b_state == State::CloseWait,
+        "B expected CloseWait after gap fill resolved deferred FIN, got {b_state:?}"
+    );
+
+    Ok(())
+}
