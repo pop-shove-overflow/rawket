@@ -231,3 +231,45 @@ fn tlp_tail_loss() -> TestResult {
 
     Ok(())
 }
+
+// RFC 8985 §7.3: After TLP probe is acknowledged, A must be Established and able to send.
+#[test]
+fn tlp_probe_advances_connection() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .rto_min_ms(10)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_a_mut().send(b"advance-test-data")?;
+    pair.transfer_one();
+
+    let snd_una_before = pair.tcp_a().snd_una();
+
+    // Drop B's first ACK — nth_matching(1) only drops the first.
+    pair.add_impairment_to_a(Impairment::Drop(PacketSpec::nth_matching(1, filter::tcp::ack())));
+
+    // transfer() drives: data→B, B's ACK dropped, TLP fires, B ACKs probe (2nd ACK goes through).
+    pair.transfer();
+
+    let snd_una_after = pair.tcp_a().snd_una();
+    assert_ok!(
+        snd_una_after != snd_una_before,
+        "snd_una did not advance after TLP probe (before={snd_una_before}, after={snd_una_after})"
+    );
+
+    assert_ok!(
+        pair.tcp_a().state == rawket::tcp::State::Established,
+        "A not Established after TLP: {:?}", pair.tcp_a().state
+    );
+
+    // A can still send.
+    pair.tcp_a_mut().send(b"ok")?;
+    pair.transfer();
+
+    assert_ok!(
+        pair.tcp_a().state == rawket::tcp::State::Established,
+        "A not Established after post-TLP send: {:?}", pair.tcp_a().state
+    );
+
+    Ok(())
+}
