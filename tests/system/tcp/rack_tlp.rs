@@ -168,3 +168,66 @@ fn rack_reorder_window_adapts() -> TestResult {
 
     Ok(())
 }
+
+// RFC 8985 §7.3: TLP sends a probe segment when no ACK arrives within the
+// PTO interval. Drop B's first ACK so A never receives acknowledgement.
+// TLP fires after 2*srtt, sending a retransmit probe. B ACKs. A is Established.
+//
+// Uses a leased-line profile so the handshake establishes SRTT > 0.
+// RFC 8985 §7.2 provides a 1-second fallback when SRTT is unavailable;
+// our implementation requires SRTT > 0 to arm TLP.
+#[test]
+fn tlp_tail_loss() -> TestResult {
+    // rto_min_ms=200 ensures RTO >> PTO so TLP fires first.
+    let mut pair = setup_tcp_pair().rto_min_ms(200).profile(LinkProfile::leased_line_100m()).connect();
+
+    // Warm up SRTT with a data exchange.
+    pair.tcp_a_mut().send(b"warmup")?;
+    pair.transfer();
+    pair.clear_capture();
+
+    let srtt = pair.tcp_a().srtt_ms();
+    assert_ok!(srtt > 0, "SRTT not established after warmup");
+
+    // Drop B's first ACK so data stays unacked → TLP fires.
+    // nth_matching(1, ack) drops only the first ACK; TLP probe's ACK gets through.
+    pair.add_impairment_to_a(Impairment::Drop(PacketSpec::nth_matching(1, filter::tcp::ack())));
+    pair.tcp_a_mut().send(&[0xbbu8; 100])?;
+
+    // transfer() drives: data→B, B's ACK dropped, TLP fires, B ACKs probe (2nd ACK goes through).
+    pair.transfer();
+
+    // Count AtoB data frames with same seq — expect ≥2 (original + TLP probe).
+    let cap = pair.drain_captured();
+    let seg_seq = cap.tcp().from_a().with_data().next()
+        .map(|f| f.tcp.seq)
+        .ok_or_else(|| TestFail::new("no AtoB data frame"))?;
+    let tlp_frames: Vec<_> = cap.all_tcp().from_a().with_data()
+        .filter(|f| f.tcp.seq == seg_seq)
+        .collect();
+    assert_ok!(
+        tlp_frames.len() >= 2,
+        "expected ≥2 AtoB data frames with seg_seq={seg_seq} (original+TLP), got {}",
+        tlp_frames.len()
+    );
+
+    // RFC 8985 §7.2: PTO = 2*SRTT; += WCDelAckT when FlightSize == 1.
+    // FlightSize is 1 (single 100-byte segment), so PTO = 2*SRTT + WCDelAck.
+    let wc_del_ack_ms = rawket::tcp::WC_DEL_ACK_NS / 1_000_000;
+    let original = &tlp_frames[0];
+    let probe = tlp_frames.last().unwrap();
+    let gap_ms = (probe.ts_ns - original.ts_ns) / 1_000_000;
+    let pto_ms = 2 * srtt + wc_del_ack_ms;
+    let rto = pair.tcp_a().rto_ms();
+    // TLP must fire at PTO (before RTO).
+    assert_ok!(
+        gap_ms >= pto_ms.saturating_sub(5) && gap_ms < rto,
+        "TLP gap {gap_ms}ms not near PTO ({pto_ms}ms) or >= RTO ({rto}ms) — \
+         expected PTO = 2*SRTT({srtt}) + {wc_del_ack_ms}ms WCDelAck"
+    );
+
+    // RFC 7323 §3.2: TLP probe must carry timestamps.
+    assert_timestamps_present(probe, "TLP probe")?;
+
+    Ok(())
+}
