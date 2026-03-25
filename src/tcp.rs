@@ -3078,6 +3078,7 @@ impl TcpSocket {
     pub fn bytes_in_flight(&self) -> u32 { self.snd_nxt - self.snd_una }
     pub fn send_buf_len(&self) -> usize { self.send_buf.len() }
     pub fn bbr_delivered(&self) -> u64 { self.bbr.delivered }
+    pub fn bbr_app_limited(&self) -> u64 { self.bbr.app_limited }
     pub fn bbr_next_round_delivered(&self) -> u64 { self.bbr.next_round_delivered }
     pub fn unacked_len(&self) -> usize { self.unacked.len() }
     #[cfg(feature = "test-internals")]
