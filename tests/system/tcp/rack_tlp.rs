@@ -323,3 +323,65 @@ fn multiple_losses_detected() -> TestResult {
 
     Ok(())
 }
+
+// RFC 8985: RACK end_seq/xmit_ms must be updated from SACK-covered segments.
+// Drop first segment, verify rack_end_seq advances after SACK feedback.
+#[test]
+fn rack_updates_from_sack() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Seed BBR/SRTT.
+    pair.tcp_a_mut().send(b"seed-data-xxxxxxxxx")?;
+    pair.transfer();
+    pair.clear_capture();
+
+    let rack_end_before  = pair.tcp_a().rack_end_seq();
+    let rack_xmit_before = pair.tcp_a().rack_xmit_ns();
+
+    // Drop first data segment, send data + more data for SACK feedback.
+    pair.add_impairment_to_b(Impairment::Drop(PacketSpec::nth_matching(1, filter::tcp::has_data())));
+    pair.tcp_a_mut().send(&[0xbbu8; 200])?;
+    pair.tcp_a_mut().send(&[0xccu8; 200])?;
+    pair.transfer();
+
+    assert_ok!(
+        pair.tcp_a().state == rawket::tcp::State::Established,
+        "A not Established after SACK-based RACK recovery: {:?}", pair.tcp_a().state
+    );
+
+    // RACK state must have advanced past the recovered segment.
+    let rack_end_after  = pair.tcp_a().rack_end_seq();
+    let rack_xmit_after = pair.tcp_a().rack_xmit_ns();
+    assert_ok!(
+        rack_end_after > rack_end_before,
+        "RACK end_seq did not advance after SACK feedback: {rack_end_before}->{rack_end_after}"
+    );
+    assert_ok!(
+        rack_xmit_after > rack_xmit_before,
+        "RACK xmit_ns did not advance after SACK feedback: {rack_xmit_before}->{rack_xmit_after}"
+    );
+    // rack_end_seq should cover at least the end of the second segment
+    // (the one that was SACKed, triggering loss detection of the first).
+    let snd_nxt = pair.tcp_a().snd_nxt();
+    assert_ok!(
+        rack_end_after >= snd_nxt.wrapping_sub(200),
+        "RACK end_seq ({rack_end_after}) didn't reach the SACKed segment range"
+    );
+
+    // Verify the dropped segment was retransmitted.
+    let cap = pair.drain_captured();
+    let dropped_seqs: Vec<u32> = cap.all_tcp().from_a().dropped().with_data()
+        .map(|f| f.tcp.seq)
+        .collect();
+    assert_ok!(!dropped_seqs.is_empty(), "no segments were dropped — test scenario invalid");
+    for &seq in &dropped_seqs {
+        let retx = cap.all_tcp().from_a().delivered().with_data()
+            .filter(|f| f.tcp.seq == seq)
+            .count();
+        assert_ok!(retx >= 1, "dropped segment seq={seq} not retransmitted via SACK-based RACK");
+    }
+
+    Ok(())
+}
