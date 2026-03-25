@@ -583,3 +583,51 @@ fn tlp_probe_is_tail_segment() -> TestResult {
 
     Ok(())
 }
+
+// RFC 8985 §6.2 (Upon Receiving an ACK): RACK-detected losses feed into
+// congestion control. After
+// sustained loss triggers bbr_on_loss, verify BBR reduced cwnd from peak.
+// Use 20% uniform loss on a latency link to reliably trigger RACK loss detection.
+#[test]
+fn rack_loss_triggers_bbr_on_loss() -> TestResult {
+    // Clean handshake on leased-line, then add 20% loss.
+    // max_retransmits=100 prevents connection death under sustained 20% loss.
+    let mut pair = setup_tcp_pair()
+        .max_retransmits(100)
+        .rto_max_ms(200)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+    pair.loss_to_b(0.20);
+
+    pair.tcp_a_mut().send(&[0xaau8; 80_000])?;
+
+    let mut peak_cwnd: u32 = 0;
+    let mut cwnd_reduced = false;
+
+    pair.transfer_while(|p| {
+        let cwnd = p.tcp_a(0).bbr_cwnd();
+        if cwnd > peak_cwnd {
+            peak_cwnd = cwnd;
+        } else if peak_cwnd > 0 && cwnd < peak_cwnd {
+            cwnd_reduced = true;
+            return false;
+        }
+
+        if p.tcp_a(0).send_buf_len() < 10_000 {
+            let _ = p.tcp_a_mut(0).send(&[0xaau8; 20_000]);
+        }
+        true
+    });
+
+    assert_ok!(
+        pair.tcp_a().state == rawket::tcp::State::Established,
+        "A not Established after RACK loss: {:?}", pair.tcp_a().state
+    );
+    assert_ok!(
+        cwnd_reduced,
+        "cwnd never reduced during sustained 20% loss (peak={peak_cwnd}) — \
+         RACK-detected loss should trigger BBR congestion response"
+    );
+
+    Ok(())
+}
