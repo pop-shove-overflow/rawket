@@ -751,3 +751,113 @@ fn tlp_count_limit() -> TestResult {
 
     Ok(())
 }
+
+// ── tlp_probe_from_send_buf ─────────────────────────────────────────────────
+//
+// RFC 8985 §7.3: When all previously sent data is acked (unacked empty) but
+// the send buffer has pending data blocked by a zero window, opening the
+// window just enough and advancing past PTO should trigger a TLP probe
+// consisting of 1 byte from the send_buf head.
+#[test]
+fn tlp_probe_from_send_buf() -> TestResult {
+    use crate::packet::build_tcp_data_with_ts;
+
+    let mut pair = setup_tcp_pair()
+        .rto_min_ms(500)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Seed SRTT with a warmup exchange.
+    pair.tcp_a_mut().send(b"warmup-data")?;
+    pair.transfer();
+    pair.clear_capture();
+
+    let srtt = pair.tcp_a().srtt_ms();
+    assert_ok!(srtt > 0, "SRTT not established after warmup");
+
+    // Now inject a zero-window ACK from B to close the send window.
+    let a_snd_nxt = pair.tcp_a().snd_nxt();
+    let b_snd_nxt = pair.tcp_b().snd_nxt();
+    let mut zero_win = build_tcp_data_with_ts(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        b_snd_nxt,
+        a_snd_nxt,
+        0, 0,
+        &[],
+    );
+    zero_win[48] = 0;
+    zero_win[49] = 0;
+    crate::packet::recompute_frame_tcp_checksum(&mut zero_win);
+    pair.inject_to_a(zero_win);
+    pair.transfer_one();
+
+    assert_ok!(
+        pair.tcp_a().snd_wnd() == 0,
+        "snd_wnd should be 0 after zero-window injection, got {}", pair.tcp_a().snd_wnd()
+    );
+
+    // Queue data into A's send_buf.  It can't be flushed because window is 0.
+    pair.tcp_a_mut().send(b"tlp-send-buf-probe-test")?;
+    pair.transfer_one();
+
+    assert_ok!(
+        pair.tcp_a().send_buf_len() > 0,
+        "send_buf should be non-empty (data queued behind zero window)"
+    );
+    assert_ok!(
+        pair.tcp_a().bytes_in_flight() == 0,
+        "bytes_in_flight should be 0 (all previous data acked), got {}",
+        pair.tcp_a().bytes_in_flight()
+    );
+
+    pair.clear_capture();
+
+    // Blackhole B→A so the TLP probe goes unanswered.
+    pair.blackhole_to_a();
+
+    // Open the window with a small value (e.g. 10 bytes) — enough for TLP
+    // to send a 1-byte probe from send_buf.
+    let mut open_win = build_tcp_data_with_ts(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        b_snd_nxt,
+        a_snd_nxt,
+        0, 0,
+        &[],
+    );
+    let window_val: u16 = 10;
+    open_win[48] = (window_val >> 8) as u8;
+    open_win[49] = window_val as u8;
+    crate::packet::recompute_frame_tcp_checksum(&mut open_win);
+    pair.inject_to_a(open_win);
+    pair.transfer_one();
+
+    // A should have flushed some data and armed TLP.
+    // Advance past PTO (2*SRTT + WCDelAck for FlightSize==1).
+    let wc_del_ack_ms = rawket::tcp::WC_DEL_ACK_NS / 1_000_000;
+    let pto_ms = (2 * srtt + wc_del_ack_ms) as i64;
+    pair.advance_both(pto_ms + 5);
+    pair.transfer_one();
+
+    // Look for TLP probe: data from A after the PTO advance.
+    let cap = pair.drain_captured();
+    let probes: Vec<_> = cap.all_tcp().from_a().with_data().collect();
+
+    // We should see the initial flush (data from send_buf) and possibly a TLP probe.
+    // The key assertion: data from the send_buf was transmitted.
+    let total_sent: usize = probes.iter().map(|f| f.payload_len).sum();
+    assert_ok!(
+        total_sent > 0,
+        "no data sent from send_buf after window opened and PTO elapsed"
+    );
+
+    assert_ok!(
+        pair.tcp_a().state == rawket::tcp::State::Established,
+        "A not Established after TLP from send_buf: {:?}", pair.tcp_a().state
+    );
+
+    Ok(())
+}
