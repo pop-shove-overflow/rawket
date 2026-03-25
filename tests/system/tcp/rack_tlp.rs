@@ -694,3 +694,60 @@ fn rack_threshold_formula() -> TestResult {
 
     Ok(())
 }
+
+// RFC 8985 §7.3: after sending a TLP probe, the sender re-arms RTO (not PTO).
+// This prevents a second TLP from firing before RTO.  After TLP fires,
+// advance past the TLP deadline again but before RTO — no second TLP should
+// fire.
+#[test]
+fn tlp_count_limit() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .rto_min_ms(200)
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Warm up SRTT.
+    pair.tcp_a_mut().send(b"warmup")?;
+    pair.transfer();
+    pair.clear_capture();
+
+    let srtt = pair.tcp_a().srtt_ms();
+    assert_ok!(srtt > 0, "SRTT not established after warmup");
+
+    // Drop all A→B data so nothing is ACKed.
+    pair.add_impairment_to_b(Impairment::Drop(PacketSpec::matching(filter::tcp::has_data())));
+    pair.clear_capture();
+
+    pair.tcp_a_mut().send(b"tlp-limit-test")?;
+    pair.transfer_one(); // original send (dropped by impairment)
+
+    // RFC 8985 §7.2: PTO = 2*SRTT + max_ack_delay for FlightSize==1.
+    let max_ack_delay_ms = rawket::tcp::WC_DEL_ACK_NS / 1_000_000;
+    let tlp_deadline = 2 * srtt + max_ack_delay_ms;
+    pair.advance_both(tlp_deadline as i64 + 5);
+    pair.transfer_one();
+
+    let cap = pair.drain_captured();
+    let sends_after_tlp = cap.all_tcp().from_a().with_data().count();
+    // 1 original + 1 TLP = 2.
+    assert_ok!(
+        sends_after_tlp == 2,
+        "expected 2 data sends (original + 1 TLP), got {sends_after_tlp}"
+    );
+
+    // Advance another TLP period — no second TLP should fire before RTO.
+    pair.clear_capture();
+    pair.advance_both(tlp_deadline as i64 + 5);
+    pair.transfer_one();
+
+    let cap2 = pair.drain_captured();
+    let extra_sends = cap2.all_tcp().from_a().with_data().count();
+    // RTO hasn't fired yet (rto_min=200ms >> 2*SRTT ~50ms), so no retransmit.
+    assert_ok!(
+        extra_sends == 0,
+        "second TLP fired (RFC 8985 §7.3: re-arm RTO not PTO): got {extra_sends} extra \
+         data sends between TLP and RTO"
+    );
+
+    Ok(())
+}
