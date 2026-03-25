@@ -1692,3 +1692,39 @@ fn last_ack_rejects_stale_ack() -> TestResult {
 
     Ok(())
 }
+
+// ── syn_challenge_ack_in_close_wait ─────────────────────────────────────────
+//
+// RFC 5961 §4: SYN challenge ACK in CloseWait (complement to FinWait2 test).
+#[test]
+fn syn_challenge_ack_in_close_wait() -> TestResult {
+    use rawket::bridge::LinkProfile;
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    pair.tcp_b_mut().close()?;
+    pair.transfer_while(|p| p.tcp_a(0).state != State::CloseWait);
+    assert_state(pair.tcp_a(), State::CloseWait, "A CloseWait")?;
+
+    let rcv_nxt = pair.tcp_a().rcv_nxt();
+    let challenge_before = pair.tcp_a().challenge_ack_count();
+
+    let syn = build_tcp_syn(
+        pair.mac_b, pair.mac_a,
+        pair.ip_b,  pair.ip_a,
+        80, 12345,
+        rcv_nxt, pair.tcp_a().snd_nxt(),
+        0x02, Some(1460), None, None, false,
+    );
+    pair.inject_to_a(syn);
+    pair.transfer_one();
+
+    assert_state(pair.tcp_a(), State::CloseWait, "A still CloseWait after SYN")?;
+    assert_ok!(
+        pair.tcp_a().challenge_ack_count() > challenge_before,
+        "no challenge ACK for SYN in CloseWait"
+    );
+
+    Ok(())
+}
