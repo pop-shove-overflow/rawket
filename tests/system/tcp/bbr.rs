@@ -1587,3 +1587,74 @@ fn inflight_longterm_caps_cwnd() -> TestResult {
 
     Ok(())
 }
+
+// ── reno_coex_round_trigger ─────────────────────────────────────────────────
+//
+// draft-ietf-ccwg-bbr-04 §4.3.3.6: in ProbeBW Cruise, if enough rounds pass
+// without a time-based probe trigger, the Reno-coexistence round counter
+// forces a transition to Refill.  Verify the cycle eventually enters Refill
+// even if the time-based trigger hasn't fired.
+#[test]
+fn reno_coex_round_trigger() -> TestResult {
+    let mut pair = setup_tcp_pair()
+        .profile(LinkProfile::leased_line_100m())
+        .connect();
+
+    // Drive into ProbeBW and keep sending to accumulate rounds.
+    pair.tcp_a_mut().send(&vec![0xDDu8; 2_000])?;
+    let mut saw_refill_after_cruise = false;
+    let mut in_cruise = false;
+    let mut cruise_rounds = 0u64;
+    let mut last_round = 0u64;
+
+    pair.transfer_while(|p| {
+        if p.tcp_a(0).send_buf_len() < 50_000 {
+            let _ = p.tcp_a_mut(0).send(&vec![0xDDu8; 50_000]);
+        }
+        let phase = p.tcp_a(0).bbr_phase();
+        let round = p.tcp_a(0).bbr_round_count();
+        if phase == BbrPhase::ProbeBwCruise {
+            if !in_cruise {
+                in_cruise = true;
+                cruise_rounds = 0;
+                last_round = round;
+            } else if round > last_round {
+                cruise_rounds += round - last_round;
+                last_round = round;
+            }
+        } else {
+            if in_cruise && phase == BbrPhase::ProbeBwRefill {
+                saw_refill_after_cruise = true;
+            }
+            in_cruise = false;
+        }
+        // Run until we see Cruise→Refill or accumulate many rounds.
+        !saw_refill_after_cruise && cruise_rounds < 200
+    });
+
+    assert_ok!(
+        saw_refill_after_cruise,
+        "never saw Cruise→Refill transition after {cruise_rounds} Cruise rounds"
+    );
+
+    // Verify the transition happened within the expected round-count range.
+    // Formula: bbr_reno_coex_rounds = bdp / (MSS × 2%), clamped [2, 63].
+    let mss = pair.tcp_cfg.mss as u64;
+    let max_bw = pair.tcp_a().bbr_max_bw();
+    let min_rtt_ns = pair.tcp_a().bbr_min_rtt_ns();
+    let bdp = max_bw * min_rtt_ns / 1_000_000_000;
+    let loss_thresh_mss = mss * 2 / 100; // MSS × 2%
+    let expected_rounds = if loss_thresh_mss > 0 {
+        (bdp / loss_thresh_mss).max(2).min(63) as u64
+    } else { 63 };
+    // The round or time trigger fires — whichever comes first.
+    // Cruise rounds must not greatly exceed expected_rounds.
+    assert_ok!(
+        cruise_rounds <= expected_rounds + 5,
+        "Cruise→Refill at {cruise_rounds} rounds, expected ≤{} (bdp={bdp}, \
+         loss_thresh_mss={loss_thresh_mss}, expected_rounds={expected_rounds})",
+        expected_rounds + 5
+    );
+
+    Ok(())
+}
