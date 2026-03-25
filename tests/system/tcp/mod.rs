@@ -9,3 +9,4 @@ mod rto_rtt;
 mod fast_retransmit;
 mod ecn;
 mod bbr;
+mod pacing;
